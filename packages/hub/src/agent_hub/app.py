@@ -25,6 +25,9 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         initialize_database(resolved.database_path)
         app.state.bearer_token = load_or_create_token(resolved.token, resolved.token_file)
+        # Log the resolved absolute path so a hub started against the wrong state
+        # directory is visible at once, rather than as lost state later.
+        logger.info("SQLite database ready at %s", resolved.database_path)
         if resolved.token is None:
             logger.info("Bearer token ready at %s", resolved.token_file)
         else:

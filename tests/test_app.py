@@ -10,6 +10,7 @@ def test_app_initializes_state_and_serves_agent_card(tmp_path: Path) -> None:
         host="127.0.0.1",
         port=8420,
         public_url="http://hub.example:8420",
+        state_dir=tmp_path,
         database_path=tmp_path / "hub.db",
         token=None,
         token_file=tmp_path / "token",
