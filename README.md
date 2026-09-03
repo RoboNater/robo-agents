@@ -15,15 +15,18 @@ The hub listens on `http://127.0.0.1:8420` by default. On first startup it
 creates `hub.db` and a mode-`0600` bearer token file under
 `$XDG_STATE_HOME/agent-hub` (falling back to `~/.local/state/agent-hub`), so the
 same state is found again no matter which working directory the process is
-started from; set `HUB_STATE_DIR` to move it. Override the other defaults with
-the variables documented in [`.env.example`](.env.example). For a deployed
-process, inject `HUB_TOKEN` rather than sharing the generated token file.
+started from; set `HUB_STATE_DIR` (which must be absolute) to move it. A
+relative `XDG_STATE_HOME` is invalid per the XDG base-directory specification
+and is ignored in favour of the `~/.local/state` fallback. Override the other
+defaults with the variables documented in [`.env.example`](.env.example). For a
+deployed process, inject `HUB_TOKEN` rather than sharing the generated token
+file.
 
 `HUB_PUBLIC_URL` is the address the agent card advertises, not the bind address.
 It defaults to `http://HUB_HOST:HUB_PORT`, which is correct only for a loopback
-bind; binding a wildcard address (`HUB_HOST=0.0.0.0`) to reach remote workers
-requires setting `HUB_PUBLIC_URL` to a dialable address such as
-`http://alice-host:8420`.
+bind; binding the unspecified address in any spelling (`0.0.0.0`, `::`,
+`0:0:0:0:0:0:0:0`, `*`) to reach remote workers requires setting
+`HUB_PUBLIC_URL` to a dialable address such as `http://alice-host:8420`.
 
 To load a local `.env` file explicitly:
 
