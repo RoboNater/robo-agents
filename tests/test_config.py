@@ -1,3 +1,4 @@
+import socket
 from pathlib import Path
 
 import pytest
@@ -107,10 +108,20 @@ def test_wildcard_bind_accepts_an_explicit_public_url() -> None:
 
 
 @pytest.mark.parametrize("host", ["::1", "[::1]", "0:0:0:0:0:0:0:1"])
-def test_ipv6_bind_is_advertised_in_bracketed_compressed_form(host: str) -> None:
+def test_ipv6_bind_host_is_normalized_for_the_socket_and_the_url(host: str) -> None:
     settings = HubSettings.from_env({"HUB_HOST": host})
 
+    # The resolver rejects the bracketed form, so brackets belong only in the URL.
+    assert settings.host == "::1"
     assert settings.public_url == "http://[::1]:8420"
+    assert socket.getaddrinfo(settings.host, settings.port, type=socket.SOCK_STREAM)
+
+
+def test_hostnames_are_left_alone() -> None:
+    settings = HubSettings.from_env({"HUB_HOST": "alice-host"})
+
+    assert settings.host == "alice-host"
+    assert settings.public_url == "http://alice-host:8420"
 
 
 @pytest.mark.parametrize(

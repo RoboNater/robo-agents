@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 WILDCARD_HOST_ALIAS = "*"
 
 
+_HostAddress = ipaddress.IPv4Address | ipaddress.IPv6Address | None
+
+
 class ConfigurationError(ValueError):
     """Raised when a hub environment variable is invalid."""
 
@@ -28,7 +31,7 @@ def _path(value: str, base: Path) -> Path:
     return path if path.is_absolute() else base / path
 
 
-def _host_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+def _host_address(host: str) -> _HostAddress:
     """Parse a bind host as an IP literal, tolerating IPv6 brackets."""
 
     literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
@@ -38,10 +41,11 @@ def _host_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | 
         return None
 
 
-def _authority(host: str, port: int) -> str:
-    address = _host_address(host)
+def _authority(host: str, address: _HostAddress, port: int) -> str:
+    """Render a normalized bind host as a URL authority."""
+
     if isinstance(address, ipaddress.IPv6Address):
-        return f"[{address.compressed}]:{port}"
+        return f"[{host}]:{port}"
     return f"{host}:{port}"
 
 
@@ -88,9 +92,13 @@ class HubSettings:
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> HubSettings:
         env = os.environ if environ is None else environ
-        host = env.get("HUB_HOST", "127.0.0.1").strip()
-        if not host:
+        raw_host = env.get("HUB_HOST", "127.0.0.1").strip()
+        if not raw_host:
             raise ConfigurationError("HUB_HOST cannot be empty")
+        # An IP literal is stored in the only form the socket resolver accepts:
+        # unbracketed and compressed. Brackets go back on for URL authorities.
+        address = _host_address(raw_host)
+        host = raw_host if address is None else address.compressed
 
         raw_port = env.get("HUB_PORT", "8420")
         try:
@@ -104,13 +112,12 @@ class HubSettings:
         # deriving one from the other is only correct for a specific interface.
         raw_public_url = env.get("HUB_PUBLIC_URL")
         if raw_public_url is None:
-            address = _host_address(host)
             if host == WILDCARD_HOST_ALIAS or (address is not None and address.is_unspecified):
                 raise ConfigurationError(
-                    f"HUB_PUBLIC_URL must be set when HUB_HOST is the wildcard address {host}; "
-                    "workers cannot dial a bind address"
+                    f"HUB_PUBLIC_URL must be set when HUB_HOST is the wildcard address "
+                    f"{raw_host}; workers cannot dial a bind address"
                 )
-            public_url = f"http://{_authority(host, port)}"
+            public_url = f"http://{_authority(host, address, port)}"
         else:
             public_url = raw_public_url.strip().rstrip("/")
             if not public_url.startswith(("http://", "https://")):
