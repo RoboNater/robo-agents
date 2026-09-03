@@ -1,9 +1,8 @@
 from pathlib import Path
 
-from fastapi.testclient import TestClient
-
 from agent_hub import create_app
 from agent_hub_common import HubSettings
+from fastapi.testclient import TestClient
 
 
 def test_app_initializes_state_and_serves_agent_card(tmp_path: Path) -> None:

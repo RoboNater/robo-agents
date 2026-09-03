@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
-
-from fastapi import FastAPI
 
 from agent_hub_common import HubSettings, load_or_create_token
+from fastapi import FastAPI
 
 from .card import build_agent_card
 from .database import initialize_database
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def create_app(settings: HubSettings | None = None) -> FastAPI:
@@ -23,6 +25,10 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         initialize_database(resolved.database_path)
         app.state.bearer_token = load_or_create_token(resolved.token, resolved.token_file)
+        if resolved.token is None:
+            logger.info("Bearer token ready at %s", resolved.token_file)
+        else:
+            logger.info("Bearer token loaded from HUB_TOKEN")
         yield
 
     app = FastAPI(

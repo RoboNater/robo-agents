@@ -2,27 +2,38 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from pathlib import Path
 import sqlite3
-from typing import Iterator
+from collections.abc import Iterator
+from contextlib import contextmanager
+from enum import StrEnum
+from pathlib import Path
 
+from agent_hub_common import AgentStatus, EventKind, TaskState, WorkflowStatus
 
 SCHEMA_VERSION = 1
 
-SCHEMA = """
+
+class DatabaseVersionError(RuntimeError):
+    """Raised when the on-disk schema does not match this application."""
+
+
+def _sql_values(enum_type: type[StrEnum]) -> str:
+    return ", ".join(f"'{item.value}'" for item in enum_type)
+
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS workflow (
     id TEXT PRIMARY KEY,
     goal TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'done', 'escalated')),
-    policy_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL CHECK (status IN ({_sql_values(WorkflowStatus)})),
+    policy_json TEXT NOT NULL DEFAULT '{{}}',
     created TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent (
     name TEXT PRIMARY KEY,
     capabilities_json TEXT NOT NULL DEFAULT '[]',
-    status TEXT NOT NULL CHECK (status IN ('idle', 'busy', 'released', 'lost')),
+    status TEXT NOT NULL CHECK (status IN ({_sql_values(AgentStatus)})),
     context_id TEXT UNIQUE,
     last_seen TEXT NOT NULL,
     current_task_id TEXT,
@@ -36,9 +47,7 @@ CREATE TABLE IF NOT EXISTS task (
     role TEXT NOT NULL,
     title TEXT NOT NULL,
     instructions TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (
-        state IN ('submitted', 'working', 'input-required', 'completed', 'failed', 'canceled')
-    ),
+    state TEXT NOT NULL CHECK (state IN ({_sql_values(TaskState)})),
     lease_expires TEXT,
     result_json TEXT,
     created TEXT NOT NULL,
@@ -60,12 +69,7 @@ CREATE TABLE IF NOT EXISTS message (
 
 CREATE TABLE IF NOT EXISTS event (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (
-        kind IN (
-            'agent_checked_in', 'task_progress', 'task_completed', 'task_failed',
-            'worker_question', 'lease_expired', 'agent_lost'
-        )
-    ),
+    kind TEXT NOT NULL CHECK (kind IN ({_sql_values(EventKind)})),
     payload_json TEXT NOT NULL,
     consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0, 1)),
     ts TEXT NOT NULL
@@ -100,17 +104,26 @@ def initialize_database(path: Path) -> None:
     """Create the database and apply the initial idempotent schema."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with connect(path) as connection:
+    with database(path) as connection:
+        current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if current_version == SCHEMA_VERSION:
+            return
+        if current_version != 0:
+            raise DatabaseVersionError(
+                f"database schema version {current_version} is incompatible with "
+                f"expected version {SCHEMA_VERSION}"
+            )
         connection.executescript(SCHEMA)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 @contextmanager
 def database(path: Path) -> Iterator[sqlite3.Connection]:
-    """Yield a connection and close it after use."""
+    """Yield a transactional connection and always close it after use."""
 
     connection = connect(path)
     try:
-        yield connection
+        with connection:
+            yield connection
     finally:
         connection.close()

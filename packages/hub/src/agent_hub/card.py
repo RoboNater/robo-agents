@@ -5,6 +5,7 @@ from a2a.types import (
     AgentCard,
     AgentSkill,
     HTTPAuthSecurityScheme,
+    SecurityScheme,
 )
 
 
@@ -31,10 +32,12 @@ def build_agent_card(public_url: str) -> AgentCard:
             )
         ],
         security_schemes={
-            "bearerAuth": HTTPAuthSecurityScheme(
-                scheme="bearer",
-                bearer_format="opaque",
-                description="Pre-shared token supplied in the Authorization header.",
+            "bearerAuth": SecurityScheme(
+                root=HTTPAuthSecurityScheme(
+                    scheme="bearer",
+                    bearer_format="opaque",
+                    description="Pre-shared token supplied in the Authorization header.",
+                )
             )
         },
         security=[{"bearerAuth": []}],
