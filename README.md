@@ -22,6 +22,11 @@ defaults with the variables documented in [`.env.example`](.env.example). For a
 deployed process, inject `HUB_TOKEN` rather than sharing the generated token
 file.
 
+Step 1 only provisions the token and advertises the `bearerAuth` scheme on the
+agent card; **nothing is enforced yet.** Bearer enforcement on the protected
+routes is a Step 2 deliverable (see §4.1 and §7 of the spec), so treat the hub as
+unauthenticated until then and keep it bound to loopback.
+
 `HUB_PUBLIC_URL` is the address the agent card advertises, not the bind address.
 It defaults to `http://HUB_HOST:HUB_PORT`, which is correct only for a loopback
 bind; binding the unspecified address in any spelling (`0.0.0.0`, `::`,
