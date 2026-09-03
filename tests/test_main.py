@@ -25,4 +25,4 @@ def test_main_parses_environment_once_and_runs_built_app(
     app, kwargs = calls[0]
     assert isinstance(app, FastAPI)
     assert app.state.settings.public_url == "https://public.example"
-    assert kwargs == {"host": "127.0.0.2", "port": 8430}
+    assert kwargs == {"host": "127.0.0.2", "port": 8430, "access_log": False}

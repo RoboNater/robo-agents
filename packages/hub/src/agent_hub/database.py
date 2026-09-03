@@ -18,6 +18,7 @@ class DatabaseVersionError(RuntimeError):
 
 
 def _sql_values(enum_type: type[StrEnum]) -> str:
+    # Values come only from closed application enums, never from runtime input.
     return ", ".join(f"'{item.value}'" for item in enum_type)
 
 

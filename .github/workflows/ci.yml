@@ -2,10 +2,15 @@ name: CI
 
 on:
   push:
-  workflow_dispatch:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -17,5 +22,5 @@ jobs:
           enable-cache: true
       - run: uv sync --locked --all-packages --dev
       - run: uv run --locked ruff check .
-      - run: uv run --locked mypy packages tests
+      - run: uv run --locked mypy
       - run: uv run --locked pytest

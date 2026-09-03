@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from .card import build_agent_card
 from .database import initialize_database
 
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 
 
 def create_app(settings: HubSettings | None = None) -> FastAPI:
