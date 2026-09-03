@@ -79,6 +79,8 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 
 `tasks/get` and `tasks/cancel` implemented for completeness/debugging.
 
+**Public vs. protected.** The A2A route is protected: every worker call carries `Authorization: Bearer <token>` and the hub returns `401` when the header is missing, malformed, or carries a token that does not match the pre-shared one (compared with `token_matches`, constant-time). `GET /.well-known/agent-card.json` and `GET /healthz` are public — the agent card must be fetchable for discovery, and health checks run before any credential is available. Those two are the entire public surface; every other route, including `/guides/{role}.md` (§4.2), requires the token.
+
 ### 4.2 Alice's MCP tools (hub, stdio)
 
 | Tool | Args | Behavior |
@@ -93,14 +95,14 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 | `log_decision` | `summary, rationale` | audit trail |
 
 No `ask_user` tool: Alice ends her turn with a question; events queue in SQLite until she resumes.
-No `merge` tool: Alice uses `gh pr checks` + `gh pr merge` directly (her session is a normal Claude Code session with shell access). Hub also serves `GET /guides/{role}.md` (static files from `guides/`).
+No `merge` tool: Alice uses `gh pr checks` + `gh pr merge` directly (her session is a normal Claude Code session with shell access). Hub also serves `GET /guides/{role}.md` (static files from `guides/`), **authenticated with the same bearer token** as §4.1: the guides carry no secrets, but they are only ever fetched by workers that already hold a token, so requiring it costs nothing and keeps the public surface to discovery and health alone.
 
 ### 4.3 Worker MCP tools (worker-mcp, stdio; configured with `HUB_URL`, `HUB_TOKEN`, `AGENT_NAME`)
 
 | Tool | Behavior |
 |---|---|
 | `check_in(capabilities)` | one-time registration; reports `runtime` (claude-code / codex / gemini) in metadata |
-| `get_role_guide(role)` | fetches `GET /guides/{role}.md` from hub — the runtime-agnostic replacement for skills |
+| `get_role_guide(role)` | fetches `GET /guides/{role}.md` from hub with the bearer token, like every other hub call — the runtime-agnostic replacement for skills |
 | `await_assignment(timeout_s=120)` | returns `{task_id, role, instructions}` \| `{release: true}` \| `{timeout: true}` |
 | `report_progress(task_id, note)` | fire-and-forget |
 | `ask_alice(task_id, question, timeout_s=120)` | blocks for reply; timeout → call again |
@@ -180,7 +182,7 @@ Exact config keys for the second runtime to be verified against its current docs
 | # | Step | Deliverable | Done when |
 |---|---|---|---|
 | 1 | Scaffold | uv workspace, packages, SQLite schema, config/token | `uv run hub` binds port, serves agent card |
-| 2 | Hub core | A2A handlers (§4.1), event queue, lease/heartbeat sweeper | `curl` READY/NEXT/result round-trips; SSE holds and releases |
+| 2 | Hub core | A2A handlers (§4.1), bearer enforcement on the protected routes (§4.1 public/protected split), event queue, lease/heartbeat sweeper | `curl` READY/NEXT/result round-trips; SSE holds and releases; the same `curl` with no `Authorization` header and with a wrong token both return 401 |
 | 3 | Alice MCP tools | §4.2 over stdio in same process | Claude Code lists tools; `wait_for_event` blocks/returns |
 | 4 | Worker MCP | §4.3 incl. `get_role_guide`, retries with backoff, timeout → retry semantics; config snippets for both runtimes | `mock-alice.py` drives one task through a Claude Code worker **and** a second-runtime worker |
 | 5 | Guides, skill, prompts | Alice skill from your turn-taking dialogs (incl. merge step); `guides/*.md`; prompts | `mock-worker.py` (scripted events) drives real Alice through PLAN→MERGE→WRAP-UP, merge executed against a throwaway PR in the sandbox |
@@ -201,6 +203,7 @@ Suggested order of effort: 1–2 (1 day), 3–4 (1 day), 5 (iterative, needs you
 | Merge authority | Alice merges on reviewer approval + CI green; `squash` default |
 | Test repo | Existing sandbox — supply repo URL and a seeded issue number before step 6 |
 | Port | 8420 |
+| Auth surface | Bearer token required on the A2A route and `/guides/{role}.md`; only `/.well-known/agent-card.json` and `/healthz` are public. Enforcement is a Step 2 deliverable |
 
 **Still open (minor, can decide at step 4):** which second runtime; whether Charlie's guide fetch should also be cached locally for offline restarts.
 
