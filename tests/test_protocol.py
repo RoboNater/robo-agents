@@ -202,6 +202,51 @@ async def test_an_unanswered_question_times_out_and_stays_parked(
     assert task is not None and task.state is TaskState.INPUT_REQUIRED
 
 
+async def test_a_retried_question_still_receives_a_reply_sent_in_the_gap(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    context_id, task_id = await assigned_context(client, hub_store)
+    while hub_store.next_event():
+        pass
+    ask = rpc(
+        "message/stream",
+        message(
+            "Which base branch?",
+            context_id=context_id,
+            task_id=task_id,
+            metadata={"kind": "question", "timeout_s": 0.05},
+        ),
+    )
+
+    timed_out = await client.post("/a2a", json=ask)
+    # Alice answers after the hold elapsed but before the worker calls again.
+    hub_store.reply(task_id, "main")
+    retried = await client.post("/a2a", json=ask)
+
+    marker = sse_results(timed_out)[0]
+    assert marker["metadata"]["timeout"] is True
+    # The marker names the id the retry has to be sent under.
+    assert marker["metadata"]["retry_as_message_id"] == ask["params"]["message"]["messageId"]
+    assert sse_results(retried)[0]["parts"][0]["text"] == "main"
+    assert hub_store.next_event() is not None
+    assert hub_store.next_event() is None
+
+
+async def test_a_worker_released_while_away_is_released_when_it_returns(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    await check_in(client, "bob")
+    hub_store.release_agent("bob")
+
+    # The worker restarts and re-announces itself, as after a crash.
+    context_id = await check_in(client, "bob")
+    response = await client.post(
+        "/a2a", json=rpc("message/stream", message("NEXT", context_id=context_id))
+    )
+
+    assert sse_results(response)[0]["metadata"]["release"] is True
+
+
 async def test_a_streaming_call_on_a_task_must_be_a_question(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:

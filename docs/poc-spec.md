@@ -79,6 +79,15 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 
 `tasks/get` and `tasks/cancel` implemented for completeness/debugging.
 
+**Retrying a held call.** A hold that reaches its deadline returns a
+`metadata.timeout` marker and the caller calls again (§4.3). For a question that
+retry must reuse the `messageId` of the original question — the marker echoes it
+as `metadata.retry_as_message_id` — and the hub then resumes that question
+rather than opening a second one. Alice may have answered in the gap between the
+attempts, and her answer is older than a new question would be, so a retry that
+asked afresh could never see it. `NEXT` needs no such correlation: it has no
+per-call state to resume.
+
 **Public vs. protected.** The A2A route is protected: every worker call carries `Authorization: Bearer <token>` and the hub returns `401` when the header is missing, malformed, or carries a token that does not match the pre-shared one (compared with `token_matches`, constant-time). `GET /.well-known/agent-card.json` and `GET /healthz` are public — the agent card must be fetchable for discovery, and health checks run before any credential is available. Those two are the entire public surface; every other route, including `/guides/{role}.md` (§4.2), requires the token.
 
 ### 4.2 Alice's MCP tools (hub, stdio)

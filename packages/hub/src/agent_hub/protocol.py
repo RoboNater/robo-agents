@@ -357,9 +357,13 @@ class A2AProtocol:
             # The task is parked and Alice is notified before the response body
             # opens, so a client that disconnects still leaves the question with
             # her rather than losing it with the stream.
-            question_id = self.store.open_question(task.id, agent.name, question)
+            question_id = self.store.open_question(
+                task.id, agent.name, question, message.message_id
+            )
             return self._streaming(
-                self._reply_stream(request_id, task, agent, question_id, timeout_s)
+                self._reply_stream(
+                    request_id, task, agent, question_id, timeout_s, message.message_id
+                )
             )
 
         if _text(message).upper() != NEXT_TEXT:
@@ -398,23 +402,38 @@ class A2AProtocol:
         agent: AgentRecord,
         question_id: int,
         timeout_s: float,
+        sent_as: str,
     ) -> AsyncIterator[bytes]:
         reply = await self.store.await_reply(task.id, question_id, timeout_s)
         if reply is None:
             yield _sse(
-                _success_body(request_id, self._timeout_message(agent.context_id, task.id))
+                _success_body(
+                    request_id,
+                    self._timeout_message(agent.context_id, task.id, sent_as),
+                )
             )
             return
         yield _sse(_success_body(request_id, _stored_message(reply)))
 
-    def _timeout_message(self, context_id: str, task_id: str | None = None) -> A2AMessage:
-        """Tell the worker the hold elapsed; the guide says to call again."""
+    def _timeout_message(
+        self, context_id: str, task_id: str | None = None, sent_as: str | None = None
+    ) -> A2AMessage:
+        """Tell the worker the hold elapsed; the guide says to call again.
 
+        A retried question has to carry the message id it was first asked
+        under, so the marker names it rather than leaving the caller to
+        remember: an answer Alice gave in the gap is only reachable through the
+        original question.
+        """
+
+        metadata: dict[str, Any] = {"kind": "timeout", "timeout": True}
+        if sent_as is not None:
+            metadata["retry_as_message_id"] = sent_as
         return _agent_message(
             "TIMEOUT",
             context_id=context_id,
             task_id=task_id,
-            metadata={"kind": "timeout", "timeout": True},
+            metadata=metadata,
         )
 
     def _timeout(self, metadata: Mapping[str, Any]) -> float:

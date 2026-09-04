@@ -84,7 +84,10 @@ curl -sN -X POST http://127.0.0.1:8420/a2a \
 
 Progress notes, questions and results are `message/send` and `message/stream`
 calls carrying a `taskId` and a `metadata.kind` of `progress`, `question` or
-`result` — see §4.1 of the spec for the full mapping. Assignments themselves
+`result` — see §4.1 of the spec for the full mapping. A question that times out
+must be retried under the `messageId` it was first asked with (the timeout
+marker echoes it as `metadata.retry_as_message_id`), so that a reply Alice sent
+between the two attempts still reaches the worker. Assignments themselves
 come from Alice, whose MCP tools land in Step 3 and run inside this same
 process; until then nothing assigns work, so a `NEXT` will hold to its deadline.
 

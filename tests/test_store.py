@@ -145,7 +145,7 @@ async def test_a_question_parks_the_task_until_alice_replies(store: HubStore) ->
     store.check_in("bob", [])
     task_id = assign(store)
 
-    question_id = store.open_question(task_id, "bob", "Which base branch?")
+    question_id = store.open_question(task_id, "bob", "Which base branch?", "q-1")
     parked = store.get_task(task_id)
 
     async def alice() -> None:
@@ -164,12 +164,56 @@ async def test_a_question_parks_the_task_until_alice_replies(store: HubStore) ->
 async def test_an_unanswered_question_times_out(store: HubStore) -> None:
     store.check_in("bob", [])
     task_id = assign(store)
-    question_id = store.open_question(task_id, "bob", "Which base branch?")
+    question_id = store.open_question(task_id, "bob", "Which base branch?", "q-1")
 
     assert await store.await_reply(task_id, question_id, 0.05) is None
     # The question stays parked, so calling again resumes the same wait.
     parked = store.get_task(task_id)
     assert parked is not None and parked.state is TaskState.INPUT_REQUIRED
+
+
+async def test_a_reply_that_lands_between_attempts_reaches_the_retry(
+    store: HubStore,
+) -> None:
+    """"Call again" is only safe if a retry can still see the answer it missed."""
+
+    store.check_in("bob", [])
+    task_id = assign(store)
+    first = store.open_question(task_id, "bob", "Which base branch?", "q-1")
+    assert await store.await_reply(task_id, first, 0.05) is None
+
+    # Alice answers in the gap between the timeout and the worker calling again.
+    store.reply(task_id, "main")
+    retry = store.open_question(task_id, "bob", "Which base branch?", "q-1")
+    reply = await store.await_reply(task_id, retry, 0.05)
+
+    assert retry == first
+    assert reply is not None
+    assert [part["text"] for part in reply.parts] == ["main"]
+
+
+def test_a_retried_question_does_not_ask_alice_twice(store: HubStore) -> None:
+    store.check_in("bob", [])
+    task_id = assign(store)
+    while store.next_event():
+        pass
+
+    store.open_question(task_id, "bob", "Which base branch?", "q-1")
+    store.open_question(task_id, "bob", "Which base branch?", "q-1")
+
+    kinds = [event.kind for event in iter(store.next_event, None)]
+    assert kinds == [EventKind.WORKER_QUESTION]
+    assert len(store.task_history(task_id)) == 2
+
+
+def test_a_different_question_is_a_new_question(store: HubStore) -> None:
+    store.check_in("bob", [])
+    task_id = assign(store)
+
+    first = store.open_question(task_id, "bob", "Which base branch?", "q-1")
+    second = store.open_question(task_id, "bob", "Squash or merge?", "q-2")
+
+    assert second != first
 
 
 @pytest.mark.parametrize(
@@ -291,6 +335,38 @@ def test_a_silent_worker_is_lost_and_its_task_fails(store: HubStore) -> None:
     assert task is not None and task.state is TaskState.FAILED
     assert task.result is not None and task.result["reason"] == "lost"
     assert store.sweep(heartbeat_timeout_s=-1) == []
+
+
+def test_a_release_survives_the_worker_restarting(store: HubStore) -> None:
+    # Alice releases at wrap-up; a worker that comes back afterwards has to be
+    # told to stop rather than left polling for work nobody will assign.
+    store.check_in("bob", [])
+    store.release_agent("bob")
+
+    returned = store.check_in("bob", ["python"])
+
+    assert returned.status is AgentStatus.RELEASED
+    assert returned.capabilities == ["python"]
+
+
+def test_checking_in_readmits_a_lost_worker(store: HubStore) -> None:
+    store.check_in("bob", [])
+    store.sweep(heartbeat_timeout_s=-1)
+
+    returned = store.check_in("bob", [])
+
+    assert returned.status is AgentStatus.IDLE
+
+
+def test_a_lost_worker_is_given_no_work_until_it_checks_in_again(store: HubStore) -> None:
+    store.check_in("bob", [])
+    store.sweep(heartbeat_timeout_s=-1)
+
+    with pytest.raises(ConflictError, match="not idle"):
+        assign(store)
+
+    store.check_in("bob", [])
+    assert store.get_task(assign(store)) is not None
 
 
 def test_a_released_worker_is_never_declared_lost(store: HubStore) -> None:

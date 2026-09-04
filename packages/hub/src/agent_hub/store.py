@@ -237,7 +237,7 @@ class HubStore:
                     " current_task_id = ? WHERE name = ?",
                     (
                         json.dumps(list(capabilities)),
-                        (AgentStatus.BUSY if current else AgentStatus.IDLE).value,
+                        _readmitted(AgentStatus(row["status"]), current).value,
                         now,
                         current,
                         name,
@@ -334,10 +334,17 @@ class HubStore:
         now = utcnow_iso()
         with database(self.path) as connection:
             record = self._require_agent(connection, agent)
-            if record.status is AgentStatus.RELEASED:
-                raise ConflictError(f"agent {agent} has been released")
-            if self._open_task_id(connection, record.current_task_id) is not None:
-                raise ConflictError(f"agent {agent} already holds task {record.current_task_id}")
+            if record.status is not AgentStatus.IDLE:
+                held = self._open_task_id(connection, record.current_task_id)
+                if held is not None:
+                    raise ConflictError(f"agent {agent} already holds task {held}")
+                # A released or lost worker is not there to claim the task, and
+                # the sweeper will not report it again. Check-in is the only
+                # re-admission: it is the one call that proves a worker is back.
+                raise ConflictError(
+                    f"agent {agent} is {record.status.value}, not idle; "
+                    "it must check in again before it can be given work"
+                )
             workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
             task_id = uuid4().hex
             connection.execute(
@@ -422,19 +429,31 @@ class HubStore:
             self._touch(connection, agent)
         self.signals.notify(EVENT_KEY)
 
-    def open_question(self, task_id: str, agent: str, question: str) -> int:
-        """Park a task on `input-required` and return the question's message id."""
+    def open_question(self, task_id: str, agent: str, question: str, sent_as: str) -> int:
+        """Park a task on `input-required` and return the question's row id.
+
+        `sent_as` is the caller's own message id, and a retry after a timeout
+        carries the one it first asked under. That is what makes "call again"
+        safe: Alice may have answered in the gap between attempts, and her
+        answer is older than a second question would be, so a retry that opened
+        a new question could never see it. A recognised retry resumes the
+        original instead — no second question, no duplicate event for Alice.
+        """
 
         with database(self.path) as connection:
             task = self._require_open_task(connection, task_id)
             record = self._require_agent(connection, agent)
+            asked = self._asked_question(connection, task.id, sent_as)
+            if asked is not None:
+                self._touch(connection, agent)
+                return asked
             message_id = self._add_message(
                 connection,
                 task_id=task.id,
                 context_id=record.context_id,
                 sender=agent,
                 direction="to_alice",
-                parts=[text_part(question, kind="question")],
+                parts=[text_part(question, kind="question", message_id=sent_as)],
             )
             self._set_state(connection, task.id, TaskState.INPUT_REQUIRED)
             self._add_event(
@@ -450,6 +469,25 @@ class HubStore:
             self._touch(connection, agent)
         self.signals.notify(EVENT_KEY)
         return message_id
+
+    def _asked_question(self, connection: Connection, task_id: str, sent_as: str) -> int | None:
+        """Return the row id of a question already asked under `sent_as`."""
+
+        if not sent_as:
+            return None
+        rows = connection.execute(
+            "SELECT id, parts_json FROM message WHERE task_id = ? AND direction = 'to_alice'"
+            " ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            for part in json.loads(row["parts_json"]):
+                if not isinstance(part, dict):
+                    continue
+                metadata = part.get("metadata") or {}
+                if metadata.get("kind") == "question" and metadata.get("message_id") == sent_as:
+                    return int(row["id"])
+        return None
 
     def reply(self, task_id: str, text: str) -> None:
         """Answer a worker question and put the task back to `working`."""
@@ -800,6 +838,21 @@ class HubStore:
                 )
             )
         return emitted
+
+
+def _readmitted(previous: AgentStatus, open_task: str | None) -> AgentStatus:
+    """Status for a worker that has just re-announced itself with READY.
+
+    A release outlives the connection it was issued on. Alice ends the workflow
+    by releasing her workers, so one that restarts afterwards has to be told to
+    stop; resetting it to idle would leave it polling for work nobody is left to
+    assign. Every other prior status — including `lost` — is what check-in
+    exists to clear.
+    """
+
+    if previous is AgentStatus.RELEASED:
+        return AgentStatus.RELEASED
+    return AgentStatus.BUSY if open_task else AgentStatus.IDLE
 
 
 def _placeholders(values: Sequence[object]) -> str:
