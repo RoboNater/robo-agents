@@ -2,10 +2,12 @@
 
 This repository implements the proof of concept described in
 [`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
-Step 1: the uv workspace, shared configuration and bearer-token provisioning,
-the SQLite schema, and A2A agent-card discovery.
+Steps 1–2: the uv workspace, shared configuration and bearer-token provisioning,
+the SQLite schema, A2A agent-card discovery, and the hub core — the A2A request
+handlers workers speak, Alice's event queue, the lease and heartbeat sweeper,
+and bearer enforcement on the protected routes.
 
-## Run the scaffold
+## Run the hub
 
 ```sh
 uv run hub
@@ -22,11 +24,6 @@ defaults with the variables documented in [`.env.example`](.env.example). For a
 deployed process, inject `HUB_TOKEN` rather than sharing the generated token
 file.
 
-Step 1 only provisions the token and advertises the `bearerAuth` scheme on the
-agent card; **nothing is enforced yet.** Bearer enforcement on the protected
-routes is a Step 2 deliverable (see §4.1 and §7 of the spec), so treat the hub as
-unauthenticated until then and keep it bound to loopback.
-
 `HUB_PUBLIC_URL` is the address the agent card advertises, not the bind address.
 It defaults to `http://HUB_HOST:HUB_PORT`, which is correct only for a loopback
 bind; binding the unspecified address in any spelling (`0.0.0.0`, `::`,
@@ -39,20 +36,66 @@ To load a local `.env` file explicitly:
 uv run --env-file .env hub
 ```
 
-Discovery and health endpoints are public:
+## What is public and what is not
+
+Discovery and health are the entire public surface — a worker needs the card
+before it holds a token, and health checks run before any credential exists:
 
 ```sh
 curl http://127.0.0.1:8420/.well-known/agent-card.json
 curl http://127.0.0.1:8420/healthz
 ```
 
-Run the Step 1 checks with:
+Everything else requires the pre-shared token. `POST /a2a` answers `401` with a
+`WWW-Authenticate: Bearer` challenge when the header is missing, malformed, or
+carries a token that does not match:
 
 ```sh
-uv run pytest
-uv run ruff check .
-uv run mypy packages tests
+TOKEN=$(cat ~/.local/state/agent-hub/token)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8420/a2a \
+  -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"x"}}'
+# 401
 ```
 
-The A2A request handlers, Alice MCP tools, and worker MCP tools intentionally
-remain unimplemented until plan Steps 2–4.
+## Talking to the hub
+
+Workers are A2A clients; the hub is the only server. Check in with `READY` to
+get the `contextId` every later call uses:
+
+```sh
+curl -s -X POST http://127.0.0.1:8420/a2a \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{
+        "messageId":"m1","role":"user","parts":[{"kind":"text","text":"READY"}],
+        "metadata":{"agent":"bob","capabilities":["python"],"runtime":"claude-code"}}}}'
+```
+
+Then poll for work with `NEXT` on `message/stream`. The hub holds the response
+open until Alice assigns a task or releases the agent, and returns a
+`metadata.timeout` marker at the deadline so no agent ever spins:
+
+```sh
+curl -sN -X POST http://127.0.0.1:8420/a2a \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"message/stream","params":{"message":{
+        "messageId":"m2","role":"user","parts":[{"kind":"text","text":"NEXT"}],
+        "contextId":"<contextId from the check-in>"}}}'
+```
+
+Progress notes, questions and results are `message/send` and `message/stream`
+calls carrying a `taskId` and a `metadata.kind` of `progress`, `question` or
+`result` — see §4.1 of the spec for the full mapping. Assignments themselves
+come from Alice, whose MCP tools land in Step 3 and run inside this same
+process; until then nothing assigns work, so a `NEXT` will hold to its deadline.
+
+## Checks
+
+```sh
+uv sync --locked --all-packages --dev
+uv run --locked ruff check .
+uv run --locked mypy
+uv run --locked pytest
+```
+
+Alice's MCP tools and the worker MCP tools intentionally remain unimplemented
+until plan Steps 3–4.
