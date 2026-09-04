@@ -61,8 +61,8 @@ resolve that with uv, never by hand-editing the lockfile.
 
 ## Changing things
 
-Fix the task in front of you; anything else you notice becomes an issue, not a
-bigger diff. When landing a change: work on a branch, never commit to `main`
-directly, reference the issue with `Closes #N`, and let CI pass before merging
-(squash, delete the branch). If the change completes a roadmap item, tick it
-in #2.
+Keep work scoped to the assigned task and report unrelated findings
+separately. Never commit directly to `main`. When explicitly asked to commit or
+open a PR for an issue, reference it with `Closes #N`. Only merge/delete the
+branch or update issue #2 when the task explicitly includes that action; wait
+for CI before merging and use squash merge.
