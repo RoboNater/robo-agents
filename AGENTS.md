@@ -72,6 +72,17 @@ a new issue, not a bigger diff.
 
 ## Things that bite
 
+- **A hub you start is yours to stop.** `uv run hub` outlives the task that
+  started it, and a leftover holds port 8420, so the next run dies with
+  `address already in use`. Check before starting one, and clean up when done:
+  ```sh
+  pgrep -a hub                   # live hubs; the venv path says which checkout
+  pkill -f "$PWD/.venv/bin/hub"  # stops only the ones from this checkout
+  ```
+  Kill the listener, not the `uv run` parent — the parent exits with its child,
+  but a killed parent can leave the child holding the port. Leave hubs belonging
+  to another checkout alone; report them instead of killing them. Strays that
+  keep reappearing despite this are a bug to investigate, not just to tidy up.
 - **stdout belongs to MCP.** From Step 3 the hub speaks JSON-RPC over stdio, so
   anything printed to stdout corrupts the framing. Log to stderr. (#7)
 - **The bearer token is provisioned but not yet enforced.** Step 1 loads it and
