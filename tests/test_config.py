@@ -131,3 +131,50 @@ def test_hostnames_are_left_alone() -> None:
 def test_settings_reject_invalid_overrides(name: str, value: str) -> None:
     with pytest.raises(ConfigurationError):
         HubSettings.from_env({name: value})
+
+
+def test_wait_bounds_and_liveness_scale_with_the_default_hold() -> None:
+    settings = HubSettings.from_env({})
+
+    assert settings.default_wait_s == 120
+    assert settings.max_wait_s == 300
+    # Spec §4.3: an agent is lost after three times the timeout with no contact,
+    # which has to outlast the longest hold the hub will grant.
+    assert settings.heartbeat_timeout_s == 360
+    assert settings.heartbeat_timeout_s > settings.max_wait_s
+    assert settings.sweep_interval_s == 10
+
+
+def test_lowering_the_default_hold_keeps_the_bounds_consistent() -> None:
+    settings = HubSettings.from_env({"HUB_DEFAULT_WAIT_S": "20"})
+
+    assert settings.max_wait_s == 50
+    assert settings.heartbeat_timeout_s == 60
+
+
+def test_a_requested_wait_is_clamped_to_the_ceiling() -> None:
+    settings = HubSettings.from_env({"HUB_DEFAULT_WAIT_S": "30", "HUB_MAX_WAIT_S": "45"})
+
+    assert settings.bounded_wait(None) == 30
+    assert settings.bounded_wait(10) == 10
+    assert settings.bounded_wait(9000) == 45
+    assert settings.bounded_wait(-5) == 0
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param({"HUB_DEFAULT_WAIT_S": "0"}, id="zero-wait"),
+        pytest.param({"HUB_SWEEP_INTERVAL_S": "-1"}, id="negative-interval"),
+        pytest.param({"HUB_MAX_WAIT_S": "soon"}, id="not-a-number"),
+        pytest.param(
+            {"HUB_DEFAULT_WAIT_S": "120", "HUB_MAX_WAIT_S": "60"}, id="ceiling-below-default"
+        ),
+        pytest.param(
+            {"HUB_MAX_WAIT_S": "300", "HUB_HEARTBEAT_TIMEOUT_S": "120"}, id="lost-mid-hold"
+        ),
+    ],
+)
+def test_settings_reject_inconsistent_timings(env: dict[str, str]) -> None:
+    with pytest.raises(ConfigurationError):
+        HubSettings.from_env(env)
