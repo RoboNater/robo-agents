@@ -104,7 +104,7 @@ per-call state to resume.
 | `log_decision` | `summary, rationale` | audit trail |
 
 No `ask_user` tool: Alice ends her turn with a question; events queue in SQLite until she resumes.
-No `merge` tool: Alice uses `gh pr checks` + `gh pr merge` directly (her session is a normal Claude Code session with shell access). Hub also serves `GET /guides/{role}.md` (static files from `guides/`), **authenticated with the same bearer token** as §4.1: the guides carry no secrets, but they are only ever fetched by workers that already hold a token, so requiring it costs nothing and keeps the public surface to discovery and health alone.
+No `merge` tool: Alice uses `gh pr checks` + `gh pr merge` directly (her session is a normal Claude Code session with shell access). Hub also serves `GET /guides/{role}.md` (static files from `guides/`, located by `HUB_GUIDES_DIR` and never relative to the working directory), **authenticated with the same bearer token** as §4.1: the guides carry no secrets, but they are only ever fetched by workers that already hold a token, so requiring it costs nothing and keeps the public surface to discovery and health alone. `{role}` is a role slug (`[a-z][a-z0-9-]*`) and never a path; an unwritten guide, an unknown role and a missing guides directory are all `404`, so the route works before Step 5 supplies the content.
 
 ### 4.3 Worker MCP tools (worker-mcp, stdio; configured with `HUB_URL`, `HUB_TOKEN`, `AGENT_NAME`)
 
@@ -154,7 +154,7 @@ agent-hub/
     hub/                    # A2A server + Alice MCP tools + SQLite  (FastAPI, a2a-sdk, mcp)
     worker_mcp/             # A2A client + worker MCP tools           (httpx, a2a-sdk, mcp)
     common/                 # shared models, config, token handling
-  guides/                   # runtime-agnostic, served by hub at /guides/{name}.md
+  guides/                   # runtime-agnostic, served by hub at /guides/{name}.md (route: step 2, content: step 5)
     worker.md  implementer.md  reviewer.md
   skills/                   # Claude Code only
     alice-orchestrator/SKILL.md   # the real Alice workflow (Alice is always Claude Code in PoC)
@@ -191,10 +191,10 @@ Exact config keys for the second runtime to be verified against its current docs
 | # | Step | Deliverable | Done when |
 |---|---|---|---|
 | 1 | Scaffold | uv workspace, packages, SQLite schema, config/token | `uv run hub` binds port, serves agent card |
-| 2 | Hub core | A2A handlers (§4.1), bearer enforcement on the protected routes (§4.1 public/protected split), event queue, lease/heartbeat sweeper | `curl` READY/NEXT/result round-trips; SSE holds and releases; the same `curl` with no `Authorization` header and with a wrong token both return 401 |
+| 2 | Hub core | A2A handlers (§4.1), `GET /guides/{role}.md` (§4.2) over a placeholder `guides/`, bearer enforcement on the protected routes (§4.1 public/protected split), event queue, lease/heartbeat sweeper | `curl` READY/NEXT/result round-trips; SSE holds and releases; `GET /guides/{role}.md` returns a guide dropped into `guides/` and 404s for an unknown role; the same `curl` with no `Authorization` header and with a wrong token both return 401, on the A2A route and on a guide alike |
 | 3 | Alice MCP tools | §4.2 over stdio in same process | Claude Code lists tools; `wait_for_event` blocks/returns |
-| 4 | Worker MCP | §4.3 incl. `get_role_guide`, retries with backoff, timeout → retry semantics; config snippets for both runtimes | `mock-alice.py` drives one task through a Claude Code worker **and** a second-runtime worker |
-| 5 | Guides, skill, prompts | Alice skill from your turn-taking dialogs (incl. merge step); `guides/*.md`; prompts | `mock-worker.py` (scripted events) drives real Alice through PLAN→MERGE→WRAP-UP, merge executed against a throwaway PR in the sandbox |
+| 4 | Worker MCP | §4.3 incl. `get_role_guide` (fetch per call, no local cache — §8), retries with backoff, timeout → retry semantics; config snippets for both runtimes | `mock-alice.py` drives one task through a Claude Code worker **and** a second-runtime worker |
+| 5 | Guides, skill, prompts | Alice skill from your turn-taking dialogs (incl. merge step); `guides/*.md` content (the route that serves it lands in Step 2); prompts | `mock-worker.py` (scripted events) drives real Alice through PLAN→MERGE→WRAP-UP, merge executed against a throwaway PR in the sandbox |
 | 6 | E2E, localhost | existing sandbox repo, seeded trivial issue, Alice+Bob on Claude Code, Charlie on second runtime | PR opened, reviewed, approved, **merged by Alice**, follow-ups filed if any, workers released |
 | 7 | E2E, networked | workers on a second machine/WSL instance via `HUB_URL` | same as 6 |
 | 8 | Harden | resume after Alice restart, `agent_lost` reassignment, escalation path exercised | kill/restart tests pass |
@@ -213,8 +213,10 @@ Suggested order of effort: 1–2 (1 day), 3–4 (1 day), 5 (iterative, needs you
 | Test repo | Existing sandbox — supply repo URL and a seeded issue number before step 6 |
 | Port | 8420 |
 | Auth surface | Bearer token required on the A2A route and `/guides/{role}.md`; only `/.well-known/agent-card.json` and `/healthz` are public. Enforcement is a Step 2 deliverable |
+| Guide serving | `GET /guides/{role}.md` is a Step 2 deliverable alongside the rest of the hub's HTTP surface; Step 5 owns only the guide text |
+| Guide caching | No local cache — `get_role_guide` fetches on every call. A worker that cannot reach the hub has no assignment to work on either, so a cached guide buys no offline capability; and the hub is where an edited guide has to take effect. Workers therefore need no cache path |
 
-**Still open (minor, can decide at step 4):** which second runtime; whether Charlie's guide fetch should also be cached locally for offline restarts.
+**Still open (minor, can decide at step 4):** which second runtime.
 
 ---
 
