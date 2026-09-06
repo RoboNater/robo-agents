@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
@@ -14,6 +16,8 @@ from agent_hub_common import HubSettings
 
 from .app import create_app
 from .mcp import run_mcp
+
+MCP_SHUTDOWN_TIMEOUT_S = 1.0
 
 
 @contextmanager
@@ -35,7 +39,13 @@ class HubServer(uvicorn.Server):
 
     @contextmanager
     def capture_signals(self) -> Iterator[None]:
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+
         def stop(signum: int, frame: object) -> None:
+            if self.should_exit and signum == signal.SIGINT:
+                self.force_exit = True
             self.should_exit = True
 
         previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
@@ -71,7 +81,8 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
         )
     )
     http = asyncio.create_task(server.serve())
-    mcp: asyncio.Task[None] | None = None
+    mcp: asyncio.Task[bool] | None = None
+    uninitialized_eof = False
     try:
         while not server.started:
             if http.done():
@@ -83,16 +94,27 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
         for task in done:
             await task
         if mcp in done:
-            logging.getLogger(__name__).warning(
-                "MCP stdin closed; shutting down HTTP. The hub requires an open "
-                "stdio connection; detached launches with stdin at EOF cannot serve."
-            )
+            if mcp.result():
+                logging.getLogger(__name__).info("MCP client disconnected; shutting down HTTP")
+            else:
+                uninitialized_eof = True
+                logging.getLogger(__name__).error(
+                    "MCP stdin closed before initialization; shutting down HTTP. "
+                    "Detached launches with stdin at EOF cannot serve."
+                )
     finally:
+        server.should_exit = True
+        await asyncio.gather(http, return_exceptions=True)
         if mcp is not None:
             mcp.cancel()
-            await asyncio.gather(mcp, return_exceptions=True)
-        server.should_exit = True
-        await http
+            _, pending = await asyncio.wait({mcp}, timeout=MCP_SHUTDOWN_TIMEOUT_S)
+            if pending:
+                logging.getLogger(__name__).critical(
+                    "MCP transport did not stop; forcing process exit"
+                )
+                os._exit(1)
+    if uninitialized_eof:
+        raise RuntimeError("MCP stdin closed before initialization")
 
 
 def main() -> None:

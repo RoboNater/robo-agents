@@ -455,4 +455,9 @@ async def test_manual_override_returns_terminal_task_to_question_stream(
     result = sse_results(await asyncio.wait_for(pending, 1))[0]
     assert result["kind"] == "task"
     assert result["status"]["state"] == state.value
+    assert result["status"]["message"]["parts"][0]["text"] == "Superseded"
+    assert result["status"]["message"]["metadata"] == {
+        "kind": "state_override",
+        "state": state.value,
+    }
     assert result["metadata"]["result"]["summary"] == "Superseded"

@@ -59,8 +59,9 @@ between launches to resume the same database, and stop an existing hub on the
 same port before starting the runtime connection. HTTP and MCP share one store
 and event loop; a separate process writing SQLite cannot wake these waits.
 Closing MCP stdin or terminating the process shuts down HTTP and the sweeper.
-A standalone `uv run hub` therefore needs stdin to stay open; if stdin closes,
-the hub logs an explicit warning explaining why it is stopping HTTP.
+A normal client disconnect is logged at info level. A standalone `uv run hub`
+needs stdin to stay open; EOF before MCP initialization is an error and exits
+nonzero so detached launches cannot silently appear healthy.
 
 Alice gets `get_state`, `wait_for_event`, `assign_task`, `reply`,
 `set_task_state`, `release_agent`, `set_workflow_status`, and `log_decision`.
@@ -68,11 +69,12 @@ Alice gets `get_state`, `wait_for_event`, `assign_task`, `reply`,
 (default 120), and returns `{"event": null}` on timeout; call again.
 Zero seconds performs a nonblocking check. If your runtime uses a shorter tool
 timeout, request a shorter hold or configure the client timeout above 120 seconds.
-Consumption happens before transport delivery, as specified in §4.2: a crash
-between consumption and delivery can lose an event notification. On reconnect,
-use `get_state` to reconcile durable workflow/task/agent state. Acknowledged event
-delivery and crash replay remain hardening work, not a guarantee of this queue. Assignment leases default to 30
-minutes and accept positive finite values up to one year.
+Consumption happens before transport delivery, as specified in §4.2: an event
+consumed for a call whose client has stopped waiting because of cancellation,
+timeout, or a crash is not redelivered. On reconnect, use `get_state` to
+reconcile durable workflow/task/agent state. Acknowledged delivery and replay
+remain hardening work, not a guarantee of this queue. Assignment leases default
+to 30 minutes and accept positive finite values up to one year.
 
 `get_state` returns a null workflow before one is created, plus agents and task
 summaries including results but excluding instructions and transcripts.

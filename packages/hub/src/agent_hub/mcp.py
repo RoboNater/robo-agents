@@ -1,11 +1,12 @@
 """Alice's §4.2 tools, sharing the HTTP server's store and event loop."""
 
 import asyncio
+import json
 import os
 import sys
 import threading
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Annotated, Any, Literal, TextIO
 
 import anyio
@@ -83,10 +84,11 @@ class CancellableStdin(anyio.AsyncFile[str]):
     hub state and cannot block interpreter shutdown; the process is exiting.
     """
 
-    def __init__(self, stream: TextIO) -> None:
+    def __init__(self, stream: TextIO, connection: "McpConnection") -> None:
         super().__init__(stream)
         self._fd = stream.fileno()
         self._pending = b""
+        self._connection = connection
 
     def _readline(self) -> str:
         # Do not hold TextIOWrapper's lock in an abandoned thread: Python
@@ -121,15 +123,66 @@ class CancellableStdin(anyio.AsyncFile[str]):
                 loop.call_soon_threadsafe(deliver, value)
 
         threading.Thread(target=read, name="mcp-stdin", daemon=True).start()
+        line = await result
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return line
+        if isinstance(payload, dict) and payload.get("method") == "initialize":
+            self._connection.initialized = True
+        return line
+
+
+class CancellableStdout(anyio.AsyncFile[str]):
+    """Write MCP framing without a non-daemon AnyIO worker blocking exit."""
+
+    def __init__(self, stream: TextIO) -> None:
+        super().__init__(stream)
+        self._fd = stream.fileno()
+
+    async def write(self, value: str) -> int:
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[int] = loop.create_future()
+        data = value.encode("utf-8")
+
+        def deliver(error: Exception | None) -> None:
+            if result.done():
+                return
+            if error is None:
+                result.set_result(len(value))
+            else:
+                result.set_exception(error)
+
+        def write() -> None:
+            error: Exception | None = None
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(self._fd, view) :]
+            except Exception as exc:
+                error = exc
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(deliver, error)
+
+        threading.Thread(target=write, name="mcp-stdout", daemon=True).start()
         return await result
 
+    async def flush(self) -> None:
+        return None
 
-async def run_mcp(store: HubStore, stdout: TextIO) -> None:
+
+@dataclass(slots=True)
+class McpConnection:
+    initialized: bool = False
+
+
+async def run_mcp(store: HubStore, stdout: TextIO) -> bool:
     server = create_mcp(store)
-    async with stdio_server(stdin=CancellableStdin(sys.stdin), stdout=anyio.wrap_file(stdout)) as (
-        read,
-        write,
-    ):
+    connection = McpConnection()
+    async with stdio_server(
+        stdin=CancellableStdin(sys.stdin, connection), stdout=CancellableStdout(stdout)
+    ) as (read, write):
         await server._mcp_server.run(
             read, write, server._mcp_server.create_initialization_options()
         )
+    return connection.initialized

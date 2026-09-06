@@ -5,6 +5,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+import uvicorn
 from agent_hub import main
 
 
@@ -48,6 +49,38 @@ def test_reserved_stream_is_exclusive_and_restored(monkeypatch: pytest.MonkeyPat
     assert sys.stdout is stdout
 
 
+def test_signal_capture_degrades_off_main_thread() -> None:
+    import threading
+
+    errors: list[BaseException] = []
+    server = main.HubServer(uvicorn.Config("unused:app"))
+
+    def enter() -> None:
+        try:
+            with server.capture_signals():
+                pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=enter)
+    thread.start()
+    thread.join()
+    assert errors == []
+
+
+def test_second_sigint_forces_exit() -> None:
+    import signal
+
+    server = main.HubServer(uvicorn.Config("unused:app"))
+    with server.capture_signals():
+        handler = signal.getsignal(signal.SIGINT)
+        assert callable(handler)
+        handler(signal.SIGINT, None)
+        assert server.should_exit and not server.force_exit
+        handler(signal.SIGINT, None)
+        assert server.force_exit
+
+
 def test_live_server_keeps_stdout_empty(tmp_path: Path) -> None:
     # Run in isolation so logging configuration and sys.stdout are process-local.
     # A pre-bound ephemeral socket avoids fixed-port conflicts and allocation races.
@@ -88,6 +121,7 @@ async def fake_mcp(store, stdout):
         response = await client.get(f"http://127.0.0.1:{port}/healthz")
         assert response.json() == {"status": "ok"}
     print("stray shutdown print")
+    return True
 
 main.run_mcp = fake_mcp
 main.main()
@@ -117,7 +151,7 @@ main.main()
         assert marker in result.stderr
 
 
-@pytest.mark.parametrize("shutdown", ["eof", "sigterm", "sigint", "http_error"])
+@pytest.mark.parametrize("shutdown", ["eof", "sigterm", "sigint", "http_error", "mcp_stuck"])
 def test_process_shutdown_releases_listener(tmp_path: Path, shutdown: str) -> None:
     import signal
     import socket
@@ -144,6 +178,16 @@ async def broken_loop(self):
     await asyncio.sleep(0.5)
     raise RuntimeError("injected HTTP failure")
 main.uvicorn.Server.main_loop = broken_loop
+"""
+    if shutdown == "mcp_stuck":
+        script += """
+async def stuck_mcp(store, stdout):
+    while True:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+main.run_mcp = stuck_mcp
 """
     script += "\nmain.main()"
     process = subprocess.Popen(
@@ -172,19 +216,108 @@ main.uvicorn.Server.main_loop = broken_loop
         if shutdown == "eof":
             assert process.stdin is not None
             process.stdin.close()
-        elif shutdown != "http_error":
+        elif shutdown not in ("http_error", "mcp_stuck"):
             process.send_signal(signal.SIGINT if shutdown == "sigint" else signal.SIGTERM)
+        elif shutdown == "mcp_stuck":
+            process.send_signal(signal.SIGTERM)
         process.wait(timeout=5)
         assert process.stderr is not None
         stderr = process.stderr.read().decode()
         assert "sweeper stopped" in stderr
-        assert process.returncode == (1 if shutdown == "http_error" else 0), stderr
+        expected = 1 if shutdown in ("eof", "http_error", "mcp_stuck") else 0
+        assert process.returncode == expected, stderr
         if shutdown == "eof":
-            assert "MCP stdin closed; shutting down HTTP" in stderr
+            assert "MCP stdin closed before initialization" in stderr
         if shutdown == "http_error":
             assert "injected HTTP failure" in stderr
+        if shutdown == "mcp_stuck":
+            assert "MCP transport did not stop; forcing process exit" in stderr
         with pytest.raises(OSError):
             urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.2)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+@pytest.mark.parametrize("blocked_stdout", [False, True])
+def test_initialized_mcp_disconnect_and_blocked_output_shutdown(
+    tmp_path: Path, blocked_stdout: bool
+) -> None:
+    import json
+    import signal
+    import socket
+    import time
+    import urllib.request
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = subprocess.Popen(
+        [sys.executable, "-m", "agent_hub.main"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={
+            **os.environ,
+            "HUB_STATE_DIR": str(tmp_path),
+            "HUB_DB_PATH": str(tmp_path / "hub.db"),
+            "HUB_TOKEN": "test",
+            "HUB_HOST": "127.0.0.1",
+            "HUB_PORT": str(port),
+        },
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.2).close()
+                break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "1"},
+                    },
+                }
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        assert json.loads(process.stdout.readline())["id"] == 1
+        process.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        if blocked_stdout:
+            for request_id in range(2, 102):
+                process.stdin.write(
+                    json.dumps({"jsonrpc": "2.0", "id": request_id, "method": "tools/list"}) + "\n"
+                )
+            process.stdin.flush()
+            time.sleep(0.2)
+            process.send_signal(signal.SIGTERM)
+        else:
+            process.stdin.close()
+        process.wait(timeout=5)
+        assert process.returncode == 0
+        assert process.stderr is not None
+        stderr = process.stderr.read()
+        assert "Finished server process" in stderr
+        if not blocked_stdout:
+            assert "MCP client disconnected; shutting down HTTP" in stderr
+            assert "before initialization" not in stderr
     finally:
         if process.poll() is None:
             process.kill()

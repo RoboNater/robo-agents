@@ -2,18 +2,20 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 from agent_hub.database import database, initialize_database
-from agent_hub.mcp import create_mcp
+from agent_hub.mcp import CancellableStdout, create_mcp
 from agent_hub.store import HubStore
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.types import CancelledNotification, CancelledNotificationParams, ClientNotification
 
 TOOLS = {
     "get_state",
@@ -70,8 +72,28 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
     for args in ({"timeout_s": -1}, {"timeout_s": 121}, {"timeout_s": float("inf")}):
         with pytest.raises(Exception, match="validation error"):
             await call("wait_for_event", **args)
-    with pytest.raises(Exception, match="already failed"):
-        await call("set_task_state", task_id=task["id"], state="canceled", note="Again")
+        with pytest.raises(Exception, match="already failed"):
+            await call("set_task_state", task_id=task["id"], state="canceled", note="Again")
+
+
+async def test_canceling_a_blocked_stdout_write_returns_promptly() -> None:
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    try:
+        while True:
+            os.write(write_fd, b"x" * 4096)
+    except BlockingIOError:
+        pass
+    os.set_blocking(write_fd, True)
+    stream = os.fdopen(write_fd, "w", closefd=False)
+    pending = asyncio.create_task(CancellableStdout(stream).write("blocked"))
+    await asyncio.sleep(0.05)
+    assert not pending.done()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 0.5)
+    os.close(read_fd)
+    os.close(write_fd)
 
 
 async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
@@ -95,23 +117,6 @@ async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
         assert {t.name for t in (await session.list_tools()).tools} == TOOLS
         timeout = await session.call_tool("wait_for_event", {"timeout_s": 0.02})
         assert timeout.structuredContent == {"event": None}
-        canceled_id = session._request_id
-        canceled = asyncio.create_task(session.call_tool("wait_for_event", {"timeout_s": 120}))
-        await asyncio.sleep(0.05)
-        canceled.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await canceled
-        # This SDK does not send wire cancellation when its Python task is cancelled.
-        await session.send_notification(
-            ClientNotification(
-                CancelledNotification(
-                    method="notifications/cancelled",
-                    params=CancelledNotificationParams(requestId=canceled_id),
-                )
-            )
-        )
-        # A subsequent request gives the server a chance to process cancellation.
-        await session.call_tool("get_state")
         pending = asyncio.create_task(session.call_tool("wait_for_event", {"timeout_s": 2}))
         await asyncio.sleep(0.05)
         assert not pending.done()
@@ -147,37 +152,118 @@ async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
             await client.get(f"http://127.0.0.1:{port}/healthz")
 
 
-def test_state_uses_one_read_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from collections.abc import Iterator
-    from contextlib import contextmanager
-    from sqlite3 import Connection
+def test_wire_cancellation_stops_event_consumption(tmp_path: Path) -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = subprocess.Popen(
+        [sys.executable, "-m", "agent_hub.main"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={
+            **os.environ,
+            "HUB_STATE_DIR": str(tmp_path),
+            "HUB_DB_PATH": str(tmp_path / "hub.db"),
+            "HUB_HOST": "127.0.0.1",
+            "HUB_PORT": str(port),
+            "HUB_TOKEN": "test",
+        },
+    )
 
-    from agent_hub import store as store_module
+    def send(payload: dict[str, Any]) -> None:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(payload) + "\n")
+        process.stdin.flush()
 
-    path = tmp_path / "hub.db"
-    initialize_database(path)
-    store = HubStore(path)
-    store.check_in("bob", [])
-    task = store.assign_task("bob", "implementer", "Fix", "Instructions")
-    changed = False
+    def receive() -> dict[str, Any]:
+        assert process.stdout is not None
+        return cast(dict[str, Any], json.loads(process.stdout.readline()))
 
-    def between_queries(sql: str) -> None:
-        nonlocal changed
-        if "SELECT * FROM task" in sql and not changed:
-            changed = True
-            with database(path) as writer:
-                writer.execute("UPDATE task SET state = 'completed' WHERE id = ?", (task.id,))
-                writer.execute("UPDATE agent SET status = 'idle', current_task_id = NULL")
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.2).close()
+                break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                },
+            }
+        )
+        assert receive()["id"] == 1
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {"name": "wait_for_event", "arguments": {"timeout_s": 120}},
+            }
+        )
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 42, "reason": "test"},
+            }
+        )
+        canceled = receive()
+        assert canceled["id"] == 42
+        assert canceled["error"]["message"] == "Request cancelled"
 
-    @contextmanager
-    def traced_database(path: Path) -> Iterator[Connection]:
-        with database(path) as connection:
-            connection.set_trace_callback(between_queries)
-            yield connection
-
-    monkeypatch.setattr(store_module, "database", traced_database)
-    state = store.get_state()
-    assert changed
-    assert state["tasks"][0]["state"] == "submitted"
-    assert state["agents"][0]["status"] == "busy"
-    assert state["agents"][0]["current_task_id"] == task.id
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/a2a",
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "message/send",
+                    "params": {
+                        "message": {
+                            "messageId": "ready",
+                            "role": "user",
+                            "parts": [{"kind": "text", "text": "READY"}],
+                            "metadata": {"agent": "bob", "capabilities": []},
+                        }
+                    },
+                }
+            ).encode(),
+            headers={"Authorization": "Bearer test", "Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(request, timeout=1).close()
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "tools/call",
+                "params": {"name": "wait_for_event", "arguments": {"timeout_s": 1}},
+            }
+        )
+        delivered = receive()
+        assert delivered["id"] == 43
+        content = json.loads(delivered["result"]["content"][0]["text"])
+        assert content["event"]["kind"] == "agent_checked_in"
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()

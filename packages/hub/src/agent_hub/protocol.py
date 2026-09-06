@@ -67,9 +67,7 @@ SSE_MEDIA_TYPE = "text/event-stream"
 # Proxies that buffer would defeat the point of holding the response open.
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
-SUPPORTED_METHODS = frozenset(
-    {"message/send", "message/stream", "tasks/get", "tasks/cancel"}
-)
+SUPPORTED_METHODS = frozenset({"message/send", "message/stream", "tasks/get", "tasks/cancel"})
 
 RequestId = str | int | None
 A2AErrorModel = (
@@ -192,16 +190,20 @@ def _artifacts(record: TaskRecord) -> list[Artifact] | None:
 
 
 def _task_object(
-    record: TaskRecord, context_id: str, history: list[A2AMessage] | None = None
+    record: TaskRecord,
+    context_id: str,
+    history: list[A2AMessage] | None = None,
+    status_message: A2AMessage | None = None,
 ) -> Task:
     """Render a stored task as the A2A Task a worker or debugger receives."""
 
-    status_message = _agent_message(
-        record.instructions,
-        context_id=context_id,
-        task_id=record.id,
-        metadata={"kind": "assignment", "role": record.role, "title": record.title},
-    )
+    if status_message is None:
+        status_message = _agent_message(
+            record.instructions,
+            context_id=context_id,
+            task_id=record.id,
+            metadata={"kind": "assignment", "role": record.role, "title": record.title},
+        )
     return Task(
         id=record.id,
         context_id=context_id,
@@ -292,9 +294,7 @@ class A2AProtocol:
 
     def _check_in(self, message: A2AMessage, metadata: dict[str, Any]) -> A2AMessage:
         if _text(message).upper() != CHECK_IN_TEXT:
-            raise _invalid(
-                f"a message with no taskId must be the {CHECK_IN_TEXT} check-in"
-            )
+            raise _invalid(f"a message with no taskId must be the {CHECK_IN_TEXT} check-in")
         name = metadata.get("agent")
         if not isinstance(name, str) or not name.strip():
             raise _invalid("check-in requires metadata.agent")
@@ -411,7 +411,19 @@ class A2AProtocol:
             TaskState.FAILED,
             TaskState.COMPLETED,
         ):
-            yield _sse(_success_body(request_id, _task_object(current, agent.context_id)))
+            note = str((current.result or {}).get("summary", current.state.value))
+            status_message = _agent_message(
+                note,
+                context_id=agent.context_id,
+                task_id=current.id,
+                metadata={"kind": "state_override", "state": current.state.value},
+            )
+            yield _sse(
+                _success_body(
+                    request_id,
+                    _task_object(current, agent.context_id, status_message=status_message),
+                )
+            )
             return
         if reply is None:
             yield _sse(
