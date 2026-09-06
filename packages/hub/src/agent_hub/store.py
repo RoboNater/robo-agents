@@ -11,7 +11,7 @@ import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from sqlite3 import Connection, Row
@@ -206,6 +206,61 @@ class HubStore:
             ),
         )
         return workflow_id
+
+    def get_state(self) -> dict[str, Any]:
+        """Return compact state without task instructions or transcripts."""
+        with database(self.path) as connection:
+            row = connection.execute("SELECT * FROM workflow ORDER BY created LIMIT 1").fetchone()
+            workflow = None if row is None else dict(row)
+            if workflow is not None:
+                workflow["policy"] = json.loads(workflow.pop("policy_json"))
+        tasks = []
+        for task in self.tasks():
+            summary = asdict(task)
+            summary.pop("instructions")
+            tasks.append(summary)
+        return {"workflow": workflow, "agents": [asdict(a) for a in self.agents()], "tasks": tasks}
+
+    def set_workflow_status(self, status: WorkflowStatus, summary: str) -> None:
+        """Persist status and its explanation atomically in the audit log."""
+        with database(self.path) as connection:
+            workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            connection.execute(
+                "UPDATE workflow SET status = ? WHERE id = ?", (status.value, workflow_id)
+            )
+            connection.execute(
+                "INSERT INTO decision (ts, summary, rationale) VALUES (?, ?, ?)",
+                (utcnow_iso(), summary, f"Workflow status set to {status.value}"),
+            )
+
+    def log_decision(self, summary: str, rationale: str) -> int:
+        with database(self.path) as connection:
+            cursor = connection.execute(
+                "INSERT INTO decision (ts, summary, rationale) VALUES (?, ?, ?)",
+                (utcnow_iso(), summary, rationale),
+            )
+            return int(cursor.lastrowid or 0)
+
+    def set_task_state(self, task_id: str, state: TaskState, note: str) -> TaskRecord:
+        """Cancel or fail open work; terminal work requires a new assignment."""
+        if state not in (TaskState.CANCELED, TaskState.FAILED):
+            raise ConflictError("manual overrides accept only canceled or failed")
+        with database(self.path) as connection:
+            task = self._require_open_task(connection, task_id)
+            context_id = self._task_context_id(connection, task)
+            self._add_message(
+                connection,
+                task_id=task_id,
+                context_id=context_id,
+                sender="alice",
+                direction="from_alice",
+                parts=[text_part(note, kind="state_override")],
+            )
+            self._finish(connection, task_id, state, {"status": state.value, "summary": note})
+            result = self._require_task(connection, task_id)
+        self.signals.notify(task_key(task_id))
+        self.signals.notify(context_key(context_id))
+        return result
 
     # -- agents -------------------------------------------------------------
 

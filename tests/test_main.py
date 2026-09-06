@@ -6,35 +6,33 @@ from pathlib import Path
 
 import pytest
 from agent_hub import main
-from fastapi import FastAPI
 
 
-def test_main_parses_environment_once_and_runs_built_app(
+def test_main_parses_environment_once_and_reserves_stdout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    calls: list[tuple[FastAPI, dict[str, object]]] = []
+    from typing import TextIO
 
-    def fake_run(app: FastAPI, **kwargs: object) -> None:
-        calls.append((app, kwargs))
+    from agent_hub_common import HubSettings
+
+    stdout, stderr = StringIO(), StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    async def fake_run(settings: HubSettings, protocol: TextIO) -> None:
+        assert settings.public_url == "https://public.example"
+        assert settings.host == "127.0.0.2"
+        assert settings.port == 8430
+        assert protocol is stdout
+        assert sys.stdout is stderr
 
     monkeypatch.setenv("HUB_HOST", "127.0.0.2")
     monkeypatch.setenv("HUB_PORT", "8430")
     monkeypatch.setenv("HUB_PUBLIC_URL", "https://public.example/")
     monkeypatch.setenv("HUB_DB_PATH", str(tmp_path / "hub.db"))
     monkeypatch.setenv("HUB_TOKEN", "test-token")
-    monkeypatch.setattr("agent_hub.main.uvicorn.run", fake_run)
-
+    monkeypatch.setattr(main, "run_hub", fake_run)
     main.main()
-
-    app, kwargs = calls[0]
-    assert isinstance(app, FastAPI)
-    assert app.state.settings.public_url == "https://public.example"
-    assert kwargs["host"] == "127.0.0.2"
-    assert kwargs["port"] == 8430
-    assert kwargs["access_log"] is False
-    config = kwargs["log_config"]
-    assert isinstance(config, dict)
-    assert all(h["stream"] == "ext://sys.stderr" for h in config["handlers"].values())
 
 
 def test_reserved_stream_is_exclusive_and_restored(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,30 +62,20 @@ import httpx
 import uvicorn
 from agent_hub import main
 
-async def serve(app, kwargs):
-    kwargs["access_log"] = True  # Explicit stderr config must protect this too.
-    server = uvicorn.Server(uvicorn.Config(app, **kwargs))
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        listener.listen()
-        listener.setblocking(False)
-        task = asyncio.create_task(server.serve(sockets=[listener]))
-        try:
-            while not server.started:
-                if task.done():
-                    await task
-                    raise RuntimeError("server failed to start")
-                await asyncio.sleep(0.01)
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"http://127.0.0.1:{listener.getsockname()[1]}/healthz"
-                )
-                assert response.json() == {"status": "ok"}
-        finally:
-            server.should_exit = True
-            await task
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+port = listener.getsockname()[1]
+listener.close()
+import os
+os.environ["HUB_PORT"] = str(port)
 
-def run(app, **kwargs):
+original_config = uvicorn.Config
+def config(*args, **kwargs):
+    kwargs["access_log"] = True
+    return original_config(*args, **kwargs)
+main.uvicorn.Config = config
+
+async def fake_mcp(store, stdout):
     print("stray startup print")
     logger = logging.getLogger("third-party")
     logger.addHandler(logging.StreamHandler(sys.stdout))
@@ -96,10 +84,12 @@ def run(app, **kwargs):
         raise ValueError("callback traceback")
     except ValueError:
         traceback.print_exc(file=sys.stdout)
-    asyncio.run(serve(app, kwargs))
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"http://127.0.0.1:{port}/healthz")
+        assert response.json() == {"status": "ok"}
     print("stray shutdown print")
 
-main.uvicorn.run = run
+main.run_mcp = fake_mcp
 main.main()
 """
     result = subprocess.run(
@@ -125,3 +115,51 @@ main.main()
         "Finished server process",
     ):
         assert marker in result.stderr
+
+
+@pytest.mark.parametrize("shutdown", ["eof", "signal"])
+def test_process_shutdown_releases_listener(tmp_path: Path, shutdown: str) -> None:
+    import signal
+    import socket
+    import time
+    import urllib.request
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = subprocess.Popen(
+        [sys.executable, "-m", "agent_hub.main"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "HUB_STATE_DIR": str(tmp_path),
+            "HUB_DB_PATH": str(tmp_path / "hub.db"),
+            "HUB_TOKEN": "test",
+            "HUB_HOST": "127.0.0.1",
+            "HUB_PORT": str(port),
+        },
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.2):
+                    break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+        if shutdown == "eof":
+            assert process.stdin is not None
+            process.stdin.close()
+        else:
+            process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
