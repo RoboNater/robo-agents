@@ -18,7 +18,9 @@ from fastapi import HTTPException, Response, status
 # request from naming a path: no separators, no dot segments, no absolute
 # paths. Documentation that lives alongside the guides (README.md) is not a
 # role and is not served.
-ROLE_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
+# Matched with `fullmatch`: `$` alone would also accept a trailing newline,
+# which a percent-encoded request can carry.
+ROLE_PATTERN = re.compile(r"[a-z][a-z0-9-]*")
 
 MEDIA_TYPE = "text/markdown; charset=utf-8"
 
@@ -30,7 +32,7 @@ def _not_found(role: str) -> HTTPException:
 def guide_response(guides_dir: Path, role: str) -> Response:
     """Serve `{role}.md` from the guides directory, or raise 404."""
 
-    if not ROLE_PATTERN.match(role):
+    if not ROLE_PATTERN.fullmatch(role):
         raise _not_found(role)
 
     # Both sides are resolved before comparing so that a symlink inside the

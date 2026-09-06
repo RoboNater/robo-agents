@@ -69,6 +69,7 @@ async def test_a_missing_guides_directory_is_a_404_not_a_crash(
         pytest.param("/guides/WORKER.md", id="uppercase"),
         pytest.param("/guides/README.md", id="not-a-role"),
         pytest.param("/guides/.env.md", id="hidden"),
+        pytest.param("/guides/worker%0a.md", id="trailing-newline"),
     ],
 )
 async def test_a_request_cannot_name_a_path(
@@ -76,6 +77,9 @@ async def test_a_request_cannot_name_a_path(
 ) -> None:
     (guides.parent / "secret.md").write_text("not a guide", encoding="utf-8")
     (guides / "README.md").write_text("not a guide", encoding="utf-8")
+    # A percent-encoded newline reaches the route, so the file a lenient name
+    # check would have served has to exist for the case to mean anything.
+    (guides / "worker\n.md").write_text("not a guide", encoding="utf-8")
 
     response = await client.get(target)
 
@@ -121,7 +125,18 @@ async def test_a_symlinked_guides_directory_still_serves(
 
 @pytest.mark.parametrize(
     "role",
-    ["..", ".", "../secret", "/etc/passwd", "", "worker.md", "Worker", "wor ker", "worker/"],
+    [
+        "..",
+        ".",
+        "../secret",
+        "/etc/passwd",
+        "",
+        "worker.md",
+        "Worker",
+        "wor ker",
+        "worker/",
+        "worker\n",
+    ],
 )
 def test_only_a_role_slug_names_a_guide(guides: Path, role: str) -> None:
     """The route's own matching rejects most of these; the check is the guarantee."""
