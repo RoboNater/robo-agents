@@ -13,6 +13,7 @@ from agent_hub.mcp import create_mcp
 from agent_hub.store import HubStore
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.types import CancelledNotification, CancelledNotificationParams, ClientNotification
 
 TOOLS = {
     "get_state",
@@ -94,11 +95,21 @@ async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
         assert {t.name for t in (await session.list_tools()).tools} == TOOLS
         timeout = await session.call_tool("wait_for_event", {"timeout_s": 0.02})
         assert timeout.structuredContent == {"event": None}
+        canceled_id = session._request_id
         canceled = asyncio.create_task(session.call_tool("wait_for_event", {"timeout_s": 120}))
         await asyncio.sleep(0.05)
         canceled.cancel()
         with pytest.raises(asyncio.CancelledError):
             await canceled
+        # This SDK does not send wire cancellation when its Python task is cancelled.
+        await session.send_notification(
+            ClientNotification(
+                CancelledNotification(
+                    method="notifications/cancelled",
+                    params=CancelledNotificationParams(requestId=canceled_id),
+                )
+            )
+        )
         # A subsequent request gives the server a chance to process cancellation.
         await session.call_tool("get_state")
         pending = asyncio.create_task(session.call_tool("wait_for_event", {"timeout_s": 2}))
