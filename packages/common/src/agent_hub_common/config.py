@@ -90,6 +90,24 @@ def _default_state_dir(env: Mapping[str, str]) -> Path:
     return base / "agent-hub"
 
 
+def _default_guides_dir(state_dir: Path) -> Path:
+    """Locate the checkout's top-level `guides/` directory (spec §6).
+
+    The hub is installed from the workspace, so this module sits at
+    `packages/common/src/agent_hub_common/` and the guides four directories
+    above it. Installed anywhere else that ancestor is not a checkout, and the
+    guides have to be pointed at explicitly; the state directory is the
+    harmless stand-in until they are, since serving whatever `guides/` happens
+    to sit above an unrelated install site would be worse than serving nothing.
+    """
+
+    parents = Path(__file__).resolve().parents
+    root = parents[4] if len(parents) > 4 else None
+    if root is not None and (root / "pyproject.toml").is_file():
+        return root / "guides"
+    return state_dir / "guides"
+
+
 def _state_dir(env: Mapping[str, str]) -> Path:
     raw_state_dir = env.get("HUB_STATE_DIR", "").strip()
     if not raw_state_dir:
@@ -114,6 +132,9 @@ class HubSettings:
     database_path: Path
     token: str | None
     token_file: Path
+    # Role guides are repo content served over HTTP, not durable state: the hub
+    # only reads them (§4.2).
+    guides_dir: Path
     # Blocking calls are bounded so no agent ever spins: a held request returns
     # empty at the deadline and the caller is told to call again.
     default_wait_s: float = 120.0
@@ -174,6 +195,20 @@ class HubSettings:
         # finds the database and token of the previous run.
         state_dir = _state_dir(env)
 
+        # The guides directory is read-only content rather than state, but it is
+        # subject to the same rule: nothing is resolved against the working
+        # directory, which an MCP client picks for itself.
+        raw_guides_dir = env.get("HUB_GUIDES_DIR", "").strip()
+        if not raw_guides_dir:
+            guides_dir = _default_guides_dir(state_dir)
+        else:
+            guides_dir = Path(raw_guides_dir).expanduser()
+            if not guides_dir.is_absolute():
+                raise ConfigurationError(
+                    f"HUB_GUIDES_DIR must be an absolute path, got {raw_guides_dir!r}; "
+                    "a relative guides directory changes with the working directory"
+                )
+
         default_wait_s = _positive_seconds(env, "HUB_DEFAULT_WAIT_S", DEFAULT_WAIT_S)
         max_wait_s = _positive_seconds(env, "HUB_MAX_WAIT_S", MAX_WAIT_FACTOR * default_wait_s)
         if max_wait_s < default_wait_s:
@@ -200,6 +235,7 @@ class HubSettings:
             database_path=_path(env.get("HUB_DB_PATH", "hub.db"), state_dir),
             token=token,
             token_file=_path(env.get("HUB_TOKEN_FILE", "token"), state_dir),
+            guides_dir=guides_dir,
             default_wait_s=default_wait_s,
             max_wait_s=max_wait_s,
             heartbeat_timeout_s=heartbeat_timeout_s,

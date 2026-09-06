@@ -71,4 +71,5 @@ def test_no_route_reaches_state_without_the_token(app: FastAPI) -> None:
     assert {route.path for route in app.routes if isinstance(route, APIRoute)} == {
         *PUBLIC_ROUTES,
         "/a2a",
+        "/guides/{role}.md",
     }

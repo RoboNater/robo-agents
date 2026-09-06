@@ -1,4 +1,4 @@
-"""FastAPI application: A2A discovery plus the protected worker protocol."""
+"""FastAPI application: A2A discovery, the worker protocol, and role guides."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Request, Response
 
 from .card import build_agent_card
 from .database import initialize_database
+from .guides import guide_response
 from .protocol import A2AProtocol, parse_error_response
 from .security import require_bearer
 from .signals import Signals
@@ -36,6 +37,13 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
         # Log the resolved absolute path so a hub started against the wrong state
         # directory is visible at once, rather than as lost state later.
         logger.info("SQLite database ready at %s", resolved.database_path)
+        if resolved.guides_dir.is_dir():
+            logger.info("Serving role guides from %s", resolved.guides_dir)
+        else:
+            # Step 5 authors the guide content; until then, and whenever
+            # HUB_GUIDES_DIR points somewhere else than intended, every
+            # /guides/{role}.md is a 404 and this line is the only warning.
+            logger.warning("Guides directory %s does not exist", resolved.guides_dir)
         if resolved.token is None:
             logger.info("Bearer token ready at %s", resolved.token_file)
         else:
@@ -67,6 +75,10 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
     @app.get("/healthz", include_in_schema=False)
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/guides/{role}.md", include_in_schema=False, dependencies=[Depends(require_bearer)])
+    async def role_guide(role: str) -> Response:
+        return guide_response(resolved.guides_dir, role)
 
     @app.post("/a2a", include_in_schema=False, dependencies=[Depends(require_bearer)])
     async def a2a(request: Request) -> Response:

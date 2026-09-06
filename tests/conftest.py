@@ -33,6 +33,7 @@ def settings(tmp_path: Path) -> HubSettings:
         database_path=tmp_path / "hub.db",
         token=TOKEN,
         token_file=tmp_path / "token",
+        guides_dir=tmp_path / "guides",
         default_wait_s=TEST_WAIT_S,
         max_wait_s=TEST_MAX_WAIT_S,
         heartbeat_timeout_s=60.0,

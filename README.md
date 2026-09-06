@@ -4,8 +4,8 @@ This repository implements the proof of concept described in
 [`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
 Steps 1–2: the uv workspace, shared configuration and bearer-token provisioning,
 the SQLite schema, A2A agent-card discovery, and the hub core — the A2A request
-handlers workers speak, Alice's event queue, the lease and heartbeat sweeper,
-and bearer enforcement on the protected routes.
+handlers workers speak, the role-guide route, Alice's event queue, the lease and
+heartbeat sweeper, and bearer enforcement on the protected routes.
 
 ## Run the hub
 
@@ -46,9 +46,9 @@ curl http://127.0.0.1:8420/.well-known/agent-card.json
 curl http://127.0.0.1:8420/healthz
 ```
 
-Everything else requires the pre-shared token. `POST /a2a` answers `401` with a
-`WWW-Authenticate: Bearer` challenge when the header is missing, malformed, or
-carries a token that does not match:
+Everything else — `POST /a2a` and `GET /guides/{role}.md` — requires the
+pre-shared token, answering `401` with a `WWW-Authenticate: Bearer` challenge
+when the header is missing, malformed, or carries a token that does not match:
 
 ```sh
 TOKEN=$(cat ~/.local/state/agent-hub/token)
@@ -81,6 +81,23 @@ curl -sN -X POST http://127.0.0.1:8420/a2a \
         "messageId":"m2","role":"user","parts":[{"kind":"text","text":"NEXT"}],
         "contextId":"<contextId from the check-in>"}}}'
 ```
+
+## Role guides
+
+Workers on any runtime get identical instructions from the hub rather than from
+a Claude Code skill, so `GET /guides/{role}.md` is what the runtime-agnostic
+design rests on:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8420/guides/worker.md
+```
+
+The files come from the [`guides/`](guides) directory of this checkout, found
+from the installed package and never from the working directory; set
+`HUB_GUIDES_DIR` (absolute) to serve them from anywhere else. `{role}` is a role
+slug, never a path: an unknown role, an unwritten guide and a missing directory
+are all `404`. The guide *content* is written in Step 5, so today every request
+is a 404 and the startup log names the directory the hub is reading.
 
 Progress notes, questions and results are `message/send` and `message/stream`
 calls carrying a `taskId` and a `metadata.kind` of `progress`, `question` or
