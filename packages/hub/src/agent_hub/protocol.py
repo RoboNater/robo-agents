@@ -405,6 +405,14 @@ class A2AProtocol:
         sent_as: str,
     ) -> AsyncIterator[bytes]:
         reply = await self.store.await_reply(task.id, question_id, timeout_s)
+        current = self.store.get_task(task.id)
+        if current is not None and current.state in (
+            TaskState.CANCELED,
+            TaskState.FAILED,
+            TaskState.COMPLETED,
+        ):
+            yield _sse(_success_body(request_id, _task_object(current, agent.context_id)))
+            return
         if reply is None:
             yield _sse(
                 _success_body(

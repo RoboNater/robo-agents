@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import signal
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stdout
@@ -29,13 +30,37 @@ def reserve_stdout() -> Iterator[TextIO]:
         yield protocol_stdout
 
 
+class HubServer(uvicorn.Server):
+    """Handle signals without Uvicorn re-raising them before MCP cleanup."""
+
+    @contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        def stop(signum: int, frame: object) -> None:
+            self.should_exit = True
+
+        previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            yield
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    async def main_loop(self) -> None:
+        try:
+            await super().main_loop()
+        except BaseException:
+            # Uvicorn does not run shutdown when its main loop raises.
+            await self.shutdown()
+            raise
+
+
 async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
     """Own both transports; either one's exit shuts down its sibling."""
     app = create_app(settings)
     log_config = deepcopy(uvicorn.config.LOGGING_CONFIG)
     for handler in log_config["handlers"].values():
         handler["stream"] = "ext://sys.stderr"
-    server = uvicorn.Server(
+    server = HubServer(
         uvicorn.Config(
             app,
             host=settings.host,
@@ -57,6 +82,11 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
         done, _ = await asyncio.wait((http, mcp), return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             await task
+        if mcp in done:
+            logging.getLogger(__name__).warning(
+                "MCP stdin closed; shutting down HTTP. The hub requires an open "
+                "stdio connection; detached launches with stdin at EOF cannot serve."
+            )
     finally:
         if mcp is not None:
             mcp.cancel()

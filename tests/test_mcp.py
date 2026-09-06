@@ -94,6 +94,13 @@ async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
         assert {t.name for t in (await session.list_tools()).tools} == TOOLS
         timeout = await session.call_tool("wait_for_event", {"timeout_s": 0.02})
         assert timeout.structuredContent == {"event": None}
+        canceled = asyncio.create_task(session.call_tool("wait_for_event", {"timeout_s": 120}))
+        await asyncio.sleep(0.05)
+        canceled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await canceled
+        # A subsequent request gives the server a chance to process cancellation.
+        await session.call_tool("get_state")
         pending = asyncio.create_task(session.call_tool("wait_for_event", {"timeout_s": 2}))
         await asyncio.sleep(0.05)
         assert not pending.done()
@@ -127,3 +134,39 @@ async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
     async with httpx.AsyncClient() as client:
         with pytest.raises(httpx.ConnectError):
             await client.get(f"http://127.0.0.1:{port}/healthz")
+
+
+def test_state_uses_one_read_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+    from sqlite3 import Connection
+
+    from agent_hub import store as store_module
+
+    path = tmp_path / "hub.db"
+    initialize_database(path)
+    store = HubStore(path)
+    store.check_in("bob", [])
+    task = store.assign_task("bob", "implementer", "Fix", "Instructions")
+    changed = False
+
+    def between_queries(sql: str) -> None:
+        nonlocal changed
+        if "SELECT * FROM task" in sql and not changed:
+            changed = True
+            with database(path) as writer:
+                writer.execute("UPDATE task SET state = 'completed' WHERE id = ?", (task.id,))
+                writer.execute("UPDATE agent SET status = 'idle', current_task_id = NULL")
+
+    @contextmanager
+    def traced_database(path: Path) -> Iterator[Connection]:
+        with database(path) as connection:
+            connection.set_trace_callback(between_queries)
+            yield connection
+
+    monkeypatch.setattr(store_module, "database", traced_database)
+    state = store.get_state()
+    assert changed
+    assert state["tasks"][0]["state"] == "submitted"
+    assert state["agents"][0]["status"] == "busy"
+    assert state["agents"][0]["current_task_id"] == task.id

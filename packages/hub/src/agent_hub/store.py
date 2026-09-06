@@ -210,16 +210,22 @@ class HubStore:
     def get_state(self) -> dict[str, Any]:
         """Return compact state without task instructions or transcripts."""
         with database(self.path) as connection:
+            # SELECT alone does not start a transaction in sqlite3's legacy mode.
+            connection.execute("BEGIN")
             row = connection.execute("SELECT * FROM workflow ORDER BY created LIMIT 1").fetchone()
             workflow = None if row is None else dict(row)
             if workflow is not None:
                 workflow["policy"] = json.loads(workflow.pop("policy_json"))
-        tasks = []
-        for task in self.tasks():
-            summary = asdict(task)
-            summary.pop("instructions")
-            tasks.append(summary)
-        return {"workflow": workflow, "agents": [asdict(a) for a in self.agents()], "tasks": tasks}
+            tasks = []
+            for row in connection.execute("SELECT * FROM task ORDER BY created").fetchall():
+                summary = asdict(_task(row))
+                summary.pop("instructions")
+                tasks.append(summary)
+            agents = [
+                asdict(_agent(row))
+                for row in connection.execute("SELECT * FROM agent ORDER BY name").fetchall()
+            ]
+        return {"workflow": workflow, "agents": agents, "tasks": tasks}
 
     def set_workflow_status(self, status: WorkflowStatus, summary: str) -> None:
         """Persist status and its explanation atomically in the audit log."""

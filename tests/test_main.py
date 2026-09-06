@@ -117,7 +117,7 @@ main.main()
         assert marker in result.stderr
 
 
-@pytest.mark.parametrize("shutdown", ["eof", "signal"])
+@pytest.mark.parametrize("shutdown", ["eof", "sigterm", "sigint", "http_error"])
 def test_process_shutdown_releases_listener(tmp_path: Path, shutdown: str) -> None:
     import signal
     import socket
@@ -127,8 +127,27 @@ def test_process_shutdown_releases_listener(tmp_path: Path, shutdown: str) -> No
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
+    script = """
+import asyncio
+from agent_hub import main
+from agent_hub import app
+
+original_stop = app.stop_sweeper
+async def stop(task):
+    await original_stop(task)
+    print("sweeper stopped")
+app.stop_sweeper = stop
+"""
+    if shutdown == "http_error":
+        script += """
+async def broken_loop(self):
+    await asyncio.sleep(0.5)
+    raise RuntimeError("injected HTTP failure")
+main.uvicorn.Server.main_loop = broken_loop
+"""
+    script += "\nmain.main()"
     process = subprocess.Popen(
-        [sys.executable, "-m", "agent_hub.main"],
+        [sys.executable, "-c", script],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -153,9 +172,19 @@ def test_process_shutdown_releases_listener(tmp_path: Path, shutdown: str) -> No
         if shutdown == "eof":
             assert process.stdin is not None
             process.stdin.close()
-        else:
-            process.send_signal(signal.SIGTERM)
+        elif shutdown != "http_error":
+            process.send_signal(signal.SIGINT if shutdown == "sigint" else signal.SIGTERM)
         process.wait(timeout=5)
+        assert process.stderr is not None
+        stderr = process.stderr.read().decode()
+        assert "sweeper stopped" in stderr
+        assert process.returncode == (1 if shutdown == "http_error" else 0), stderr
+        if shutdown == "eof":
+            assert "MCP stdin closed; shutting down HTTP" in stderr
+        if shutdown == "http_error":
+            assert "injected HTTP failure" in stderr
+        with pytest.raises(OSError):
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.2)
     finally:
         if process.poll() is None:
             process.kill()

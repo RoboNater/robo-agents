@@ -59,19 +59,26 @@ between launches to resume the same database, and stop an existing hub on the
 same port before starting the runtime connection. HTTP and MCP share one store
 and event loop; a separate process writing SQLite cannot wake these waits.
 Closing MCP stdin or terminating the process shuts down HTTP and the sweeper.
-A standalone `uv run hub` therefore needs stdin to stay open.
+A standalone `uv run hub` therefore needs stdin to stay open; if stdin closes,
+the hub logs an explicit warning explaining why it is stopping HTTP.
 
 Alice gets `get_state`, `wait_for_event`, `assign_task`, `reply`,
 `set_task_state`, `release_agent`, `set_workflow_status`, and `log_decision`.
 `wait_for_event` consumes the oldest queued event, waits up to 120 seconds
 (default 120), and returns `{"event": null}` on timeout; call again.
-Zero seconds performs a nonblocking check. Assignment leases default to 30
+Zero seconds performs a nonblocking check. If your runtime uses a shorter tool
+timeout, request a shorter hold or configure the client timeout above 120 seconds.
+Consumption happens before transport delivery, as specified in §4.2: a crash
+between consumption and delivery can lose an event notification. On reconnect,
+use `get_state` to reconcile durable workflow/task/agent state. Acknowledged event
+delivery and crash replay remain hardening work, not a guarantee of this queue. Assignment leases default to 30
 minutes and accept positive finite values up to one year.
 
 `get_state` returns a null workflow before one is created, plus agents and task
 summaries including results but excluding instructions and transcripts.
 Manual task overrides accept `canceled` or `failed` for open tasks, preserve
-the note, and free the worker; use a new assignment to retry terminal work.
+the note, and free the worker; a held question returns a terminal A2A Task
+with its final state and result rather than interpreting the note as an answer; use a new assignment to retry terminal work.
 Workflow status summaries and decisions persist in the SQLite audit log.
 All diagnostics go to stderr; stdout carries only MCP JSON-RPC.
 

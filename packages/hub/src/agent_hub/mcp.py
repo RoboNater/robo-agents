@@ -1,5 +1,10 @@
 """Alice's §4.2 tools, sharing the HTTP server's store and event loop."""
 
+import asyncio
+import os
+import sys
+import threading
+from contextlib import suppress
 from dataclasses import asdict
 from typing import Annotated, Any, Literal, TextIO
 
@@ -71,9 +76,60 @@ def create_mcp(store: HubStore) -> FastMCP:
     return server
 
 
+class CancellableStdin(anyio.AsyncFile[str]):
+    """A process-lifetime reader whose blocked thread cannot delay shutdown.
+
+    On cancellation the single pending daemon read is abandoned. It owns no
+    hub state and cannot block interpreter shutdown; the process is exiting.
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        super().__init__(stream)
+        self._fd = stream.fileno()
+        self._pending = b""
+
+    def _readline(self) -> str:
+        # Do not hold TextIOWrapper's lock in an abandoned thread: Python
+        # acquires that lock during interpreter shutdown.
+        while b"\n" not in self._pending:
+            chunk = os.read(self._fd, 65536)
+            if not chunk:
+                line, self._pending = self._pending, b""
+                return line.decode("utf-8", errors="replace")
+            self._pending += chunk
+        line, self._pending = self._pending.split(b"\n", 1)
+        return (line + b"\n").decode("utf-8", errors="replace")
+
+    async def readline(self) -> str:
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[str] = loop.create_future()
+
+        def deliver(value: str | Exception) -> None:
+            if not result.done():
+                if isinstance(value, Exception):
+                    result.set_exception(value)
+                else:
+                    result.set_result(value)
+
+        def read() -> None:
+            value: str | Exception
+            try:
+                value = self._readline()
+            except Exception as exc:
+                value = exc
+            with suppress(RuntimeError):  # The event loop may already be closed.
+                loop.call_soon_threadsafe(deliver, value)
+
+        threading.Thread(target=read, name="mcp-stdin", daemon=True).start()
+        return await result
+
+
 async def run_mcp(store: HubStore, stdout: TextIO) -> None:
     server = create_mcp(store)
-    async with stdio_server(stdout=anyio.wrap_file(stdout)) as (read, write):
+    async with stdio_server(stdin=CancellableStdin(sys.stdin), stdout=anyio.wrap_file(stdout)) as (
+        read,
+        write,
+    ):
         await server._mcp_server.run(
             read, write, server._mcp_server.create_initialization_options()
         )

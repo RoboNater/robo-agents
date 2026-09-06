@@ -88,6 +88,11 @@ attempts, and her answer is older than a new question would be, so a retry that
 asked afresh could never see it. `NEXT` needs no such correlation: it has no
 per-call state to resume.
 
+**Manual termination during a question.** If Alice cancels or fails a task while
+its question stream is held, the stream returns an A2A Task with terminal
+`status.state` and the override note in `metadata.result.summary`. Step 4's
+`ask_alice` must treat that as end-of-task, not an answer to resume work.
+
 **Public vs. protected.** The A2A route is protected: every worker call carries `Authorization: Bearer <token>` and the hub returns `401` when the header is missing, malformed, or carries a token that does not match the pre-shared one (compared with `token_matches`, constant-time). `GET /.well-known/agent-card.json` and `GET /healthz` are public — the agent card must be fetchable for discovery, and health checks run before any credential is available. Those two are the entire public surface; every other route, including `/guides/{role}.md` (§4.2), requires the token.
 
 ### 4.2 Alice's MCP tools (hub, stdio)
