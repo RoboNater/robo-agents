@@ -2,7 +2,7 @@ import socket
 from pathlib import Path
 
 import pytest
-from agent_hub_common import ConfigurationError, HubSettings
+from agent_hub_common import ConfigurationError, HubSettings, config
 
 
 def test_settings_have_local_defaults(tmp_path: Path) -> None:
@@ -14,6 +14,9 @@ def test_settings_have_local_defaults(tmp_path: Path) -> None:
     assert settings.state_dir == tmp_path / "agent-hub"
     assert settings.database_path == tmp_path / "agent-hub/hub.db"
     assert settings.token_file == tmp_path / "agent-hub/token"
+    # Guides are checkout content, not state: the default is the repository's
+    # own top-level guides/ directory (§6).
+    assert settings.guides_dir == Path(__file__).resolve().parents[1] / "guides"
 
 
 def test_state_paths_ignore_the_working_directory(
@@ -31,6 +34,7 @@ def test_state_paths_ignore_the_working_directory(
     assert first.state_dir == second.state_dir
     assert first.database_path == second.database_path
     assert first.token_file == second.token_file
+    assert first.guides_dir == second.guides_dir
 
 
 def test_relative_xdg_state_home_falls_back_to_the_default() -> None:
@@ -43,6 +47,17 @@ def test_relative_xdg_state_home_falls_back_to_the_default() -> None:
 def test_relative_state_dir_is_rejected() -> None:
     with pytest.raises(ConfigurationError, match="absolute"):
         HubSettings.from_env({"HUB_STATE_DIR": "state"})
+
+
+def test_relative_guides_dir_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="absolute"):
+        HubSettings.from_env({"HUB_GUIDES_DIR": "guides"})
+
+
+def test_the_guides_directory_is_configurable(tmp_path: Path) -> None:
+    settings = HubSettings.from_env({"HUB_GUIDES_DIR": str(tmp_path / "elsewhere/guides")})
+
+    assert settings.guides_dir == tmp_path / "elsewhere/guides"
 
 
 def test_relative_state_paths_resolve_against_the_state_directory(tmp_path: Path) -> None:
@@ -178,3 +193,17 @@ def test_a_requested_wait_is_clamped_to_the_ceiling() -> None:
 def test_settings_reject_inconsistent_timings(env: dict[str, str]) -> None:
     with pytest.raises(ConfigurationError):
         HubSettings.from_env(env)
+
+
+def test_guides_fall_back_to_the_state_directory_outside_a_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Installed as a plain wheel there is no workspace above the package, and
+    # the ancestor that would hold guides/ belongs to someone else.
+    installed = tmp_path / "site-packages/a/b/c/agent_hub_common/config.py"
+    installed.parent.mkdir(parents=True)
+    monkeypatch.setattr(config, "__file__", str(installed))
+
+    settings = HubSettings.from_env({"HUB_STATE_DIR": str(tmp_path / "state")})
+
+    assert settings.guides_dir == tmp_path / "state/guides"
