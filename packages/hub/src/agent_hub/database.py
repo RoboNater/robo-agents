@@ -115,7 +115,12 @@ def initialize_database(path: Path) -> None:
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
         if current_version == 1:
-            connection.execute("ALTER TABLE agent ADD COLUMN runtime TEXT")
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(agent)").fetchall()
+            }
+            if "runtime" not in columns:
+                connection.execute("ALTER TABLE agent ADD COLUMN runtime TEXT")
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
         raise DatabaseVersionError(
