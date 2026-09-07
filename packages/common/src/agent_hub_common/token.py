@@ -6,6 +6,7 @@ import hmac
 import os
 import secrets
 import stat
+import sys
 from pathlib import Path
 
 
@@ -18,7 +19,10 @@ def _read_token(path: Path) -> str:
         permissions = stat.S_IMODE(path.stat().st_mode)
     except OSError as exc:
         raise TokenError(f"cannot inspect bearer token file: {path}") from exc
-    if permissions & 0o077:
+    # On Windows, stat().st_mode does not represent POSIX group/other mode bits
+    # (0o077); Windows filesystem security is managed via NTFS ACLs. POSIX
+    # permission validation is therefore only enforced on non-Windows platforms.
+    if sys.platform != "win32" and (permissions & 0o077):
         raise TokenError(f"bearer token file must not be accessible by group or others: {path}")
 
     try:
@@ -31,7 +35,11 @@ def _read_token(path: Path) -> str:
 
 
 def load_or_create_token(explicit_token: str | None, token_file: Path) -> str:
-    """Return an injected token, or atomically create/read a mode-0600 token file."""
+    """Return an injected token, or atomically create/read a mode-0600 token file.
+
+    On Windows, the token file's permissions are governed by NTFS ACLs rather than
+    POSIX mode bits, so mode-0600 protection is unverified on that platform.
+    """
 
     if explicit_token is not None:
         explicit_token = explicit_token.strip()

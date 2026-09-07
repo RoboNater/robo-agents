@@ -62,6 +62,7 @@ class AgentRecord:
     context_id: str
     last_seen: str
     current_task_id: str | None
+    runtime: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +122,7 @@ def _agent(row: Row) -> AgentRecord:
         context_id=row["context_id"],
         last_seen=row["last_seen"],
         current_task_id=row["current_task_id"],
+        runtime=row["runtime"],
     )
 
 
@@ -284,9 +286,17 @@ class HubStore:
             if row is None:
                 context_id = uuid4().hex
                 connection.execute(
-                    "INSERT INTO agent (name, capabilities_json, status, context_id, last_seen)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (name, json.dumps(list(capabilities)), AgentStatus.IDLE.value, context_id, now),
+                    "INSERT INTO agent "
+                    "(name, capabilities_json, status, context_id, last_seen, runtime)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        name,
+                        json.dumps(list(capabilities)),
+                        AgentStatus.IDLE.value,
+                        context_id,
+                        now,
+                        runtime,
+                    ),
                 )
             else:
                 # A returning worker keeps its context id so Alice reads one
@@ -295,12 +305,13 @@ class HubStore:
                 current = self._open_task_id(connection, row["current_task_id"])
                 connection.execute(
                     "UPDATE agent SET capabilities_json = ?, status = ?, last_seen = ?,"
-                    " current_task_id = ? WHERE name = ?",
+                    " current_task_id = ?, runtime = coalesce(?, runtime) WHERE name = ?",
                     (
                         json.dumps(list(capabilities)),
                         _readmitted(AgentStatus(row["status"]), current).value,
                         now,
                         current,
+                        runtime,
                         name,
                     ),
                 )

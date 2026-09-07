@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,8 @@ def test_token_file_is_created_once_with_private_permissions(tmp_path: Path) -> 
 
     assert first == second
     assert len(first) >= 32
-    assert os.stat(path).st_mode & 0o777 == 0o600
+    if sys.platform != "win32":
+        assert os.stat(path).st_mode & 0o777 == 0o600
     assert token_matches(first, second)
     assert not token_matches(first, "wrong")
 
@@ -25,6 +27,9 @@ def test_explicit_token_does_not_touch_disk(tmp_path: Path) -> None:
     assert not path.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows does not support POSIX permission bits"
+)
 def test_world_readable_token_file_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "token"
     path.write_text("exposed-secret\n", encoding="utf-8")

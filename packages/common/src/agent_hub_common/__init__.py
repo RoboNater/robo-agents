@@ -3,6 +3,7 @@
 from .clock import iso_after, to_iso, utcnow, utcnow_iso
 from .config import ConfigurationError, HubSettings
 from .models import AgentStatus, EventKind, TaskState, WorkflowStatus
+from .stdio import reserve_stdout
 from .token import TokenError, load_or_create_token, token_matches
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "WorkflowStatus",
     "iso_after",
     "load_or_create_token",
+    "reserve_stdout",
     "to_iso",
     "token_matches",
     "utcnow",
