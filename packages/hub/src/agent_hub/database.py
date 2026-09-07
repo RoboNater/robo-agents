@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_hub_common import AgentStatus, EventKind, TaskState, WorkflowStatus
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class DatabaseVersionError(RuntimeError):
@@ -103,20 +103,25 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 def initialize_database(path: Path) -> None:
-    """Create the database and apply the initial idempotent schema."""
+    """Create the database and apply the initial schema or migrations."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with database(path) as connection:
         current_version = connection.execute("PRAGMA user_version").fetchone()[0]
         if current_version == SCHEMA_VERSION:
             return
-        if current_version != 0:
-            raise DatabaseVersionError(
-                f"database schema version {current_version} is incompatible with "
-                f"expected version {SCHEMA_VERSION}"
-            )
-        connection.executescript(SCHEMA)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        if current_version == 0:
+            connection.executescript(SCHEMA)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
+        if current_version == 1:
+            connection.execute("ALTER TABLE agent ADD COLUMN runtime TEXT")
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
+        raise DatabaseVersionError(
+            f"database schema version {current_version} is incompatible with "
+            f"expected version {SCHEMA_VERSION}"
+        )
 
 
 @contextmanager

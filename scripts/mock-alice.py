@@ -27,7 +27,7 @@ from typing import Any
 
 from agent_hub.database import database, initialize_database
 from agent_hub.store import HubStore
-from agent_hub_common import ConfigurationError, EventKind, HubSettings, WorkflowStatus
+from agent_hub_common import AgentStatus, ConfigurationError, EventKind, HubSettings, WorkflowStatus
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -88,7 +88,11 @@ async def drive_one_task_mcp(
         state_data = await _call(session, "get_state", {})
         agents = state_data.get("agents") if isinstance(state_data, dict) else []
         for ag in agents or []:
-            if isinstance(ag, dict) and ag.get("name") == expected_agent:
+            if (
+                isinstance(ag, dict)
+                and ag.get("name") == expected_agent
+                and ag.get("status") != AgentStatus.RELEASED.value
+            ):
                 agent_name = expected_agent
                 checked_in_runtime = ag.get("runtime")
                 break
@@ -231,7 +235,7 @@ async def drive_one_task(
     while asyncio.get_running_loop().time() < deadline:
         # Check if agent already checked in before or between events
         agent = store.agent_by_name(expected_agent)
-        if agent is not None:
+        if agent is not None and agent.status != AgentStatus.RELEASED:
             agent_name = agent.name
             checked_in_runtime = agent.runtime or _agent_runtime(store, agent_name)
             break

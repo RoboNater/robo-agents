@@ -54,7 +54,7 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 | Table | Fields | Notes |
 |---|---|---|
 | `workflow` | id, goal, status, policy_json, created | one row for the PoC |
-| `agent` | name, capabilities[], status (`idle`/`busy`/`released`/`lost`), context_id, last_seen, current_task_id | registered on check-in |
+| `agent` | name, capabilities[], status (`idle`/`busy`/`released`/`lost`), context_id, last_seen, current_task_id, runtime? | registered on check-in |
 | `task` | id, workflow_id, assignee, role, title, instructions, state (A2A TaskState), lease_expires, result_json, created, updated | A2A states: `submitted, working, input-required, completed, failed, canceled` |
 | `message` | id, task_id?, context_id, sender, direction (`to_alice`/`from_alice`), parts_json, ts | full transcript |
 | `event` | id, kind, payload_json, consumed (bool), ts | Alice's inbox queue |
