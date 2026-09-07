@@ -6,7 +6,7 @@ import os
 import sys
 import threading
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Annotated, Any, Literal, TextIO
 
 import anyio
@@ -128,22 +128,41 @@ class CancellableStdin(anyio.AsyncFile[str]):
             payload = json.loads(line)
         except (json.JSONDecodeError, TypeError):
             return line
-        if isinstance(payload, dict) and payload.get("method") == "initialize":
-            self._connection.initialized = True
+        if (
+            isinstance(payload, dict)
+            and payload.get("method") == "initialize"
+            and isinstance(payload.get("id"), (str, int))
+        ):
+            self._connection.initialize_ids.add(payload["id"])
         return line
 
 
 class CancellableStdout(anyio.AsyncFile[str]):
     """Write MCP framing without a non-daemon AnyIO worker blocking exit."""
 
-    def __init__(self, stream: TextIO) -> None:
+    def __init__(self, stream: TextIO, connection: "McpConnection | None" = None) -> None:
         super().__init__(stream)
         self._fd = stream.fileno()
+        self._connection = connection
+        self._workers: set[threading.Thread] = set()
+        self._workers_lock = threading.Lock()
 
     async def write(self, value: str) -> int:
         loop = asyncio.get_running_loop()
         result: asyncio.Future[int] = loop.create_future()
         data = value.encode("utf-8")
+        accepted_initialize = False
+        if self._connection is not None:
+            try:
+                payload = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                payload = None
+            accepted_initialize = (
+                isinstance(payload, dict)
+                and payload.get("id") in self._connection.initialize_ids
+                and isinstance(payload.get("result"), dict)
+                and "protocolVersion" in payload["result"]
+            )
 
         def deliver(error: Exception | None) -> None:
             if result.done():
@@ -161,26 +180,45 @@ class CancellableStdout(anyio.AsyncFile[str]):
                     view = view[os.write(self._fd, view) :]
             except Exception as exc:
                 error = exc
+            finally:
+                with self._workers_lock:
+                    self._workers.discard(threading.current_thread())
             with suppress(RuntimeError):
                 loop.call_soon_threadsafe(deliver, error)
 
-        threading.Thread(target=write, name="mcp-stdout", daemon=True).start()
-        return await result
+        worker = threading.Thread(target=write, name="mcp-stdout", daemon=True)
+        with self._workers_lock:
+            self._workers.add(worker)
+        worker.start()
+        written = await result
+        if accepted_initialize and self._connection is not None:
+            self._connection.initialized = True
+        return written
 
     async def flush(self) -> None:
         return None
+
+    def join_workers(self, timeout: float) -> bool:
+        """Wait for cleanup after the pipe peer has closed."""
+        with self._workers_lock:
+            workers = list(self._workers)
+        for worker in workers:
+            worker.join(timeout)
+        return all(not worker.is_alive() for worker in workers)
 
 
 @dataclass(slots=True)
 class McpConnection:
     initialized: bool = False
+    initialize_ids: set[str | int] = field(default_factory=set)
 
 
 async def run_mcp(store: HubStore, stdout: TextIO) -> bool:
     server = create_mcp(store)
     connection = McpConnection()
     async with stdio_server(
-        stdin=CancellableStdin(sys.stdin, connection), stdout=CancellableStdout(stdout)
+        stdin=CancellableStdin(sys.stdin, connection),
+        stdout=CancellableStdout(stdout, connection),
     ) as (read, write):
         await server._mcp_server.run(
             read, write, server._mcp_server.create_initialization_options()

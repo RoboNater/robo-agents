@@ -64,7 +64,7 @@ class HubServer(uvicorn.Server):
             raise
 
 
-async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
+async def run_hub(settings: HubSettings, stdout: TextIO) -> bool:
     """Own both transports; either one's exit shuts down its sibling."""
     app = create_app(settings)
     log_config = deepcopy(uvicorn.config.LOGGING_CONFIG)
@@ -83,6 +83,7 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
     http = asyncio.create_task(server.serve())
     mcp: asyncio.Task[bool] | None = None
     uninitialized_eof = False
+    http_failure: BaseException | None = None
     try:
         while not server.started:
             if http.done():
@@ -104,7 +105,9 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
                 )
     finally:
         server.should_exit = True
-        await asyncio.gather(http, return_exceptions=True)
+        http_result = (await asyncio.gather(http, return_exceptions=True))[0]
+        if isinstance(http_result, BaseException):
+            http_failure = http_result
         if mcp is not None:
             mcp.cancel()
             _, pending = await asyncio.wait({mcp}, timeout=MCP_SHUTDOWN_TIMEOUT_S)
@@ -113,14 +116,16 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> None:
                     "MCP transport did not stop; forcing process exit"
                 )
                 os._exit(1)
-    if uninitialized_eof:
-        raise RuntimeError("MCP stdin closed before initialization")
+    if http_failure is not None:
+        raise http_failure
+    return not uninitialized_eof
 
 
 def main() -> None:
     with reserve_stdout() as stdout:
         logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-        asyncio.run(run_hub(HubSettings.from_env(), stdout))
+        if not asyncio.run(run_hub(HubSettings.from_env(), stdout)):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

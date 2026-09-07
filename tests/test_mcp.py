@@ -72,8 +72,8 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
     for args in ({"timeout_s": -1}, {"timeout_s": 121}, {"timeout_s": float("inf")}):
         with pytest.raises(Exception, match="validation error"):
             await call("wait_for_event", **args)
-        with pytest.raises(Exception, match="already failed"):
-            await call("set_task_state", task_id=task["id"], state="canceled", note="Again")
+    with pytest.raises(Exception, match="already failed"):
+        await call("set_task_state", task_id=task["id"], state="canceled", note="Again")
 
 
 async def test_canceling_a_blocked_stdout_write_returns_promptly() -> None:
@@ -85,15 +85,18 @@ async def test_canceling_a_blocked_stdout_write_returns_promptly() -> None:
     except BlockingIOError:
         pass
     os.set_blocking(write_fd, True)
-    stream = os.fdopen(write_fd, "w", closefd=False)
-    pending = asyncio.create_task(CancellableStdout(stream).write("blocked"))
-    await asyncio.sleep(0.05)
-    assert not pending.done()
-    pending.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(pending, 0.5)
-    os.close(read_fd)
-    os.close(write_fd)
+    writer = CancellableStdout(os.fdopen(write_fd, "w", closefd=False))
+    try:
+        pending = asyncio.create_task(writer.write("blocked"))
+        await asyncio.sleep(0.05)
+        assert not pending.done()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, 0.5)
+    finally:
+        os.close(read_fd)
+        assert writer.join_workers(1)
+        os.close(write_fd)
 
 
 async def test_stdio_and_http_share_events(tmp_path: Path) -> None:

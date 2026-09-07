@@ -20,12 +20,13 @@ def test_main_parses_environment_once_and_reserves_stdout(
     monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(sys, "stderr", stderr)
 
-    async def fake_run(settings: HubSettings, protocol: TextIO) -> None:
+    async def fake_run(settings: HubSettings, protocol: TextIO) -> bool:
         assert settings.public_url == "https://public.example"
         assert settings.host == "127.0.0.2"
         assert settings.port == 8430
         assert protocol is stdout
         assert sys.stdout is stderr
+        return True
 
     monkeypatch.setenv("HUB_HOST", "127.0.0.2")
     monkeypatch.setenv("HUB_PORT", "8430")
@@ -228,6 +229,7 @@ main.run_mcp = stuck_mcp
         assert process.returncode == expected, stderr
         if shutdown == "eof":
             assert "MCP stdin closed before initialization" in stderr
+            assert "Traceback" not in stderr
         if shutdown == "http_error":
             assert "injected HTTP failure" in stderr
         if shutdown == "mcp_stuck":
@@ -318,6 +320,117 @@ def test_initialized_mcp_disconnect_and_blocked_output_shutdown(
         if not blocked_stdout:
             assert "MCP client disconnected; shutting down HTTP" in stderr
             assert "before initialization" not in stderr
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def test_rejected_initialize_exits_as_uninitialized_without_traceback(tmp_path: Path) -> None:
+    import json
+    import socket
+    import time
+    import urllib.request
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    process = subprocess.Popen(
+        [sys.executable, "-m", "agent_hub.main"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env={
+            **os.environ,
+            "HUB_STATE_DIR": str(tmp_path),
+            "HUB_DB_PATH": str(tmp_path / "hub.db"),
+            "HUB_TOKEN": "test",
+            "HUB_HOST": "127.0.0.1",
+            "HUB_PORT": str(port),
+        },
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.2).close()
+                break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n')
+        process.stdin.flush()
+        response = json.loads(process.stdout.readline())
+        assert response["id"] == 1 and response["error"]["code"] == -32602
+        process.stdin.close()
+        process.wait(timeout=5)
+        assert process.returncode == 1
+        assert process.stderr is not None
+        stderr = process.stderr.read()
+        assert "MCP stdin closed before initialization" in stderr
+        assert "MCP client disconnected" not in stderr
+        assert "Traceback" not in stderr
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def test_http_shutdown_failure_is_reported_after_mcp_cleanup(tmp_path: Path) -> None:
+    import signal
+    import socket
+    import time
+    import urllib.request
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    script = """
+from agent_hub import main
+original = main.HubServer.shutdown
+async def broken(self, *args, **kwargs):
+    await original(self, *args, **kwargs)
+    raise RuntimeError("injected shutdown failure")
+main.HubServer.shutdown = broken
+main.main()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "HUB_STATE_DIR": str(tmp_path),
+            "HUB_DB_PATH": str(tmp_path / "hub.db"),
+            "HUB_TOKEN": "test",
+            "HUB_HOST": "127.0.0.1",
+            "HUB_PORT": str(port),
+        },
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=0.2).close()
+                break
+            except OSError:
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+        assert process.returncode == 1
+        assert process.stderr is not None
+        assert b"injected shutdown failure" in process.stderr.read()
     finally:
         if process.poll() is None:
             process.kill()
