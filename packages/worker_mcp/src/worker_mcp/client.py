@@ -43,10 +43,6 @@ class WorkerHubClient:
         # Active pending question (question_text, message_id) per task (§4.1)
         self._pending_questions: dict[str, tuple[str, str]] = {}
 
-    @property
-    def _pending_question_message_ids(self) -> dict[str, str]:
-        return {k: v[1] for k, v in self._pending_questions.items()}
-
     async def __aenter__(self) -> WorkerHubClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
@@ -455,7 +451,7 @@ class WorkerHubClient:
         if clean_status not in ("completed", "failed"):
             raise ValueError(f"status must be 'completed' or 'failed', got {status!r}")
 
-        self._pending_question_message_ids.pop(task_id, None)
+        self._pending_questions.pop(task_id, None)
         params = {
             "message": {
                 "messageId": uuid4().hex,

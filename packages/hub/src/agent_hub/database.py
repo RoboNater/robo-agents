@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS agent (
     context_id TEXT UNIQUE,
     last_seen TEXT NOT NULL,
     current_task_id TEXT,
+    runtime TEXT,
     FOREIGN KEY (current_task_id) REFERENCES task(id) ON DELETE SET NULL
 );
 

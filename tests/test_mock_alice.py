@@ -6,9 +6,9 @@ from pathlib import Path
 import httpx
 import pytest
 from agent_hub import create_app
-from agent_hub.database import initialize_database
+from agent_hub.database import database, initialize_database
 from agent_hub.store import HubStore
-from agent_hub_common import HubSettings, WorkflowStatus
+from agent_hub_common import HubSettings, TaskState, WorkflowStatus
 from conftest import BASE_URL, TOKEN
 from worker_mcp.client import WorkerHubClient
 from worker_mcp.config import WorkerSettings
@@ -119,6 +119,9 @@ async def test_mock_alice_drives_worker_through_full_task(
 
         assert alice_res["task_id"] is not None
         assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+        with database(store.path) as connection:
+            decisions = connection.execute("SELECT * FROM decision ORDER BY id").fetchall()
+            assert any("Assigned task" in d["summary"] for d in decisions)
 
 
 async def test_mock_alice_rejects_unexpected_runtime(tmp_path: Path) -> None:
@@ -176,3 +179,131 @@ def test_mock_alice_main_cli_parses_arguments(
 
     mock_alice.main()
     assert called is True
+
+
+async def test_mock_alice_agent_already_checked_in_event_consumed(tmp_path: Path) -> None:
+    db_path = tmp_path / "already_checked_in.db"
+    initialize_database(db_path)
+    store = HubStore(db_path)
+
+    # Bob checks in as codex
+    store.check_in("bob", ["python"], runtime="codex")
+
+    # Consume the check_in event so wait_for_event returns None
+    event = await store.wait_for_event(timeout_s=0.01)
+    assert event is not None and event.kind.value == "agent_checked_in"
+
+    # Worker completes task once assigned
+    async def finish_task() -> None:
+        for _ in range(100):
+            t = store.get_state()["tasks"]
+            if t:
+                task_id = t[0]["id"]
+                store.submit_result(
+                    task_id=task_id,
+                    agent="bob",
+                    status=TaskState.COMPLETED,
+                    summary="Done",
+                )
+                break
+            await asyncio.sleep(0.01)
+
+    drive_fut = asyncio.create_task(
+        mock_alice.drive_one_task(
+            store=store,
+            expected_agent="bob",
+            timeout_s=2.0,
+            expected_runtime="codex",
+        )
+    )
+    finish_fut = asyncio.create_task(finish_task())
+    res, _ = await asyncio.gather(drive_fut, finish_fut)
+    assert res.get("summary") == "Done"
+
+
+async def test_mock_alice_agent_already_checked_in_mismatch(tmp_path: Path) -> None:
+    db_path = tmp_path / "already_mismatch.db"
+    initialize_database(db_path)
+    store = HubStore(db_path)
+
+    # Bob checks in as codex
+    store.check_in("bob", ["python"], runtime="codex")
+
+    # Consume the check_in event
+    await store.wait_for_event(timeout_s=0.01)
+
+    match_msg = "Worker 'bob' checked in with runtime 'codex', expected 'claude-code'"
+    with pytest.raises(ValueError, match=match_msg):
+        await mock_alice.drive_one_task(
+            store=store,
+            expected_agent="bob",
+            timeout_s=1.0,
+            expected_runtime="claude-code",
+        )
+
+
+async def test_mock_alice_call_helper_error_handling() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    session = MagicMock()
+
+    # Success call
+    mock_success = MagicMock()
+    mock_success.isError = False
+    mock_success.structuredContent = {"ok": True}
+    mock_success.content = None
+    session.call_tool = AsyncMock(return_value=mock_success)
+
+    data = await mock_alice._call(session, "get_state")
+    assert data == {"ok": True}
+
+    # Error call
+    mock_error = MagicMock()
+    mock_error.isError = True
+    text_content = MagicMock()
+    text_content.text = "Field required: summary"
+    mock_error.content = [text_content]
+    session.call_tool = AsyncMock(return_value=mock_error)
+
+    with pytest.raises(RuntimeError, match="Tool log_decision failed: Field required: summary"):
+        await mock_alice._call(session, "log_decision", {"decision": "wrong"})
+
+
+def test_mock_alice_parse_cmd(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On Windows: parses paths with spaces inside quotes without stripping backslashes
+    monkeypatch.setattr(sys, "platform", "win32")
+    cmd_win = r'"C:\Program Files\Python312\python.exe" -m agent_hub.main'
+    parts = mock_alice._parse_cmd(cmd_win)
+    assert parts == [r"C:\Program Files\Python312\python.exe", "-m", "agent_hub.main"]
+
+    # On POSIX: standard shlex.split
+    monkeypatch.setattr(sys, "platform", "linux")
+    cmd_posix = "/usr/bin/python3 -m agent_hub.main"
+    assert mock_alice._parse_cmd(cmd_posix) == ["/usr/bin/python3", "-m", "agent_hub.main"]
+
+
+def test_mock_alice_main_cli_mcp_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    called_mcp = False
+
+    def fake_run(coro: object) -> dict[str, str]:
+        nonlocal called_mcp
+        called_mcp = True
+        if hasattr(coro, "close"):
+            coro.close()
+        return {"status": "ok"}
+
+    monkeypatch.setattr(mock_alice.asyncio, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mock-alice.py",
+            "--mcp",
+            "--agent",
+            "bob",
+            "--runtime",
+            "claude-code",
+        ],
+    )
+    mock_alice.main()
+    assert called_mcp is True

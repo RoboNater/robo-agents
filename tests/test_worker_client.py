@@ -160,8 +160,8 @@ async def test_ask_alice_reply_and_retry_correlation(
     # 2. Ask question that times out
     timeout_res = await worker.ask_alice(task.id, "Second question?", timeout_s=0.05)
     assert timeout_res == {"timeout": True}
-    assert task.id in worker._pending_question_message_ids
-    saved_msg_id = worker._pending_question_message_ids[task.id]
+    assert task.id in worker._pending_questions
+    saved_msg_id = worker._pending_questions[task.id][1]
     assert saved_msg_id != ""
 
     # Alice answers while worker is retrying in the gap
@@ -170,16 +170,16 @@ async def test_ask_alice_reply_and_retry_correlation(
     # 3. Retry uses the saved message_id and picks up the answer
     retry_res = await worker.ask_alice(task.id, "Second question?", timeout_s=2.0)
     assert retry_res == {"reply": "The answer given in the gap."}
-    assert task.id not in worker._pending_question_message_ids
+    assert task.id not in worker._pending_questions
 
     # 4. Asking a different question after timeout generates a new message_id
     timeout_diff_1 = await worker.ask_alice(task.id, "Question A?", timeout_s=0.05)
     assert timeout_diff_1 == {"timeout": True}
-    msg_id_a = worker._pending_question_message_ids[task.id]
+    msg_id_a = worker._pending_questions[task.id][1]
 
     timeout_diff_2 = await worker.ask_alice(task.id, "Question B?", timeout_s=0.05)
     assert timeout_diff_2 == {"timeout": True}
-    msg_id_b = worker._pending_question_message_ids[task.id]
+    msg_id_b = worker._pending_questions[task.id][1]
     assert msg_id_b != msg_id_a
 
 
@@ -207,7 +207,7 @@ async def test_ask_alice_manual_termination_override(
     assert res.get("task_ended") is True
     assert res.get("state") == "canceled"
     assert "aborted" in str(res.get("note"))
-    assert task.id not in worker._pending_question_message_ids
+    assert task.id not in worker._pending_questions
 
 
 async def test_ask_alice_cancellation_without_result_summary(
@@ -234,7 +234,7 @@ async def test_ask_alice_cancellation_without_result_summary(
     assert res.get("task_ended") is True
     assert res.get("state") == "canceled"
     assert res.get("note") == "canceled"
-    assert task.id not in worker._pending_question_message_ids
+    assert task.id not in worker._pending_questions
 
 
 async def test_stream_rpc_json_error_raises_protocol_error(

@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -26,7 +27,7 @@ from typing import Any
 
 from agent_hub.database import database, initialize_database
 from agent_hub.store import HubStore
-from agent_hub_common import EventKind, HubSettings, WorkflowStatus
+from agent_hub_common import ConfigurationError, EventKind, HubSettings, WorkflowStatus
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -50,6 +51,22 @@ def _extract_tool_data(tool_result: Any) -> Any:
     return {}
 
 
+async def _call(
+    session: ClientSession,
+    name: str,
+    arguments: dict[str, Any] | None = None,
+) -> Any:
+    result = await session.call_tool(name, arguments or {})
+    if getattr(result, "isError", False):
+        error_msg = ""
+        if hasattr(result, "content") and result.content:
+            error_msg = "; ".join(
+                getattr(item, "text", str(item)) for item in result.content
+            )
+        raise RuntimeError(f"Tool {name} failed: {error_msg or result}")
+    return _extract_tool_data(result)
+
+
 async def drive_one_task_mcp(
     session: ClientSession,
     expected_agent: str,
@@ -64,27 +81,24 @@ async def drive_one_task_mcp(
 
     deadline = asyncio.get_running_loop().time() + timeout_s
     agent_name: str | None = None
+    checked_in_runtime: str | None = None
 
     while asyncio.get_running_loop().time() < deadline:
-        res = await session.call_tool("wait_for_event", {"timeout_s": 2.0})
-        data = _extract_tool_data(res)
-        event = data.get("event") if isinstance(data, dict) else None
-
-        if event is None:
-            state_res = await session.call_tool("get_state", {})
-            state_data = _extract_tool_data(state_res)
-            agents = state_data.get("agents") if isinstance(state_data, dict) else []
-            for ag in agents or []:
-                if isinstance(ag, dict) and ag.get("name") == expected_agent:
-                    agent_name = expected_agent
-                    if expected_runtime and ag.get("runtime") != expected_runtime:
-                        raise ValueError(
-                            f"Worker {agent_name!r} checked in with runtime "
-                            f"{ag.get('runtime')!r}, expected {expected_runtime!r}"
-                        )
-                    break
-            if agent_name:
+        # Check if agent already checked in before or between events
+        state_data = await _call(session, "get_state", {})
+        agents = state_data.get("agents") if isinstance(state_data, dict) else []
+        for ag in agents or []:
+            if isinstance(ag, dict) and ag.get("name") == expected_agent:
+                agent_name = expected_agent
+                checked_in_runtime = ag.get("runtime")
                 break
+        if agent_name:
+            break
+
+        remaining = max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
+        data = await _call(session, "wait_for_event", {"timeout_s": remaining})
+        event = data.get("event") if isinstance(data, dict) else None
+        if event is None:
             continue
 
         if (
@@ -94,31 +108,35 @@ async def drive_one_task_mcp(
         ):
             agent_name = expected_agent
             payload = event.get("payload") or {}
-            runtime = payload.get("runtime")
-            if expected_runtime and runtime and runtime != expected_runtime:
-                raise ValueError(
-                    f"Worker {agent_name!r} checked in with runtime {runtime!r}, "
-                    f"expected {expected_runtime!r}"
-                )
+            checked_in_runtime = payload.get("runtime")
             break
 
     if not agent_name:
         raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
 
+    if expected_runtime is not None:
+        if checked_in_runtime != expected_runtime:
+            raise ValueError(
+                f"Worker {agent_name!r} checked in with runtime {checked_in_runtime!r}, "
+                f"expected {expected_runtime!r}"
+            )
+        logger.info("Worker %r runtime verified: %s", agent_name, checked_in_runtime)
+
     logger.info("Worker %r checked in! Assigning task...", agent_name)
 
-    assign_res = await session.call_tool(
+    assign_data = await _call(
+        session,
         "assign_task",
         {"agent": agent_name, "role": role, "title": title, "instructions": instructions},
     )
-    assign_data = _extract_tool_data(assign_res)
     task_id = assign_data.get("id") if isinstance(assign_data, dict) else ""
     logger.info("Task assigned: id=%s title=%r", task_id, title)
 
-    await session.call_tool(
+    await _call(
+        session,
         "log_decision",
         {
-            "decision": f"Assigned task {task_id} to {agent_name}",
+            "summary": f"Assigned task {task_id} to {agent_name}",
             "rationale": f"Initial assignment for role {role}",
         },
     )
@@ -127,8 +145,7 @@ async def drive_one_task_mcp(
     result_data: dict[str, Any] = {}
 
     while not task_finished and asyncio.get_running_loop().time() < deadline:
-        res = await session.call_tool("wait_for_event", {"timeout_s": 5.0})
-        data = _extract_tool_data(res)
+        data = await _call(session, "wait_for_event", {"timeout_s": 5.0})
         event = data.get("event") if isinstance(data, dict) else None
         if not event or not isinstance(event, dict):
             continue
@@ -142,7 +159,8 @@ async def drive_one_task_mcp(
         elif kind == "worker_question":
             q_task_id = payload.get("task_id")
             logger.info("Worker asked question on %s: %r", q_task_id, payload.get("question"))
-            await session.call_tool(
+            await _call(
+                session,
                 "reply",
                 {"task_id": q_task_id, "text": "Approved. Proceed with the proposed design."},
             )
@@ -164,8 +182,9 @@ async def drive_one_task_mcp(
         raise TimeoutError(f"Task {task_id} did not finish within {timeout_s}s")
 
     logger.info("Releasing worker %r...", agent_name)
-    await session.call_tool("release_agent", {"agent": agent_name})
-    await session.call_tool(
+    await _call(session, "release_agent", {"agent": agent_name})
+    await _call(
+        session,
         "set_workflow_status",
         {"status": "done", "summary": f"Task {task_id} finished successfully"},
     )
@@ -174,13 +193,16 @@ async def drive_one_task_mcp(
 
 
 def _agent_runtime(store: HubStore, agent_name: str) -> str | None:
+    agent = store.agent_by_name(agent_name)
+    if agent is not None and agent.runtime is not None:
+        return agent.runtime
     with database(store.path) as connection:
         rows = connection.execute(
-            "SELECT payload FROM event WHERE kind = ? ORDER BY id DESC",
+            "SELECT payload_json FROM event WHERE kind = ? ORDER BY id DESC",
             (EventKind.AGENT_CHECKED_IN.value,),
         ).fetchall()
         for r in rows:
-            p = json.loads(r["payload"])
+            p = json.loads(r["payload_json"])
             if p.get("agent") == agent_name:
                 return p.get("runtime")
     return None
@@ -207,14 +229,16 @@ async def drive_one_task(
     checked_in_runtime: str | None = None
 
     while asyncio.get_running_loop().time() < deadline:
-        event = await store.wait_for_event(timeout_s=2.0)
+        # Check if agent already checked in before or between events
+        agent = store.agent_by_name(expected_agent)
+        if agent is not None:
+            agent_name = agent.name
+            checked_in_runtime = agent.runtime or _agent_runtime(store, agent_name)
+            break
+
+        remaining = max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
+        event = await store.wait_for_event(timeout_s=remaining)
         if event is None:
-            # Check if agent already checked in before Alice waited
-            agent = store.agent_by_name(expected_agent)
-            if agent is not None:
-                agent_name = agent.name
-                checked_in_runtime = _agent_runtime(store, agent_name)
-                break
             continue
         matched = (
             event.kind == EventKind.AGENT_CHECKED_IN
@@ -297,16 +321,26 @@ async def drive_one_task(
     return result_data
 
 
+def _parse_cmd(cmd: str) -> list[str]:
+    """Parse a shell command string into arguments, supporting Windows paths with spaces."""
+    if sys.platform == "win32":
+        return [part.strip("\"'") for part in shlex.split(cmd, posix=False)]
+    return shlex.split(cmd)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mock Alice orchestrator")
     try:
-        default_db = str(HubSettings.from_env().db_path)
-    except Exception:
+        default_db = str(HubSettings.from_env().database_path)
+    except ConfigurationError:
         default_db = "hub.db"
     parser.add_argument(
         "--db",
         default=default_db,
-        help="Path to SQLite database file (defaults to HUB_DB_PATH from environment)",
+        help=(
+            "Path to SQLite database file (applies to direct DB mode; "
+            "--mcp manages state via HUB_STATE_DIR in the environment)"
+        ),
     )
     parser.add_argument("--agent", default="bob", help="Expected worker agent name")
     parser.add_argument("--role", default="implementer", help="Task role to assign")
@@ -323,16 +357,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--hub-cmd",
-        default=f"{sys.executable} -m agent_hub.main",
-        help="Command to launch hub when running with --mcp",
+        default=f'"{sys.executable}" -m agent_hub.main',
+        help="Command to launch hub when running with --mcp (parsed quote-aware)",
     )
 
     args = parser.parse_args()
 
     try:
         if args.mcp:
-            cmd_parts = shlex.split(args.hub_cmd)
-            params = StdioServerParameters(command=cmd_parts[0], args=cmd_parts[1:])
+            cmd_parts = _parse_cmd(args.hub_cmd)
+            params = StdioServerParameters(
+                command=cmd_parts[0],
+                args=cmd_parts[1:],
+                env=dict(os.environ),
+            )
 
             async def run_mcp_session() -> dict[str, Any]:
                 async with (
