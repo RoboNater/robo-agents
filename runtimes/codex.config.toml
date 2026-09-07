@@ -1,4 +1,6 @@
+# Codex CLI ~/.codex/config.toml
+# Replace /path/to/agent-hub with the absolute path to this checkout.
 [mcp_servers.hub]
 command = "uv"
-args = ["run", "worker-mcp"]
-env = { HUB_URL = "http://alice-host:8420", HUB_TOKEN = "...", AGENT_NAME = "charlie" }
+args = ["run", "--directory", "/path/to/agent-hub", "worker-mcp"]
+env = { HUB_URL = "http://alice-host:8420", HUB_TOKEN = "...", AGENT_NAME = "charlie", AGENT_RUNTIME = "codex" }

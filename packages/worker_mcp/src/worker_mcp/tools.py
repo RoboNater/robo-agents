@@ -33,11 +33,12 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         return await client.get_role_guide(role)
 
     @server.tool()
-    async def await_assignment(timeout_s: Timeout = 120.0) -> dict[str, Any]:
+    async def await_assignment(timeout_s: Timeout | None = None) -> dict[str, Any]:
         """Poll the hub for the next task assignment.
 
         Returns {task_id, role, instructions}, {release: true}, or {timeout: true}.
         On timeout, call again.
+        timeout_s: Optional wait timeout in seconds (defaults to HUB_DEFAULT_WAIT_S if omitted).
         """
         return await client.await_assignment(timeout_s)
 
@@ -48,12 +49,13 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
 
     @server.tool()
     async def ask_alice(
-        task_id: str, question: str, timeout_s: Timeout = 120.0
+        task_id: str, question: str, timeout_s: Timeout | None = None
     ) -> dict[str, Any]:
         """Ask Alice a clarifying question and hold for her response.
 
         Returns {reply: text}, {timeout: true}, or {task_ended: true, state, note}.
         On timeout, call ask_alice again to continue waiting; retries resume the pending question.
+        timeout_s: Optional wait timeout in seconds (defaults to HUB_DEFAULT_WAIT_S if omitted).
         """
         return await client.ask_alice(task_id, question, timeout_s)
 

@@ -7,31 +7,18 @@ import signal
 import sys
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import TextIO
 
 import uvicorn
 from agent_hub_common import HubSettings
+from agent_hub_common import reserve_stdout as reserve_stdout
 
 from .app import create_app
 from .mcp import run_mcp
 
 MCP_SHUTDOWN_TIMEOUT_S = 1.0
-
-
-@contextmanager
-def reserve_stdout() -> Iterator[TextIO]:
-    """Keep the original stream for MCP; send ordinary Python output to stderr.
-
-    The MCP transport receives the yielded stream explicitly instead of
-    discovering the redirected sys.stdout.
-    This guards Python stream writes, not native writes to file descriptor 1
-    or deliberate writes through sys.__stdout__.
-    """
-    protocol_stdout = sys.stdout
-    with redirect_stdout(sys.stderr):
-        yield protocol_stdout
 
 
 class HubServer(uvicorn.Server):

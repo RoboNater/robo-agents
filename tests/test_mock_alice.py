@@ -1,11 +1,13 @@
 import asyncio
 import importlib.util
+import sys
 from pathlib import Path
 
 import httpx
 import pytest
 from agent_hub import create_app
 from agent_hub.database import initialize_database
+from agent_hub.store import HubStore
 from agent_hub_common import HubSettings, WorkflowStatus
 from conftest import BASE_URL, TOKEN
 from worker_mcp.client import WorkerHubClient
@@ -108,6 +110,7 @@ async def test_mock_alice_drives_worker_through_full_task(
                 title="Test Issue",
                 instructions="Please fix the issue.",
                 timeout_s=5.0,
+                expected_runtime=runtime,
             )
         )
         worker_task = asyncio.create_task(run_worker())
@@ -116,3 +119,60 @@ async def test_mock_alice_drives_worker_through_full_task(
 
         assert alice_res["task_id"] is not None
         assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+
+
+async def test_mock_alice_rejects_unexpected_runtime(tmp_path: Path) -> None:
+    db_path = tmp_path / "hub_mismatch.db"
+    initialize_database(db_path)
+    store = HubStore(db_path)
+
+    # Bob checks in as claude-code
+    store.check_in("bob", ["python"], runtime="claude-code")
+
+    # Mock Alice expects codex
+    match_msg = "Worker 'bob' checked in with runtime 'claude-code', expected 'codex'"
+    with pytest.raises(ValueError, match=match_msg):
+        await mock_alice.drive_one_task(
+            store=store,
+            expected_agent="bob",
+            timeout_s=1.0,
+            expected_runtime="codex",
+        )
+
+
+def test_mock_alice_main_cli_parses_arguments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "cli_test.db"
+    initialize_database(db_path)
+
+    called = False
+
+    async def fake_drive_one_task(
+        store: object, expected_agent: str, **kwargs: object
+    ) -> dict[str, str]:
+        nonlocal called
+        called = True
+        assert expected_agent == "charlie"
+        assert kwargs.get("expected_runtime") == "codex"
+        return {"status": "ok"}
+
+    monkeypatch.setattr(mock_alice, "drive_one_task", fake_drive_one_task)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mock-alice.py",
+            "--db",
+            str(db_path),
+            "--agent",
+            "charlie",
+            "--runtime",
+            "codex",
+            "--timeout",
+            "10",
+        ],
+    )
+
+    mock_alice.main()
+    assert called is True

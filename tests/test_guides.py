@@ -1,6 +1,6 @@
 """The hub's role-guide route (spec §4.2): static markdown behind the token."""
 
-import contextlib
+import sys
 from pathlib import Path
 
 import httpx
@@ -70,7 +70,14 @@ async def test_a_missing_guides_directory_is_a_404_not_a_crash(
         pytest.param("/guides/WORKER.md", id="uppercase"),
         pytest.param("/guides/README.md", id="not-a-role"),
         pytest.param("/guides/.env.md", id="hidden"),
-        pytest.param("/guides/worker%0a.md", id="trailing-newline"),
+        pytest.param(
+            "/guides/worker%0a.md",
+            id="trailing-newline",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="Filesystem does not support newlines in filenames (Windows/NTFS)",
+            ),
+        ),
     ],
 )
 async def test_a_request_cannot_name_a_path(
@@ -80,7 +87,7 @@ async def test_a_request_cannot_name_a_path(
     (guides / "README.md").write_text("not a guide", encoding="utf-8")
     # A percent-encoded newline reaches the route, so the file a lenient name
     # check would have served has to exist for the case to mean anything.
-    with contextlib.suppress(OSError):
+    if target == "/guides/worker%0a.md":
         (guides / "worker\n.md").write_text("not a guide", encoding="utf-8")
 
     response = await client.get(target)

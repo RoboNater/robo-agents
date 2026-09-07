@@ -5,7 +5,7 @@ import pytest
 from agent_hub.store import HubStore
 from agent_hub_common import HubSettings, TaskState
 from conftest import BASE_URL, TOKEN
-from worker_mcp.client import WorkerHubClient
+from worker_mcp.client import WorkerHubClient, WorkerProtocolError
 from worker_mcp.config import WorkerSettings
 
 
@@ -172,6 +172,16 @@ async def test_ask_alice_reply_and_retry_correlation(
     assert retry_res == {"reply": "The answer given in the gap."}
     assert task.id not in worker._pending_question_message_ids
 
+    # 4. Asking a different question after timeout generates a new message_id
+    timeout_diff_1 = await worker.ask_alice(task.id, "Question A?", timeout_s=0.05)
+    assert timeout_diff_1 == {"timeout": True}
+    msg_id_a = worker._pending_question_message_ids[task.id]
+
+    timeout_diff_2 = await worker.ask_alice(task.id, "Question B?", timeout_s=0.05)
+    assert timeout_diff_2 == {"timeout": True}
+    msg_id_b = worker._pending_question_message_ids[task.id]
+    assert msg_id_b != msg_id_a
+
 
 async def test_ask_alice_manual_termination_override(
     client: httpx.AsyncClient,
@@ -198,6 +208,54 @@ async def test_ask_alice_manual_termination_override(
     assert res.get("state") == "canceled"
     assert "aborted" in str(res.get("note"))
     assert task.id not in worker._pending_question_message_ids
+
+
+async def test_ask_alice_cancellation_without_result_summary(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    worker = WorkerHubClient(worker_settings, http_client=client)
+    await worker.check_in()
+    task = hub_store.assign_task("bob", "implementer", "Task 1", "Instructions")
+
+    async def cancel_task() -> None:
+        for _ in range(100):
+            current = hub_store.get_task(task.id)
+            if current is not None and current.state == TaskState.INPUT_REQUIRED:
+                break
+            await asyncio.sleep(0.01)
+        hub_store.cancel_task(task.id)
+
+    ask_task = asyncio.create_task(worker.ask_alice(task.id, "How to proceed?", timeout_s=2.0))
+    await asyncio.gather(cancel_task(), ask_task)
+
+    res = ask_task.result()
+    assert res.get("task_ended") is True
+    assert res.get("state") == "canceled"
+    assert res.get("note") == "canceled"
+    assert task.id not in worker._pending_question_message_ids
+
+
+async def test_stream_rpc_json_error_raises_protocol_error(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    worker = WorkerHubClient(worker_settings, http_client=client)
+    # 1. await_assignment with unknown contextId raises WorkerProtocolError
+    worker.context_id = "invalid-context-id"
+    with pytest.raises(WorkerProtocolError) as exc_info:
+        await worker.await_assignment(timeout_s=0.5)
+    assert "unknown context" in exc_info.value.message.lower()
+
+    # 2. ask_alice on a task not assigned to bob raises WorkerProtocolError
+    await worker.check_in()
+    hub_store.check_in("charlie", ["python"])
+    charlie_task = hub_store.assign_task("charlie", "implementer", "Task Charlie", "Inst")
+    with pytest.raises(WorkerProtocolError) as exc_info:
+        await worker.ask_alice(charlie_task.id, "Question?", timeout_s=0.5)
+    assert "not assigned to bob" in exc_info.value.message.lower()
 
 
 async def test_retry_on_503(

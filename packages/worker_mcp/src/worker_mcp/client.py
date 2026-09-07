@@ -40,8 +40,12 @@ class WorkerHubClient:
         self._external_client = http_client
         self._client: httpx.AsyncClient | None = http_client
         self.context_id: str | None = None
-        # Maps task_id -> message_id of the active pending question to reuse across retries (§4.1)
-        self._pending_question_message_ids: dict[str, str] = {}
+        # Active pending question (question_text, message_id) per task (§4.1)
+        self._pending_questions: dict[str, tuple[str, str]] = {}
+
+    @property
+    def _pending_question_message_ids(self) -> dict[str, str]:
+        return {k: v[1] for k, v in self._pending_questions.items()}
 
     async def __aenter__(self) -> WorkerHubClient:
         if self._client is None:
@@ -187,6 +191,32 @@ class WorkerHubClient:
                         await asyncio.sleep(delay)
                         continue
                     response.raise_for_status()
+                    content_type = response.headers.get("content-type", "")
+                    if "text/event-stream" not in content_type:
+                        content = await response.aread()
+                        try:
+                            data = json.loads(content)
+                        except Exception as exc:
+                            raw = content.decode("utf-8", errors="replace")[:200]
+                            raise WorkerProtocolError(
+                                None,
+                                f"Hub returned non-SSE response: {raw}",
+                            ) from exc
+                        if isinstance(data, dict) and "error" in data:
+                            err = data["error"]
+                            code = err.get("code") if isinstance(err, dict) else None
+                            msg = (
+                                err.get("message", "Unknown JSON-RPC error")
+                                if isinstance(err, dict)
+                                else str(err)
+                            )
+                            raise WorkerProtocolError(code, msg)
+                        if isinstance(data, dict) and "result" in data:
+                            return data["result"]
+                        raise WorkerProtocolError(
+                            None, f"Hub returned unexpected non-streaming response: {data}"
+                        )
+
                     async for line in response.aiter_lines():
                         line = line.strip()
                         if line.startswith("data:"):
@@ -206,7 +236,9 @@ class WorkerHubClient:
                                 )
                                 raise WorkerProtocolError(code, msg)
                             return data.get("result")
-                return None
+                    raise WorkerProtocolError(
+                        None, "SSE stream closed without delivering a data event"
+                    )
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 if attempts < self.settings.max_retries:
                     attempts += 1
@@ -333,17 +365,21 @@ class WorkerHubClient:
     ) -> dict[str, Any]:
         """Ask Alice a question, holding until answered, overridden, or timed out.
 
-        Retries reuse the original messageId (§4.1) so answers given in gaps are not lost.
+        Retries of the same question on a task reuse the original messageId (§4.1)
+        so answers given in gaps are not lost. Asking a different question generates
+        a new messageId.
         """
         if not self.context_id:
             raise RuntimeError("Worker has not checked in yet; call check_in first")
         hold_s = timeout_s if timeout_s is not None else self.settings.default_wait_s
 
-        # Re-use messageId if retrying a question on this task
-        message_id = self._pending_question_message_ids.get(task_id)
-        if not message_id:
+        # Re-use messageId if retrying the same question on this task
+        pending = self._pending_questions.get(task_id)
+        if pending is not None and pending[0] == question:
+            message_id = pending[1]
+        else:
             message_id = uuid4().hex
-            self._pending_question_message_ids[task_id] = message_id
+            self._pending_questions[task_id] = (question, message_id)
 
         params = {
             "message": {
@@ -369,8 +405,9 @@ class WorkerHubClient:
             or state in ("canceled", "failed", "completed")
         )
         if overridden:
-            self._pending_question_message_ids.pop(task_id, None)
-            note = (result.get("metadata") or {}).get("result", {}).get("summary")
+            self._pending_questions.pop(task_id, None)
+            task_result = (result.get("metadata") or {}).get("result")
+            note = task_result.get("summary") if isinstance(task_result, dict) else None
             if not note:
                 parts = status_msg.get("parts") or []
                 note = parts[0].get("text") if parts and isinstance(parts[0], dict) else state
@@ -385,11 +422,11 @@ class WorkerHubClient:
         if res_metadata.get("timeout") is True:
             # Preserve retry_as_message_id if provided by hub
             retry_id = res_metadata.get("retry_as_message_id", message_id)
-            self._pending_question_message_ids[task_id] = retry_id
+            self._pending_questions[task_id] = (question, retry_id)
             return {"timeout": True}
 
         # Normal reply from Alice
-        self._pending_question_message_ids.pop(task_id, None)
+        self._pending_questions.pop(task_id, None)
         parts = result.get("parts") or []
         reply_text = ""
         for part in parts:

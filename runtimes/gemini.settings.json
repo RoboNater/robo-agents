@@ -2,11 +2,17 @@
   "mcpServers": {
     "hub": {
       "command": "uv",
-      "args": ["run", "worker-mcp"],
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/agent-hub",
+        "worker-mcp"
+      ],
       "env": {
         "HUB_URL": "http://alice-host:8420",
         "HUB_TOKEN": "...",
-        "AGENT_NAME": "charlie"
+        "AGENT_NAME": "charlie",
+        "AGENT_RUNTIME": "gemini"
       }
     }
   }
