@@ -2,10 +2,11 @@
 
 This repository implements the proof of concept described in
 [`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
-Steps 1–2: the uv workspace, shared configuration and bearer-token provisioning,
+Steps 1–3: the uv workspace, shared configuration and bearer-token provisioning,
 the SQLite schema, A2A agent-card discovery, and the hub core — the A2A request
 handlers workers speak, the role-guide route, Alice's event queue, the lease and
-heartbeat sweeper, and bearer enforcement on the protected routes.
+heartbeat sweeper, bearer enforcement on the protected routes, and Alice's
+eight MCP tools over stdio in the same process.
 
 ## Run the hub
 
@@ -35,6 +36,53 @@ To load a local `.env` file explicitly:
 ```sh
 uv run --env-file .env hub
 ```
+
+## Alice's MCP connection
+
+Launch the hub as a stdio MCP server from Claude Code with this configuration
+(replace the absolute checkout and state paths):
+
+```json
+{
+  "mcpServers": {
+    "hub": {
+      "command": "uv",
+      "args": ["run", "--locked", "--project", "/absolute/path/to/robo-agents", "hub"],
+      "env": { "HUB_STATE_DIR": "/absolute/path/to/hub-state" }
+    }
+  }
+}
+```
+
+The launcher needs no working-directory setting. Keep `HUB_STATE_DIR` consistent
+between launches to resume the same database, and stop an existing hub on the
+same port before starting the runtime connection. HTTP and MCP share one store
+and event loop; a separate process writing SQLite cannot wake these waits.
+Closing MCP stdin or terminating the process shuts down HTTP and the sweeper.
+A normal client disconnect is logged at info level. A standalone `uv run hub`
+needs stdin to stay open; EOF before MCP initialization is an error and exits
+nonzero so detached launches cannot silently appear healthy.
+
+Alice gets `get_state`, `wait_for_event`, `assign_task`, `reply`,
+`set_task_state`, `release_agent`, `set_workflow_status`, and `log_decision`.
+`wait_for_event` consumes the oldest queued event, waits up to 120 seconds
+(default 120), and returns `{"event": null}` on timeout; call again.
+Zero seconds performs a nonblocking check. If your runtime uses a shorter tool
+timeout, request a shorter hold or configure the client timeout above 120 seconds.
+Consumption happens before transport delivery, as specified in §4.2: an event
+consumed for a call whose client has stopped waiting because of cancellation,
+timeout, or a crash is not redelivered. On reconnect, use `get_state` to
+reconcile durable workflow/task/agent state. Acknowledged delivery and replay
+remain hardening work, not a guarantee of this queue. Assignment leases default
+to 30 minutes and accept positive finite values up to one year.
+
+`get_state` returns a null workflow before one is created, plus agents and task
+summaries including results but excluding instructions and transcripts.
+Manual task overrides accept `canceled` or `failed` for open tasks, preserve
+the note, and free the worker; a held question returns a terminal A2A Task
+with its final state and result rather than interpreting the note as an answer; use a new assignment to retry terminal work.
+Workflow status summaries and decisions persist in the SQLite audit log.
+All diagnostics go to stderr; stdout carries only MCP JSON-RPC.
 
 ## What is public and what is not
 
@@ -105,8 +153,8 @@ calls carrying a `taskId` and a `metadata.kind` of `progress`, `question` or
 must be retried under the `messageId` it was first asked with (the timeout
 marker echoes it as `metadata.retry_as_message_id`), so that a reply Alice sent
 between the two attempts still reaches the worker. Assignments themselves
-come from Alice, whose MCP tools land in Step 3 and run inside this same
-process; until then nothing assigns work, so a `NEXT` will hold to its deadline.
+come from Alice's MCP tools in this same process; `assign_task` wakes a pending
+`NEXT` immediately.
 
 ## Checks
 
@@ -117,5 +165,4 @@ uv run --locked mypy
 uv run --locked pytest
 ```
 
-Alice's MCP tools and the worker MCP tools intentionally remain unimplemented
-until plan Steps 3–4.
+Worker MCP tools remain Step 4 work.

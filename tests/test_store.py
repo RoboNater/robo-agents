@@ -1,6 +1,12 @@
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from sqlite3 import Connection
 
 import pytest
+from agent_hub import store as store_module
+from agent_hub.database import database, initialize_database
 from agent_hub.store import (
     ConflictError,
     HubStore,
@@ -12,6 +18,36 @@ from agent_hub_common import AgentStatus, EventKind, TaskState, iso_after, to_is
 
 def assign(store: HubStore, agent: str = "bob", role: str = "implementer") -> str:
     return store.assign_task(agent, role, "Fix #1", "Open a PR", lease_min=30).id
+
+
+def test_state_uses_one_read_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "hub.db"
+    initialize_database(path)
+    store = HubStore(path)
+    store.check_in("bob", [])
+    task = store.assign_task("bob", "implementer", "Fix", "Instructions")
+    changed = False
+
+    def between_queries(sql: str) -> None:
+        nonlocal changed
+        if "SELECT * FROM task" in sql and not changed:
+            changed = True
+            with database(path) as writer:
+                writer.execute("UPDATE task SET state = 'completed' WHERE id = ?", (task.id,))
+                writer.execute("UPDATE agent SET status = 'idle', current_task_id = NULL")
+
+    @contextmanager
+    def traced_database(path: Path) -> Iterator[Connection]:
+        with database(path) as connection:
+            connection.set_trace_callback(between_queries)
+            yield connection
+
+    monkeypatch.setattr(store_module, "database", traced_database)
+    state = store.get_state()
+    assert changed
+    assert state["tasks"][0]["state"] == "submitted"
+    assert state["agents"][0]["status"] == "busy"
+    assert state["agents"][0]["current_task_id"] == task.id
 
 
 def test_check_in_registers_an_agent_and_queues_the_event(store: HubStore) -> None:
@@ -92,9 +128,7 @@ async def test_waiting_worker_gets_the_task_and_claims_it(store: HubStore) -> No
         await asyncio.sleep(0.01)
         assign(store)
 
-    waited, _ = await asyncio.gather(
-        store.await_assignment(agent.context_id, 2.0), alice()
-    )
+    waited, _ = await asyncio.gather(store.await_assignment(agent.context_id, 2.0), alice())
 
     assert not isinstance(waited, Released)
     assert waited is not None
@@ -110,9 +144,7 @@ async def test_waiting_worker_is_released_while_it_waits(store: HubStore) -> Non
         await asyncio.sleep(0.01)
         store.release_agent("bob")
 
-    waited, _ = await asyncio.gather(
-        store.await_assignment(agent.context_id, 2.0), alice()
-    )
+    waited, _ = await asyncio.gather(store.await_assignment(agent.context_id, 2.0), alice())
 
     assert waited == Released(agent="bob")
 
@@ -175,7 +207,7 @@ async def test_an_unanswered_question_times_out(store: HubStore) -> None:
 async def test_a_reply_that_lands_between_attempts_reaches_the_retry(
     store: HubStore,
 ) -> None:
-    """"Call again" is only safe if a retry can still see the answer it missed."""
+    """ "Call again" is only safe if a retry can still see the answer it missed."""
 
     store.check_in("bob", [])
     task_id = assign(store)

@@ -424,3 +424,40 @@ async def test_a_non_numeric_timeout_is_rejected(client: httpx.AsyncClient) -> N
     )
 
     assert body["error"]["code"] == -32602
+
+
+@pytest.mark.parametrize("state", [TaskState.CANCELED, TaskState.FAILED])
+async def test_manual_override_returns_terminal_task_to_question_stream(
+    client: httpx.AsyncClient, hub_store: HubStore, state: TaskState
+) -> None:
+    context_id, task_id = await assigned_context(client, hub_store)
+    pending = asyncio.create_task(
+        client.post(
+            "/a2a",
+            json=rpc(
+                "message/stream",
+                message(
+                    "Which?",
+                    context_id=context_id,
+                    task_id=task_id,
+                    metadata={"kind": "question"},
+                ),
+            ),
+        )
+    )
+    while True:
+        task = hub_store.get_task(task_id)
+        assert task is not None
+        if task.state == TaskState.INPUT_REQUIRED:
+            break
+        await asyncio.sleep(0)
+    hub_store.set_task_state(task_id, state, "Superseded")
+    result = sse_results(await asyncio.wait_for(pending, 1))[0]
+    assert result["kind"] == "task"
+    assert result["status"]["state"] == state.value
+    assert result["status"]["message"]["parts"][0]["text"] == "Superseded"
+    assert result["status"]["message"]["metadata"] == {
+        "kind": "state_override",
+        "state": state.value,
+    }
+    assert result["metadata"]["result"]["summary"] == "Superseded"
