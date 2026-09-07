@@ -1,0 +1,4 @@
+[mcp_servers.hub]
+command = "uv"
+args = ["run", "worker-mcp"]
+env = { HUB_URL = "http://alice-host:8420", HUB_TOKEN = "...", AGENT_NAME = "charlie" }

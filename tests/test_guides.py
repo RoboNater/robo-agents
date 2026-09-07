@@ -1,5 +1,6 @@
 """The hub's role-guide route (spec §4.2): static markdown behind the token."""
 
+import contextlib
 from pathlib import Path
 
 import httpx
@@ -15,7 +16,7 @@ GUIDE = "# Worker\n\nLoop: await_assignment -> get_role_guide -> do -> submit_re
 @pytest.fixture
 def guides(settings: HubSettings) -> Path:
     settings.guides_dir.mkdir()
-    (settings.guides_dir / "worker.md").write_text(GUIDE, encoding="utf-8")
+    (settings.guides_dir / "worker.md").write_text(GUIDE, encoding="utf-8", newline="\n")
     return settings.guides_dir
 
 
@@ -79,7 +80,8 @@ async def test_a_request_cannot_name_a_path(
     (guides / "README.md").write_text("not a guide", encoding="utf-8")
     # A percent-encoded newline reaches the route, so the file a lenient name
     # check would have served has to exist for the case to mean anything.
-    (guides / "worker\n.md").write_text("not a guide", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        (guides / "worker\n.md").write_text("not a guide", encoding="utf-8")
 
     response = await client.get(target)
 
@@ -92,7 +94,12 @@ async def test_a_symlink_out_of_the_directory_is_refused(
 ) -> None:
     outside = guides.parent / "outside.md"
     outside.write_text("not a guide", encoding="utf-8")
-    (guides / "escaped.md").symlink_to(outside)
+    try:
+        (guides / "escaped.md").symlink_to(outside)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows Developer Mode or symlink privilege required")
+        raise
 
     response = await client.get("/guides/escaped.md")
 
@@ -106,8 +113,13 @@ async def test_a_symlinked_guides_directory_still_serves(
     # traversal: the check is "inside the directory", not "not a symlink".
     real = tmp_path / "checkout-guides"
     real.mkdir()
-    (real / "worker.md").write_text(GUIDE, encoding="utf-8")
-    settings.guides_dir.symlink_to(real, target_is_directory=True)
+    (real / "worker.md").write_text(GUIDE, encoding="utf-8", newline="\n")
+    try:
+        settings.guides_dir.symlink_to(real, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows Developer Mode or symlink privilege required")
+        raise
 
     async with (
         app.router.lifespan_context(app),

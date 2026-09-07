@@ -6,6 +6,7 @@ import hmac
 import os
 import secrets
 import stat
+import sys
 from pathlib import Path
 
 
@@ -18,7 +19,7 @@ def _read_token(path: Path) -> str:
         permissions = stat.S_IMODE(path.stat().st_mode)
     except OSError as exc:
         raise TokenError(f"cannot inspect bearer token file: {path}") from exc
-    if permissions & 0o077:
+    if sys.platform != "win32" and (permissions & 0o077):
         raise TokenError(f"bearer token file must not be accessible by group or others: {path}")
 
     try:

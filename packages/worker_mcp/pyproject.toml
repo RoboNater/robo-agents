@@ -3,7 +3,12 @@ name = "worker-mcp"
 version = "0.1.0"
 description = "Worker-side MCP client for agent-hub"
 requires-python = ">=3.12"
-dependencies = ["agent-hub-common"]
+dependencies = [
+    "a2a-sdk>=0.3.0,<0.4.0",
+    "agent-hub-common",
+    "httpx>=0.27,<1",
+    "mcp>=1.26,<2",
+]
 
 [project.scripts]
 worker-mcp = "worker_mcp.main:main"

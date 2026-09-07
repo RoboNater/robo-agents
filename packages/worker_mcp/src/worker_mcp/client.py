@@ -1,0 +1,441 @@
+"""A2A HTTP client for worker MCP tools."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from typing import Any
+from uuid import uuid4
+
+import httpx
+
+from .config import WorkerSettings
+
+logger = logging.getLogger(__name__)
+
+ROLE_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
+
+
+class WorkerProtocolError(Exception):
+    """Raised when the hub returns a JSON-RPC error or protocol failure."""
+
+    def __init__(self, code: int | None, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class WorkerHubClient:
+    """HTTP client communicating with the agent-hub over A2A and guide routes."""
+
+    def __init__(
+        self,
+        settings: WorkerSettings,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.settings = settings
+        self._external_client = http_client
+        self._client: httpx.AsyncClient | None = http_client
+        self.context_id: str | None = None
+        # Maps task_id -> message_id of the active pending question to reuse across retries (§4.1)
+        self._pending_question_message_ids: dict[str, str] = {}
+
+    async def __aenter__(self) -> WorkerHubClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self.settings.hub_url,
+                headers={"Authorization": f"Bearer {self.settings.token}"},
+            )
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._external_client is None and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self.settings.hub_url,
+                headers={"Authorization": f"Bearer {self.settings.token}"},
+            )
+        return self._client
+
+    async def _request_with_retry(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        client = self._ensure_client()
+        attempts = 0
+        while True:
+            try:
+                response = await client.request(
+                    method,
+                    path,
+                    json=json_body,
+                    timeout=timeout,
+                    headers={"Authorization": f"Bearer {self.settings.token}"},
+                )
+                retryable = (
+                    response.status_code in RETRYABLE_STATUS_CODES
+                    and attempts < self.settings.max_retries
+                )
+                if retryable:
+                    attempts += 1
+                    delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                    logger.warning(
+                        "Hub returned %s on %s %s; retrying in %.2fs (attempt %d/%d)",
+                        response.status_code,
+                        method,
+                        path,
+                        delay,
+                        attempts,
+                        self.settings.max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                return response
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if attempts < self.settings.max_retries:
+                    attempts += 1
+                    delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                    logger.warning(
+                        "Connection error (%s) on %s %s; retrying in %.2fs (attempt %d/%d)",
+                        exc,
+                        method,
+                        path,
+                        delay,
+                        attempts,
+                        self.settings.max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+    async def _post_rpc(self, method: str, params: dict[str, Any]) -> Any:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": uuid4().hex,
+            "method": method,
+            "params": params,
+        }
+        response = await self._request_with_retry("POST", "/a2a", json_body=payload)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise WorkerProtocolError(None, "Hub response was not a JSON object")
+        if "error" in data:
+            err = data["error"]
+            code = err.get("code") if isinstance(err, dict) else None
+            msg = (
+                err.get("message", "Unknown JSON-RPC error")
+                if isinstance(err, dict)
+                else str(err)
+            )
+            raise WorkerProtocolError(code, msg)
+        return data.get("result")
+
+    async def _stream_rpc(
+        self,
+        method: str,
+        params: dict[str, Any],
+        hold_timeout_s: float,
+    ) -> Any:
+        client = self._ensure_client()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": uuid4().hex,
+            "method": method,
+            "params": params,
+        }
+        # Client read timeout must comfortably exceed the requested server hold timeout
+        client_timeout = hold_timeout_s + 15.0
+        attempts = 0
+        while True:
+            try:
+                async with client.stream(
+                    "POST",
+                    "/a2a",
+                    json=payload,
+                    timeout=client_timeout,
+                    headers={"Authorization": f"Bearer {self.settings.token}"},
+                ) as response:
+                    retryable = (
+                        response.status_code in RETRYABLE_STATUS_CODES
+                        and attempts < self.settings.max_retries
+                    )
+                    if retryable:
+                        attempts += 1
+                        delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                        logger.warning(
+                            "Hub returned %s on stream; retrying in %.2fs (attempt %d/%d)",
+                            response.status_code,
+                            delay,
+                            attempts,
+                            self.settings.max_retries,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if line.startswith("data:"):
+                            raw = line.removeprefix("data:").strip()
+                            if not raw:
+                                continue
+                            data = json.loads(raw)
+                            if not isinstance(data, dict):
+                                raise WorkerProtocolError(None, "SSE chunk was not a JSON object")
+                            if "error" in data:
+                                err = data["error"]
+                                code = err.get("code") if isinstance(err, dict) else None
+                                msg = (
+                                    err.get("message", "Unknown JSON-RPC error")
+                                    if isinstance(err, dict)
+                                    else str(err)
+                                )
+                                raise WorkerProtocolError(code, msg)
+                            return data.get("result")
+                return None
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if attempts < self.settings.max_retries:
+                    attempts += 1
+                    delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                    logger.warning(
+                        "Connection error (%s) on stream; retrying in %.2fs (attempt %d/%d)",
+                        exc,
+                        delay,
+                        attempts,
+                        self.settings.max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+    async def check_in(self, capabilities: list[str] | None = None) -> dict[str, Any]:
+        """Register the worker with the hub and store the returned contextId."""
+        caps = capabilities if capabilities is not None else ["python"]
+        params = {
+            "message": {
+                "messageId": uuid4().hex,
+                "role": "user",
+                "parts": [{"kind": "text", "text": "READY"}],
+                "metadata": {
+                    "agent": self.settings.agent_name,
+                    "capabilities": caps,
+                    "runtime": self.settings.runtime,
+                },
+            }
+        }
+        result = await self._post_rpc("message/send", params)
+        if not isinstance(result, dict):
+            raise WorkerProtocolError(None, "check_in response was not a dict")
+        context_id = result.get("contextId") or (result.get("metadata") or {}).get("contextId")
+        if not context_id or not isinstance(context_id, str):
+            raise WorkerProtocolError(None, "check_in response did not contain contextId")
+        self.context_id = context_id
+        return {
+            "status": "registered",
+            "agent": self.settings.agent_name,
+            "context_id": self.context_id,
+        }
+
+    async def get_role_guide(self, role: str) -> str:
+        """Fetch role guidance markdown from GET /guides/{role}.md (no local cache)."""
+        clean_role = role.strip()
+        if not ROLE_SLUG_RE.fullmatch(clean_role):
+            raise ValueError(
+                f"Role must be a slug matching [a-z][a-z0-9-]*, got {role!r}"
+            )
+        response = await self._request_with_retry("GET", f"/guides/{clean_role}.md")
+        if response.status_code == 404:
+            raise FileNotFoundError(f"Role guide for {clean_role!r} not found (404)")
+        response.raise_for_status()
+        return response.text
+
+    async def await_assignment(self, timeout_s: float | None = None) -> dict[str, Any]:
+        """Poll the hub for the next task assignment, holding until assigned or released."""
+        if not self.context_id:
+            raise RuntimeError("Worker has not checked in yet; call check_in first")
+        hold_s = timeout_s if timeout_s is not None else self.settings.default_wait_s
+        params = {
+            "message": {
+                "messageId": uuid4().hex,
+                "contextId": self.context_id,
+                "role": "user",
+                "parts": [{"kind": "text", "text": "NEXT"}],
+                "metadata": {"timeout_s": hold_s},
+            }
+        }
+        result = await self._stream_rpc("message/stream", params, hold_s)
+        if not isinstance(result, dict):
+            return {"timeout": True}
+        metadata = result.get("metadata") or {}
+        if metadata.get("release") is True:
+            return {"release": True}
+        if metadata.get("timeout") is True:
+            return {"timeout": True}
+
+        # Assignment received (A2A Task object)
+        task_id = result.get("id")
+        role = metadata.get("role", "")
+        status_msg = (result.get("status") or {}).get("message") or {}
+        parts = status_msg.get("parts") or []
+        instructions = ""
+        for part in parts:
+            if isinstance(part, dict) and "text" in part:
+                instructions += part["text"]
+            elif (
+                isinstance(part, dict)
+                and isinstance(part.get("root"), dict)
+                and "text" in part["root"]
+            ):
+                instructions += part["root"]["text"]
+
+        return {
+            "task_id": str(task_id) if task_id else "",
+            "role": str(role),
+            "instructions": instructions,
+        }
+
+    async def report_progress(self, task_id: str, note: str) -> dict[str, Any]:
+        """Send a progress note to Alice."""
+        if not self.context_id:
+            raise RuntimeError("Worker has not checked in yet; call check_in first")
+        params = {
+            "message": {
+                "messageId": uuid4().hex,
+                "taskId": task_id,
+                "contextId": self.context_id,
+                "role": "user",
+                "parts": [{"kind": "text", "text": note}],
+                "metadata": {"kind": "progress"},
+            }
+        }
+        await self._post_rpc("message/send", params)
+        return {"ok": True, "note": note}
+
+    async def ask_alice(
+        self,
+        task_id: str,
+        question: str,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Ask Alice a question, holding until answered, overridden, or timed out.
+
+        Retries reuse the original messageId (§4.1) so answers given in gaps are not lost.
+        """
+        if not self.context_id:
+            raise RuntimeError("Worker has not checked in yet; call check_in first")
+        hold_s = timeout_s if timeout_s is not None else self.settings.default_wait_s
+
+        # Re-use messageId if retrying a question on this task
+        message_id = self._pending_question_message_ids.get(task_id)
+        if not message_id:
+            message_id = uuid4().hex
+            self._pending_question_message_ids[task_id] = message_id
+
+        params = {
+            "message": {
+                "messageId": message_id,
+                "taskId": task_id,
+                "contextId": self.context_id,
+                "role": "user",
+                "parts": [{"kind": "text", "text": question}],
+                "metadata": {"kind": "question", "timeout_s": hold_s},
+            }
+        }
+        result = await self._stream_rpc("message/stream", params, hold_s)
+        if not isinstance(result, dict):
+            return {"timeout": True}
+
+        # Check for manual termination during question (§4.1)
+        status = result.get("status") or {}
+        state = status.get("state")
+        status_msg = status.get("message") or {}
+        msg_metadata = status_msg.get("metadata") or {}
+        overridden = (
+            msg_metadata.get("kind") == "state_override"
+            or state in ("canceled", "failed", "completed")
+        )
+        if overridden:
+            self._pending_question_message_ids.pop(task_id, None)
+            note = (result.get("metadata") or {}).get("result", {}).get("summary")
+            if not note:
+                parts = status_msg.get("parts") or []
+                note = parts[0].get("text") if parts and isinstance(parts[0], dict) else state
+            return {
+                "task_ended": True,
+                "state": state,
+                "note": note,
+            }
+
+        # Check for hold timeout (§4.1)
+        res_metadata = result.get("metadata") or {}
+        if res_metadata.get("timeout") is True:
+            # Preserve retry_as_message_id if provided by hub
+            retry_id = res_metadata.get("retry_as_message_id", message_id)
+            self._pending_question_message_ids[task_id] = retry_id
+            return {"timeout": True}
+
+        # Normal reply from Alice
+        self._pending_question_message_ids.pop(task_id, None)
+        parts = result.get("parts") or []
+        reply_text = ""
+        for part in parts:
+            if isinstance(part, dict) and "text" in part:
+                reply_text += part["text"]
+            elif (
+                isinstance(part, dict)
+                and isinstance(part.get("root"), dict)
+                and "text" in part["root"]
+            ):
+                reply_text += part["root"]["text"]
+
+        return {"reply": reply_text}
+
+    async def submit_result(
+        self,
+        task_id: str,
+        status: str,
+        summary: str,
+        artifacts: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """Report final result (completed or failed) with artifacts and summary."""
+        if not self.context_id:
+            raise RuntimeError("Worker has not checked in yet; call check_in first")
+        clean_status = status.strip().lower()
+        if clean_status not in ("completed", "failed"):
+            raise ValueError(f"status must be 'completed' or 'failed', got {status!r}")
+
+        self._pending_question_message_ids.pop(task_id, None)
+        params = {
+            "message": {
+                "messageId": uuid4().hex,
+                "taskId": task_id,
+                "contextId": self.context_id,
+                "role": "user",
+                "parts": [{"kind": "text", "text": summary}],
+                "metadata": {
+                    "kind": "result",
+                    "status": clean_status,
+                    "artifacts": artifacts or [],
+                },
+            }
+        }
+        await self._post_rpc("message/send", params)
+        return {
+            "status": clean_status,
+            "task_id": task_id,
+            "summary": summary,
+        }

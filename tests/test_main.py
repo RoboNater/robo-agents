@@ -152,6 +152,10 @@ main.main()
         assert marker in result.stderr
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX subprocess signal and pipe handling is not supported on Windows",
+)
 @pytest.mark.parametrize("shutdown", ["eof", "sigterm", "sigint", "http_error", "mcp_stuck"])
 def test_process_shutdown_releases_listener(tmp_path: Path, shutdown: str) -> None:
     import signal
@@ -245,6 +249,10 @@ main.run_mcp = stuck_mcp
                 stream.close()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX subprocess signal and pipe handling is not supported on Windows",
+)
 @pytest.mark.parametrize("blocked_stdout", [False, True])
 def test_initialized_mcp_disconnect_and_blocked_output_shutdown(
     tmp_path: Path, blocked_stdout: bool
@@ -329,6 +337,10 @@ def test_initialized_mcp_disconnect_and_blocked_output_shutdown(
                 stream.close()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX subprocess signal and pipe handling is not supported on Windows",
+)
 def test_rejected_initialize_exits_as_uninitialized_without_traceback(tmp_path: Path) -> None:
     import json
     import socket
@@ -385,6 +397,10 @@ def test_rejected_initialize_exits_as_uninitialized_without_traceback(tmp_path: 
                 stream.close()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX subprocess signal and pipe handling is not supported on Windows",
+)
 def test_http_shutdown_failure_is_reported_after_mcp_cleanup(tmp_path: Path) -> None:
     import signal
     import socket
