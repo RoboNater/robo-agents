@@ -84,7 +84,7 @@ The hub and worker speak an A2A-shaped wire protocol layered over JSON-RPC 2.0. 
 - JSON-RPC requests & responses: `SendMessageRequest`, `SendStreamingMessageRequest`, `GetTaskRequest`, `CancelTaskRequest`, `JSONRPCSuccessResponse`, `JSONRPCErrorResponse`, `JSONRPCError`
 
 **Hub metadata keys (`hub.*`):**
-All hub-specific extensions ride inside A2A `metadata` objects using the `hub.` prefix to guarantee namespace isolation:
+All hub-specific extensions ride inside A2A `metadata` objects using the `hub.` prefix to guarantee namespace isolation across all layers — including task-level metadata (`Task.metadata`), message-level metadata (`Message.metadata`), and part-level metadata (`Part.metadata`):
 - `hub.kind`: Intent discriminator for messages and events:
   - Worker requests: `progress`, `question`, `result`.
   - Hub responses: `check_in_ack`, `assignment`, `progress_ack`, `release`, `timeout`, `state_override`.

@@ -143,6 +143,51 @@ def _task(row: Row) -> TaskRecord:
     )
 
 
+_LEGACY_KEY_MAP: dict[str, str] = {
+    "kind": MetaKeys.KIND.value,
+    "agent": MetaKeys.AGENT.value,
+    "capabilities": MetaKeys.CAPABILITIES.value,
+    "runtime": MetaKeys.RUNTIME.value,
+    "status": MetaKeys.STATUS.value,
+    "timeout": MetaKeys.TIMEOUT.value,
+    "timeout_s": MetaKeys.TIMEOUT_S.value,
+    "retry_as_message_id": MetaKeys.RETRY_AS_MESSAGE_ID.value,
+    "release": MetaKeys.RELEASE.value,
+    "result": MetaKeys.RESULT.value,
+    "role": MetaKeys.ROLE.value,
+    "title": MetaKeys.TITLE.value,
+    "assignee": MetaKeys.ASSIGNEE.value,
+    "lease_expires": MetaKeys.LEASE_EXPIRES.value,
+    "artifacts": MetaKeys.ARTIFACTS.value,
+    "state": MetaKeys.STATE.value,
+    "sender": MetaKeys.SENDER.value,
+    "ts": MetaKeys.TS.value,
+}
+
+
+def _normalize_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize legacy unprefixed metadata keys to the hub.* namespace."""
+    normalized: dict[str, Any] = {}
+    for k, v in metadata.items():
+        if k in _LEGACY_KEY_MAP:
+            normalized[_LEGACY_KEY_MAP[k]] = v
+        elif not k.startswith("hub."):
+            normalized[f"hub.{k}"] = v
+        else:
+            normalized[k] = v
+    return normalized
+
+
+def _normalize_part(part: dict[str, Any]) -> dict[str, Any]:
+    """Ensure part metadata uses the hub.* namespace."""
+    metadata = part.get("metadata")
+    if not isinstance(metadata, dict):
+        return part
+    new_part = dict(part)
+    new_part["metadata"] = _normalize_metadata(metadata)
+    return new_part
+
+
 def _message(row: Row) -> MessageRecord:
     parts: Any = json.loads(row["parts_json"])
     return MessageRecord(
@@ -151,7 +196,11 @@ def _message(row: Row) -> MessageRecord:
         context_id=row["context_id"],
         sender=row["sender"],
         direction=row["direction"],
-        parts=[part for part in parts if isinstance(part, dict)] if isinstance(parts, list) else [],
+        parts=[
+            _normalize_part(part) for part in parts if isinstance(part, dict)
+        ]
+        if isinstance(parts, list)
+        else [],
         ts=row["ts"],
     )
 
@@ -165,12 +214,12 @@ def _event(row: Row) -> EventRecord:
     )
 
 
-def text_part(text: str, **metadata: Any) -> dict[str, Any]:
+def text_part(text: str, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Build the A2A text part shape the transcript stores."""
 
     part: dict[str, Any] = {"kind": "text", "text": text}
     if metadata:
-        part["metadata"] = metadata
+        part["metadata"] = _normalize_metadata(metadata)
     return part
 
 
@@ -263,7 +312,7 @@ class HubStore:
                 context_id=context_id,
                 sender="alice",
                 direction="from_alice",
-                parts=[text_part(note, kind="state_override")],
+                parts=[text_part(note, metadata={MetaKeys.KIND: "state_override"})],
             )
             self._finish(connection, task_id, state, {"status": state.value, "summary": note})
             result = self._require_task(connection, task_id)
@@ -316,13 +365,16 @@ class HubStore:
                         name,
                     ),
                 )
+            check_in_meta: dict[str, Any] = {MetaKeys.KIND: "check_in"}
+            if runtime is not None:
+                check_in_meta[MetaKeys.RUNTIME] = runtime
             self._add_message(
                 connection,
                 task_id=None,
                 context_id=context_id,
                 sender=name,
                 direction="to_alice",
-                parts=[text_part("READY", kind="check_in", runtime=runtime)],
+                parts=[text_part("READY", metadata=check_in_meta)],
             )
             self._add_event(
                 connection,
@@ -446,7 +498,16 @@ class HubStore:
                 context_id=record.context_id,
                 sender="alice",
                 direction="from_alice",
-                parts=[text_part(instructions, kind="assignment", role=role, title=title)],
+                parts=[
+                    text_part(
+                        instructions,
+                        metadata={
+                            MetaKeys.KIND: "assignment",
+                            MetaKeys.ROLE: role,
+                            MetaKeys.TITLE: title,
+                        },
+                    )
+                ],
             )
             task = self._require_task(connection, task_id)
         self.signals.notify(context_key(record.context_id))
@@ -492,7 +553,7 @@ class HubStore:
                 context_id=record.context_id,
                 sender=agent,
                 direction="to_alice",
-                parts=[text_part(note, kind="progress")],
+                parts=[text_part(note, metadata={MetaKeys.KIND: "progress"})],
             )
             self._add_event(
                 connection,
@@ -529,7 +590,10 @@ class HubStore:
                 parts=[
                     text_part(
                         question,
-                        **{MetaKeys.KIND: "question", MetaKeys.RETRY_AS_MESSAGE_ID: sent_as},
+                        metadata={
+                            MetaKeys.KIND: "question",
+                            MetaKeys.RETRY_AS_MESSAGE_ID: sent_as,
+                        },
                     )
                 ],
             )
@@ -562,7 +626,7 @@ class HubStore:
             for part in json.loads(row["parts_json"]):
                 if not isinstance(part, dict):
                     continue
-                metadata = part.get("metadata") or {}
+                metadata = _normalize_part(part).get("metadata") or {}
                 if (
                     metadata.get(MetaKeys.KIND) == "question"
                     and metadata.get(MetaKeys.RETRY_AS_MESSAGE_ID) == sent_as
@@ -582,7 +646,7 @@ class HubStore:
                 context_id=context_id,
                 sender="alice",
                 direction="from_alice",
-                parts=[text_part(text, kind="reply")],
+                parts=[text_part(text, metadata={MetaKeys.KIND: "reply"})],
             )
             self._set_state(connection, task.id, TaskState.WORKING)
         self.signals.notify(task_key(task_id))
@@ -624,7 +688,15 @@ class HubStore:
                 context_id=record.context_id,
                 sender=agent,
                 direction="to_alice",
-                parts=[text_part(summary, kind="result", status=status.value)],
+                parts=[
+                    text_part(
+                        summary,
+                        metadata={
+                            MetaKeys.KIND: "result",
+                            MetaKeys.STATUS: status.value,
+                        },
+                    )
+                ],
             )
             self._finish(connection, task.id, status, payload)
             self._add_event(

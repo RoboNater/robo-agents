@@ -139,6 +139,16 @@ def test_no_unprefixed_hub_keys_in_packages_code() -> None:
                             ):
                                 msg = f"{py_file}: Unprefixed key {key_node.value!r} in metadata"
                                 assert key_node.value.startswith("hub."), msg
+            elif isinstance(node, ast.Call):
+                func = node.func
+                is_text_part = (
+                    (isinstance(func, ast.Name) and func.id == "text_part")
+                    or (isinstance(func, ast.Attribute) and func.attr == "text_part")
+                )
+                if is_text_part:
+                    for kw in node.keywords:
+                        msg = f"{py_file}:{node.lineno}: text_part called with kwarg {kw.arg!r}"
+                        assert kw.arg == "metadata", msg
 
 
 async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
@@ -169,6 +179,7 @@ async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
 
     # Assign task so tasks/get and tasks/cancel work
     task = store.assign_task("bob", "implementer", "Fix #1", "Fix issue #1")
+    store.record_progress(task.id, "bob", "branch pushed")
 
     # 2. tasks/get fixture
     get_fixture = json.loads((WIRE_DIR / "tasks_get.json").read_text(encoding="utf-8"))
@@ -190,3 +201,103 @@ async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
     assert cancel_data["result"]["id"] == task.id
     assert cancel_data["result"]["status"]["state"] == "canceled"
     assert cancel_data["result"]["metadata"][MetaKeys.ASSIGNEE] == "bob"
+
+
+async def test_tasks_get_populated_history_has_only_prefixed_metadata(
+    tmp_path: Path,
+) -> None:
+    """Regression test for Issue #22 finding: part-metadata must be namespaced to hub.*.
+
+    Verifies that all history messages (assignment, progress, question, reply)
+    and legacy persisted rows in the database return only hub.* namespaced
+    metadata keys at all levels (message, part, task).
+    """
+    from agent_hub.database import database
+
+    db_path = tmp_path / "populated_hub.db"
+    initialize_database(db_path)
+    settings = HubSettings(
+        host="127.0.0.1",
+        port=8420,
+        public_url="http://hub.example:8420",
+        state_dir=tmp_path,
+        database_path=db_path,
+        token="wire-token",
+        token_file=tmp_path / "token",
+        guides_dir=tmp_path / "guides",
+    )
+    store = HubStore(db_path)
+    protocol = A2AProtocol(store, settings)
+
+    store.check_in("bob", ["python"], runtime="claude-code")
+    task = store.assign_task("bob", "implementer", "Fix issue #22", "Do the work")
+    store.record_progress(task.id, "bob", "working on fix")
+    q_id = store.open_question(task.id, "bob", "Which approach?", sent_as="q-001")
+    assert q_id > 0
+    store.reply(task.id, "Use MetaKeys constants")
+
+    # Directly insert a legacy transcript row with raw, unprefixed keys to test
+    # backward compatibility for existing persisted databases.
+    with database(db_path) as conn:
+        legacy_parts = json.dumps(
+            [
+                {
+                    "kind": "text",
+                    "text": "legacy progress note",
+                    "metadata": {"kind": "progress", "role": "implementer"},
+                }
+            ]
+        )
+        conn.execute(
+            "INSERT INTO message (task_id, context_id, sender, direction, parts_json, ts)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (task.id, "ctx-bob", "bob", "to_alice", legacy_parts, "2026-09-01T12:00:00Z"),
+        )
+
+    # Dispatch tasks/get with full history
+    get_req = {
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "tasks/get",
+        "params": {"id": task.id, "historyLength": 10},
+    }
+    resp = await protocol.dispatch(get_req)
+    resp_data = json.loads(bytes(resp.body).decode("utf-8"))
+
+    # Validate response matches a2a-sdk Task model
+    JSONRPCSuccessResponse.model_validate(resp_data)
+    task_result = Task.model_validate(resp_data["result"])
+    assert task_result.history is not None
+    assert len(task_result.history) >= 5
+
+    # Check all metadata keys recursively across entire response
+    all_keys = _collect_metadata_keys(resp_data)
+    assert all_keys, "Expected metadata keys in tasks/get response"
+    unprefixed = [k for k in all_keys if not k.startswith("hub.")]
+    assert not unprefixed, f"Found unprefixed metadata keys: {unprefixed}"
+
+    # Specifically check part metadata on each history message
+    history = resp_data["result"]["history"]
+    part_metas = [
+        part["metadata"]
+        for msg in history
+        for part in msg.get("parts", [])
+        if "metadata" in part
+    ]
+    assert len(part_metas) >= 5, "Expected part metadata on history messages"
+    for pmeta in part_metas:
+        assert isinstance(pmeta, dict)
+        for key in pmeta:
+            assert key.startswith("hub."), f"Found unprefixed part metadata key {key!r}"
+
+    # Verify that the legacy row's metadata was normalized to hub.*
+    legacy_msg = next(
+        msg
+        for msg in history
+        if any(p.get("text") == "legacy progress note" for p in msg.get("parts", []))
+    )
+    legacy_part = legacy_msg["parts"][0]
+    assert legacy_part["metadata"] == {
+        "hub.kind": "progress",
+        "hub.role": "implementer",
+    }

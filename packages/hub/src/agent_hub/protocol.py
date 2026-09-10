@@ -57,6 +57,7 @@ from .store import (
     NotFoundError,
     Released,
     TaskRecord,
+    _normalize_part,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,7 +162,7 @@ def _stored_message(record: MessageRecord) -> A2AMessage:
     return A2AMessage(
         message_id=str(record.id),
         role=Role.user if record.direction == "to_alice" else Role.agent,
-        parts=[Part.model_validate(part) for part in record.parts],
+        parts=[Part.model_validate(_normalize_part(part)) for part in record.parts],
         context_id=record.context_id,
         task_id=record.task_id,
         metadata={MetaKeys.SENDER: record.sender, MetaKeys.TS: record.ts},

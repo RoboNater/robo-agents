@@ -26,6 +26,9 @@
           "parts": [
             {
               "kind": "text",
+              "metadata": {
+                "hub.kind": "progress"
+              },
               "text": "branch pushed"
             }
           ],
