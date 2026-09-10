@@ -52,7 +52,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "a2a-sdk", extras = ["http-server"], specifier = ">=0.3.0,<0.4.0" },
+    { name = "a2a-sdk", extras = ["http-server"], specifier = "==0.3.26" },
     { name = "agent-hub-common", editable = "packages/common" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "mcp", specifier = ">=1.26,<2" },
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "a2a-sdk", specifier = ">=0.3.0,<0.4.0" },
+    { name = "a2a-sdk", specifier = "==0.3.26" },
     { name = "agent-hub-common", editable = "packages/common" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "mcp", specifier = ">=1.26,<2" },
