@@ -45,7 +45,7 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 - **Runtime mix (decided):** Alice + Bob on Claude Code, Charlie on a second MCP-capable CLI (Codex CLI or Gemini CLI — pick whichever is already set up in the sandbox env). Consequence: **role guidance cannot depend on Claude Code skills.** The hub serves role guides over HTTP and `worker-mcp` exposes them as a tool, so every runtime gets identical instructions. Claude Code skill files become a thin wrapper that says "call `get_role_guide`."
 - **Alice mode (decided): interactive Claude Code session.** Alice has `gh` in her env and performs the merge herself.
 - **Blocking tools with bounded timeouts** (default 120 s, under runtime MCP tool timeouts). Tool returns `{"event": null}` on timeout and the skill says "call again." No agent ever spins.
-- **A2A alignment:** reuse `a2a-sdk` types (AgentCard, Task, TaskState, Message, Part, Artifact) and its JSON-RPC methods (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`). Pull semantics are layered on top via `contextId` per worker and message metadata — see §4.
+- **A2A alignment:** A2A-shaped data model and transport; reuse `a2a-sdk` types (AgentCard, Task, TaskState, Message, Part, Artifact) and its JSON-RPC methods (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`). Pull semantics are layered on top via `contextId` per worker and `hub.*` message metadata — see §4. Third-party A2A clients are not expected to interoperate without `worker-mcp`.
 
 ---
 
@@ -66,23 +66,63 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 
 ## 4. Protocol
 
+### 4.0 A2A compatibility profile
+
+The hub and worker speak an A2A-shaped wire protocol layered over JSON-RPC 2.0. The implementation pins `a2a-sdk==0.3.26`. Third-party A2A clients are not expected to interoperate without `worker-mcp` or matching client-side adaptations for the pull model.
+
+**Methods used:**
+- `message/send`: Immediate round-trip intents (`READY` check-in, `progress` reporting, `result` reporting).
+- `message/stream`: Long-polling intents held via Server-Sent Events (SSE) until fulfilled or timed out (`NEXT` assignment polling, `question` asking).
+- `tasks/get`: Task inspection and message history retrieval (debugging / audit).
+- `tasks/cancel`: Explicit task cancellation.
+
+**SDK types used:**
+- `AgentCard` (discovery at `/.well-known/agent-card.json`)
+- `Task`, `TaskStatus`, `TaskState` (`submitted`, `working`, `input-required`, `completed`, `failed`, `canceled`)
+- `Message`, `Role` (`user`, `agent`), `Part`, `TextPart`
+- `Artifact`
+- JSON-RPC requests & responses: `SendMessageRequest`, `SendStreamingMessageRequest`, `GetTaskRequest`, `CancelTaskRequest`, `JSONRPCSuccessResponse`, `JSONRPCErrorResponse`, `JSONRPCError`
+
+**Hub metadata keys (`hub.*`):**
+All hub-specific extensions ride inside A2A `metadata` objects using the `hub.` prefix to guarantee namespace isolation:
+- `hub.kind`: Intent discriminator for messages and events:
+  - Worker requests: `progress`, `question`, `result`.
+  - Hub responses: `check_in_ack`, `assignment`, `progress_ack`, `release`, `timeout`, `state_override`.
+- `hub.agent`: Registered worker agent name (string).
+- `hub.capabilities`: List of capability strings declared by worker during check-in.
+- `hub.runtime`: Worker runtime identifier (e.g. `claude-code`, `codex`, `gemini`).
+- `hub.status`: Terminal task status in a result (`completed` | `failed`), or agent status in `check_in_ack` (`idle`, etc.).
+- `hub.timeout`: Boolean (`true`) indicating that a streaming hold timed out without an assignment or reply.
+- `hub.timeout_s`: Requested hold duration in seconds (float or int).
+- `hub.retry_as_message_id`: In a question timeout response, echoes the original question's `messageId` to be reused on retry.
+- `hub.release`: Boolean (`true`) signaling that the worker has been released and should exit its loop.
+- `hub.result`: Task result payload (summary, artifacts, etc.) attached to Task metadata or state override.
+- `hub.role`: Role name (`implementer`, `reviewer`) in task metadata and assignment messages.
+- `hub.title`: Task title in task metadata and assignment messages.
+- `hub.assignee`: Assigned agent name in task metadata.
+- `hub.lease_expires`: Lease expiration ISO timestamp in task metadata.
+- `hub.artifacts`: List of artifact payloads reported with a result.
+- `hub.state`: Task state string in `state_override` status message metadata.
+- `hub.sender`: Stored message sender name in task history messages.
+- `hub.ts`: Stored message ISO timestamp in task history messages.
+
 ### 4.1 Worker → Alice (A2A over HTTP, `Authorization: Bearer <token>`)
 
 | Worker intent | A2A call | Metadata / mapping |
 |---|---|---|
-| Check in | `message/send` text `READY` | `metadata.agent`, `metadata.capabilities` → registers agent, gets `contextId` |
+| Check in | `message/send` text `READY` | `hub.agent`, `hub.capabilities` → registers agent, gets `contextId` |
 | Get assignment | `message/stream` text `NEXT` in own `contextId` | Server holds SSE open (≤ timeout) until Alice assigns → returns a Task (`working`) whose first message = instructions |
-| Progress | `message/send` in `taskId` | `metadata.kind=progress` → event to Alice |
-| Ask Alice | `message/stream` in `taskId`, `metadata.kind=question` | task → `input-required`; stream held until Alice replies |
-| Report result | `message/send` in `taskId`, `metadata.kind=result`, `metadata.status=completed\|failed` | task → terminal state; artifacts = PR URL, commit SHAs, review URL |
-| Released | Alice's assignment reply contains `metadata.release=true` | worker exits loop |
+| Progress | `message/send` in `taskId` | `hub.kind=progress` → event to Alice |
+| Ask Alice | `message/stream` in `taskId`, `hub.kind=question` | task → `input-required`; stream held until Alice replies |
+| Report result | `message/send` in `taskId`, `hub.kind=result`, `hub.status=completed\|failed` | task → terminal state; artifacts = PR URL, commit SHAs, review URL |
+| Released | Alice's assignment reply contains `hub.release=true` | worker exits loop |
 
 `tasks/get` and `tasks/cancel` implemented for completeness/debugging.
 
 **Retrying a held call.** A hold that reaches its deadline returns a
-`metadata.timeout` marker and the caller calls again (§4.3). For a question that
+`hub.timeout` marker and the caller calls again (§4.3). For a question that
 retry must reuse the `messageId` of the original question — the marker echoes it
-as `metadata.retry_as_message_id` — and the hub then resumes that question
+as `hub.retry_as_message_id` — and the hub then resumes that question
 rather than opening a second one. Alice may have answered in the gap between the
 attempts, and her answer is older than a new question would be, so a retry that
 asked afresh could never see it. `NEXT` needs no such correlation: it has no
@@ -91,8 +131,8 @@ per-call state to resume.
 **Manual termination during a question.** If Alice cancels or fails a task while
 its question stream is held, the stream returns an A2A Task with terminal
 `status.state`; its status message carries the override note with
-`metadata.kind=state_override`, and the note is also in
-`metadata.result.summary`. Step 4's `ask_alice` must treat that as end-of-task,
+`hub.kind=state_override`, and the note is also in
+`hub.result.summary`. Step 4's `ask_alice` must treat that as end-of-task,
 not an answer to resume work.
 
 **Public vs. protected.** The A2A route is protected: every worker call carries `Authorization: Bearer <token>` and the hub returns `401` when the header is missing, malformed, or carries a token that does not match the pre-shared one (compared with `token_matches`, constant-time). `GET /.well-known/agent-card.json` and `GET /healthz` are public — the agent card must be fetchable for discovery, and health checks run before any credential is available. Those two are the entire public surface; every other route, including `/guides/{role}.md` (§4.2), requires the token.
@@ -117,7 +157,7 @@ No `merge` tool: Alice uses `gh pr checks` + `gh pr merge` directly (her session
 
 | Tool | Behavior |
 |---|---|
-| `check_in(capabilities)` | one-time registration; reports `runtime` (claude-code / codex / gemini) in metadata |
+| `check_in(capabilities)` | one-time registration; reports `runtime` (claude-code / codex / gemini) in `hub.runtime` metadata |
 | `get_role_guide(role)` | fetches `GET /guides/{role}.md` from hub with the bearer token, like every other hub call — the runtime-agnostic replacement for skills |
 | `await_assignment(timeout_s=120)` | returns `{task_id, role, instructions}` \| `{release: true}` \| `{timeout: true}` |
 | `report_progress(task_id, note)` | fire-and-forget |
