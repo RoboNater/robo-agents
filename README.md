@@ -2,11 +2,11 @@
 
 This repository implements the proof of concept described in
 [`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
-Steps 1–3: the uv workspace, shared configuration and bearer-token provisioning,
-the SQLite schema, A2A agent-card discovery, and the hub core — the A2A request
-handlers workers speak, the role-guide route, Alice's event queue, the lease and
-heartbeat sweeper, bearer enforcement on the protected routes, and Alice's
-eight MCP tools over stdio in the same process.
+Steps 1–4: the uv workspace, shared configuration and bearer-token provisioning,
+the SQLite schema, A2A agent-card discovery, the hub core (A2A request handlers,
+role-guide route, event queue, lease/heartbeat sweeper, bearer enforcement),
+Alice's eight MCP tools over stdio, and worker MCP tools connecting Claude Code
+and Codex CLI workers to the hub. The Step 4A durability retrofit is currently in progress.
 
 ## Run the hub
 
@@ -165,4 +165,4 @@ uv run --locked mypy
 uv run --locked pytest
 ```
 
-Worker MCP tools remain Step 4 work.
+Step 4A durability retrofit and Step 4B worker endurance testing are next.
