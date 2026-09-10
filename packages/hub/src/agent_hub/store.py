@@ -22,6 +22,7 @@ from uuid import uuid4
 from agent_hub_common import (
     AgentStatus,
     EventKind,
+    MetaKeys,
     TaskState,
     WorkflowStatus,
     to_iso,
@@ -525,7 +526,12 @@ class HubStore:
                 context_id=record.context_id,
                 sender=agent,
                 direction="to_alice",
-                parts=[text_part(question, kind="question", message_id=sent_as)],
+                parts=[
+                    text_part(
+                        question,
+                        **{MetaKeys.KIND: "question", MetaKeys.RETRY_AS_MESSAGE_ID: sent_as},
+                    )
+                ],
             )
             self._set_state(connection, task.id, TaskState.INPUT_REQUIRED)
             self._add_event(
@@ -557,7 +563,10 @@ class HubStore:
                 if not isinstance(part, dict):
                     continue
                 metadata = part.get("metadata") or {}
-                if metadata.get("kind") == "question" and metadata.get("message_id") == sent_as:
+                if (
+                    metadata.get(MetaKeys.KIND) == "question"
+                    and metadata.get(MetaKeys.RETRY_AS_MESSAGE_ID) == sent_as
+                ):
                     return int(row["id"])
         return None
 
