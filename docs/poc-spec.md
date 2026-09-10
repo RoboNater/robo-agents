@@ -184,18 +184,21 @@ Task results are structured, versioned payloads validated against Pydantic model
 - `pr_url`: PR URL string (required when `outcome == "completed"`).
 - `head_sha`: 40-character hex commit SHA string (required when `outcome == "completed"`).
 - `commits`: List of commit SHA strings.
-- `tests`: List of `TestResult` objects (`name`, `passed`, `output?`).
+- `tests`: List of `TestResult` objects (`command`, `status`).
 - `blocker`: Blocker description string (when `outcome == "blocked"`).
 - `resolved_finding_ids`: List of finding ID strings addressed from previous review.
 - `disputed_finding_ids`: List of finding ID strings disputed with rationale.
 
 **ReviewerResult:**
-- `verdict`: `approved`, `changes_requested`, or `failed`.
+- `verdict`: `approved`, `changes_requested`, `blocked`, or `failed`.
 - `summary`: Human-readable summary string.
+- `pr_url`: PR URL string (optional).
+- `review_url`: Review URL string (optional).
 - `reviewed_head_sha`: 40-character hex commit SHA string (required when `verdict == "approved"`).
-- `findings`: List of `Finding` objects (`id` matching `^r\d+-\d+$`, `path`, `line?`, `severity` (`blocking` | `non_blocking`), `comment`).
-- `tests`: List of `TestResult` objects (`name`, `passed`, `output?`).
-- Validation rule: When `verdict == "approved"`, blocking findings must be empty and `reviewed_head_sha` must be present.
+- `blocking_findings`: List of `Finding` objects (`id` matching `^r\d+-\d+$`, `text`).
+- `nonblocking_findings`: List of `Finding` objects (`id` matching `^r\d+-\d+$`, `text`).
+- `tests`: List of `TestResult` objects (`command`, `status`).
+- Validation rule: When `verdict == "approved"`, `blocking_findings` must be empty and `reviewed_head_sha` must be present.
 
 ---
 
