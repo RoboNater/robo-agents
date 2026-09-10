@@ -24,3 +24,5 @@ class MetaKeys(StrEnum):
     STATE = "hub.state"
     SENDER = "hub.sender"
     TS = "hub.ts"
+    SCHEMA_VERSION = "hub.schema_version"
+    OPERATION_ID = "hub.operation_id"
