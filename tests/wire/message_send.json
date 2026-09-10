@@ -1,0 +1,49 @@
+{
+  "method": "message/send",
+  "request": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "msg-101",
+        "metadata": {
+          "hub.agent": "bob",
+          "hub.capabilities": [
+            "python"
+          ],
+          "hub.runtime": "claude-code"
+        },
+        "parts": [
+          {
+            "kind": "text",
+            "text": "READY"
+          }
+        ],
+        "role": "user"
+      }
+    }
+  },
+  "response": {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+      "contextId": "ctx-101",
+      "kind": "message",
+      "messageId": "msg-ack-101",
+      "metadata": {
+        "hub.agent": "bob",
+        "hub.kind": "check_in_ack",
+        "hub.status": "idle"
+      },
+      "parts": [
+        {
+          "kind": "text",
+          "text": "REGISTERED"
+        }
+      ],
+      "role": "agent"
+    }
+  }
+}
