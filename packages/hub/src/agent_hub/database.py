@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_hub_common import AgentStatus, EventKind, TaskState, WorkflowStatus
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class DatabaseVersionError(RuntimeError):
@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS decision (
     rationale TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS operation (
+    actor TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    PRIMARY KEY (actor, operation_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_task_workflow_state ON task(workflow_id, state);
 CREATE INDEX IF NOT EXISTS idx_task_assignee ON task(assignee);
 CREATE INDEX IF NOT EXISTS idx_message_context_ts ON message(context_id, ts);
@@ -121,6 +129,27 @@ def initialize_database(path: Path) -> None:
             }
             if "runtime" not in columns:
                 connection.execute("ALTER TABLE agent ADD COLUMN runtime TEXT")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS operation (
+                    actor TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    PRIMARY KEY (actor, operation_id)
+                )
+            """)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
+        if current_version == 2:
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS operation (
+                    actor TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    PRIMARY KEY (actor, operation_id)
+                )
+            """)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
         raise DatabaseVersionError(

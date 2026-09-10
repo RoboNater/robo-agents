@@ -22,7 +22,12 @@ from uuid import uuid4
 from agent_hub_common import (
     AgentStatus,
     EventKind,
+    ImplementerOutcome,
+    ImplementerResult,
     MetaKeys,
+    ReviewerResult,
+    ReviewerVerdict,
+    TaskResult,
     TaskState,
     WorkflowStatus,
     to_iso,
@@ -53,6 +58,10 @@ class NotFoundError(StoreError):
 
 class ConflictError(StoreError):
     """Raised when an operation contradicts the current state."""
+
+
+class IdempotencyConflictError(ConflictError):
+    """Raised when an operation is retried with a conflicting payload."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -663,23 +672,109 @@ class HubStore:
             ).fetchone()
         return None if row is None else _message(row)
 
+    def get_operation(self, actor: str, operation_id: str) -> Row | None:
+        """Look up an existing operation by actor and operation_id."""
+        with database(self.path) as connection:
+            row: Row | None = connection.execute(
+                "SELECT * FROM operation WHERE actor = ? AND operation_id = ?",
+                (actor, operation_id),
+            ).fetchone()
+            return row
+
+    def record_operation(
+        self,
+        actor: str,
+        operation_id: str,
+        payload_hash: str,
+        response_json: str,
+    ) -> None:
+        """Record an operation result for idempotency deduplication."""
+        with database(self.path) as connection:
+            connection.execute(
+                "INSERT INTO operation (actor, operation_id, payload_hash, response_json)"
+                " VALUES (?, ?, ?, ?)",
+                (actor, operation_id, payload_hash, response_json),
+            )
+
     def submit_result(
         self,
         task_id: str,
         agent: str,
-        status: TaskState,
-        summary: str,
+        result: TaskResult | Mapping[str, Any] | TaskState | None = None,
+        summary: str = "",
         artifacts: Sequence[Mapping[str, Any]] = (),
+        *,
+        status: TaskState | None = None,
     ) -> TaskRecord:
         """Drive a task to a terminal state and free its worker."""
 
-        if status not in (TaskState.COMPLETED, TaskState.FAILED):
-            raise ConflictError(f"a result must be completed or failed, got {status.value}")
-        payload: dict[str, Any] = {
-            "status": status.value,
-            "summary": summary,
-            "artifacts": [dict(artifact) for artifact in artifacts],
-        }
+        payload: dict[str, Any]
+        result_summary: str
+        terminal_status: TaskState
+
+        actual_result = result if result is not None else status
+        if actual_result is None:
+            raise ConflictError("submit_result requires result or status")
+
+        if isinstance(actual_result, ImplementerResult):
+            terminal_status = (
+                TaskState.COMPLETED
+                if actual_result.outcome == ImplementerOutcome.COMPLETED
+                else TaskState.FAILED
+            )
+            payload = actual_result.model_dump(mode="json")
+            result_summary = actual_result.summary
+        elif isinstance(actual_result, ReviewerResult):
+            approved_or_changes = (
+                ReviewerVerdict.APPROVED,
+                ReviewerVerdict.CHANGES_REQUESTED,
+            )
+            terminal_status = (
+                TaskState.COMPLETED
+                if actual_result.verdict in approved_or_changes
+                else TaskState.FAILED
+            )
+            payload = actual_result.model_dump(mode="json")
+            result_summary = actual_result.summary
+        elif isinstance(actual_result, Mapping):
+            if "outcome" in actual_result:
+                parsed_impl = ImplementerResult.model_validate(actual_result)
+                terminal_status = (
+                    TaskState.COMPLETED
+                    if parsed_impl.outcome == ImplementerOutcome.COMPLETED
+                    else TaskState.FAILED
+                )
+                payload = parsed_impl.model_dump(mode="json")
+                result_summary = parsed_impl.summary
+            elif "verdict" in actual_result:
+                parsed_rev = ReviewerResult.model_validate(actual_result)
+                approved_or_changes = (
+                    ReviewerVerdict.APPROVED,
+                    ReviewerVerdict.CHANGES_REQUESTED,
+                )
+                terminal_status = (
+                    TaskState.COMPLETED
+                    if parsed_rev.verdict in approved_or_changes
+                    else TaskState.FAILED
+                )
+                payload = parsed_rev.model_dump(mode="json")
+                result_summary = parsed_rev.summary
+            else:
+                raise ConflictError("result mapping must contain 'outcome' or 'verdict'")
+        elif isinstance(actual_result, TaskState):
+            if actual_result not in (TaskState.COMPLETED, TaskState.FAILED):
+                msg = f"a result must be completed or failed, got {actual_result.value}"
+                raise ConflictError(msg)
+            terminal_status = actual_result
+            result_summary = summary
+            payload = {
+                "status": terminal_status.value,
+                "summary": summary,
+                "artifacts": [dict(artifact) for artifact in artifacts],
+            }
+        else:
+            raise ConflictError(f"unsupported result type: {type(actual_result)}")
+
         with database(self.path) as connection:
             task = self._require_open_task(connection, task_id)
             record = self._require_agent(connection, agent)
@@ -691,21 +786,28 @@ class HubStore:
                 direction="to_alice",
                 parts=[
                     text_part(
-                        summary,
+                        result_summary,
                         metadata={
                             MetaKeys.KIND: "result",
-                            MetaKeys.STATUS: status.value,
+                            MetaKeys.STATUS: terminal_status.value,
                         },
                     )
                 ],
             )
-            self._finish(connection, task.id, status, payload)
+            self._finish(connection, task.id, terminal_status, payload)
+            event_payload: dict[str, Any] = {
+                "task_id": task.id,
+                "agent": agent,
+                "summary": result_summary,
+            }
+            event_payload.update(payload)
+            event_payload["result"] = payload
             self._add_event(
                 connection,
                 EventKind.TASK_COMPLETED
-                if status is TaskState.COMPLETED
+                if terminal_status is TaskState.COMPLETED
                 else EventKind.TASK_FAILED,
-                {"task_id": task.id, "agent": agent} | payload,
+                event_payload,
             )
             self._touch(connection, agent)
             finished = self._require_task(connection, task.id)

@@ -9,6 +9,7 @@ deadline passes. `tasks/get` and `tasks/cancel` are there for debugging.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator, Mapping
@@ -44,7 +45,16 @@ from a2a.types import (
 )
 from a2a.types import Message as A2AMessage
 from a2a.types import TaskState as A2ATaskState
-from agent_hub_common import HubSettings, MetaKeys, TaskState
+from agent_hub_common import (
+    HubSettings,
+    ImplementerOutcome,
+    ImplementerResult,
+    MetaKeys,
+    ReviewerResult,
+    ReviewerVerdict,
+    TaskResult,
+    TaskState,
+)
 from fastapi import Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -53,6 +63,7 @@ from .store import (
     AgentRecord,
     ConflictError,
     HubStore,
+    IdempotencyConflictError,
     MessageRecord,
     NotFoundError,
     Released,
@@ -92,16 +103,43 @@ class ProtocolError(Exception):
         self.error = error
 
 
+class ResultValidationError(ProtocolError):
+    """Raised when a typed task result fails validation."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(InvalidParamsError(message=message))
+
+
+class UnsupportedSchemaVersionError(ProtocolError):
+    """Raised when an unsupported hub.schema_version is encountered."""
+
+    def __init__(self, version: Any) -> None:
+        super().__init__(InvalidParamsError(message=f"unsupported schema_version: {version!r}"))
+
+
 def _invalid(message: str) -> ProtocolError:
     return ProtocolError(InvalidParamsError(message=message))
 
 
-def _error_response(request_id: RequestId, error: A2AErrorModel) -> JSONResponse:
+def _check_schema_version(metadata: Mapping[str, Any]) -> None:
+    if MetaKeys.SCHEMA_VERSION in metadata:
+        version = metadata[MetaKeys.SCHEMA_VERSION]
+        if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+            raise UnsupportedSchemaVersionError(version)
+
+
+def _hash_payload(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _error_response(
+    request_id: RequestId,
+    error: A2AErrorModel,
+    status_code: int = 200,
+) -> JSONResponse:
     body = JSONRPCErrorResponse(id=request_id, error=error)
-    # JSON-RPC transports protocol failures in the body; the HTTP status stays
-    # 200 so a client reads one error shape. Authentication is the exception
-    # and is refused with 401 before dispatch ever runs.
-    return JSONResponse(body.model_dump(mode="json", exclude_none=True))
+    return JSONResponse(body.model_dump(mode="json", exclude_none=True), status_code=status_code)
 
 
 def parse_error_response() -> JSONResponse:
@@ -173,21 +211,30 @@ def _artifacts(record: TaskRecord) -> list[Artifact] | None:
     """Expose a worker's reported artifacts — PR URL, SHAs — on the task."""
 
     result = record.result or {}
-    reported = result.get("artifacts")
-    if not isinstance(reported, list) or not reported:
-        return None
     artifacts = []
-    for item in reported:
-        payload = item if isinstance(item, dict) else {"value": item}
-        name = payload.get("name")
-        artifacts.append(
-            Artifact(
-                artifact_id=uuid4().hex,
-                name=str(name) if isinstance(name, str) else None,
-                parts=[Part(root=TextPart(text=json.dumps(payload, sort_keys=True)))],
+    reported = result.get("artifacts")
+    if isinstance(reported, list):
+        for item in reported:
+            payload = item if isinstance(item, dict) else {"value": item}
+            name = payload.get("name")
+            artifacts.append(
+                Artifact(
+                    artifact_id=uuid4().hex,
+                    name=str(name) if isinstance(name, str) else None,
+                    parts=[Part(root=TextPart(text=json.dumps(payload, sort_keys=True)))],
+                )
             )
-        )
-    return artifacts
+    for field in ("pr_url", "head_sha", "reviewed_head_sha", "review_url"):
+        val = result.get(field)
+        if isinstance(val, str) and val:
+            artifacts.append(
+                Artifact(
+                    artifact_id=uuid4().hex,
+                    name=field,
+                    parts=[Part(root=TextPart(text=val))],
+                )
+            )
+    return artifacts or None
 
 
 def _task_object(
@@ -251,6 +298,14 @@ class A2AProtocol:
 
         try:
             return await self._dispatch(method, payload, request_id)
+        except ResultValidationError as exc:
+            return _error_response(request_id, exc.error, status_code=400)
+        except UnsupportedSchemaVersionError as exc:
+            return _error_response(request_id, exc.error, status_code=400)
+        except IdempotencyConflictError as exc:
+            return _error_response(
+                request_id, InvalidRequestError(message=str(exc)), status_code=409
+            )
         except ProtocolError as exc:
             return _error_response(request_id, exc.error)
         except NotFoundError as exc:
@@ -288,28 +343,81 @@ class A2AProtocol:
         if kind == "result":
             return self._result(task, agent, _text(message), metadata)
         if kind == "progress":
-            self.store.record_progress(task.id, agent.name, _text(message))
-            return _agent_message(
+            _check_schema_version(metadata)
+            operation_id = metadata.get(MetaKeys.OPERATION_ID)
+            payload_hash: str | None = None
+            note = _text(message)
+            if operation_id is not None:
+                if not isinstance(operation_id, str) or not operation_id.strip():
+                    raise _invalid(f"metadata.{MetaKeys.OPERATION_ID} must be a non-empty string")
+                operation_id = operation_id.strip()
+                payload_hash = _hash_payload({
+                    "intent": "progress",
+                    "task_id": task.id,
+                    "note": note,
+                })
+                existing = self.store.get_operation(agent.name, operation_id)
+                if existing is not None:
+                    if existing["payload_hash"] != payload_hash:
+                        raise IdempotencyConflictError(
+                            f"operation {operation_id!r} already executed with different payload"
+                        )
+                    return A2AMessage.model_validate(json.loads(existing["response_json"]))
+
+            self.store.record_progress(task.id, agent.name, note)
+            resp = _agent_message(
                 "noted",
                 context_id=agent.context_id,
                 task_id=task.id,
                 metadata={MetaKeys.KIND: "progress_ack"},
             )
+            if operation_id is not None and payload_hash is not None:
+                self.store.record_operation(
+                    agent.name,
+                    operation_id,
+                    payload_hash,
+                    json.dumps(resp.model_dump(mode="json", exclude_none=True)),
+                )
+            return resp
         raise _invalid(f"metadata.{MetaKeys.KIND} {kind!r} is not a message/send intent on a task")
 
     def _check_in(self, message: A2AMessage, metadata: dict[str, Any]) -> A2AMessage:
         if _text(message).upper() != CHECK_IN_TEXT:
             raise _invalid(f"a message with no taskId must be the {CHECK_IN_TEXT} check-in")
+        _check_schema_version(metadata)
         name = metadata.get(MetaKeys.AGENT)
         if not isinstance(name, str) or not name.strip():
             raise _invalid(f"check-in requires metadata.{MetaKeys.AGENT}")
+        agent_name = name.strip()
         runtime = metadata.get(MetaKeys.RUNTIME)
+        capabilities = _string_list(metadata.get(MetaKeys.CAPABILITIES), MetaKeys.CAPABILITIES)
+
+        operation_id = metadata.get(MetaKeys.OPERATION_ID)
+        payload_hash: str | None = None
+        if operation_id is not None:
+            if not isinstance(operation_id, str) or not operation_id.strip():
+                raise _invalid(f"metadata.{MetaKeys.OPERATION_ID} must be a non-empty string")
+            operation_id = operation_id.strip()
+            payload_hash = _hash_payload({
+                "intent": "check_in",
+                "agent": agent_name,
+                "capabilities": sorted(capabilities),
+                "runtime": str(runtime) if runtime is not None else None,
+            })
+            existing = self.store.get_operation(agent_name, operation_id)
+            if existing is not None:
+                if existing["payload_hash"] != payload_hash:
+                    raise IdempotencyConflictError(
+                        f"operation {operation_id!r} already executed with different payload"
+                    )
+                return A2AMessage.model_validate(json.loads(existing["response_json"]))
+
         agent = self.store.check_in(
-            name.strip(),
-            _string_list(metadata.get(MetaKeys.CAPABILITIES), MetaKeys.CAPABILITIES),
+            agent_name,
+            capabilities,
             runtime=str(runtime) if isinstance(runtime, str) else None,
         )
-        return _agent_message(
+        resp = _agent_message(
             "REGISTERED",
             context_id=agent.context_id,
             metadata={
@@ -318,6 +426,14 @@ class A2AProtocol:
                 MetaKeys.STATUS: agent.status.value,
             },
         )
+        if operation_id is not None and payload_hash is not None:
+            self.store.record_operation(
+                agent_name,
+                operation_id,
+                payload_hash,
+                json.dumps(resp.model_dump(mode="json", exclude_none=True)),
+            )
+        return resp
 
     def _result(
         self,
@@ -326,22 +442,124 @@ class A2AProtocol:
         summary: str,
         metadata: dict[str, Any],
     ) -> Task:
-        raw_status = metadata.get(MetaKeys.STATUS)
-        try:
-            status = TaskState(str(raw_status))
-        except ValueError as exc:
-            raise _invalid(f"metadata.{MetaKeys.STATUS} must be 'completed' or 'failed'") from exc
-        artifacts = metadata.get(MetaKeys.ARTIFACTS) or []
-        if not isinstance(artifacts, list):
-            raise _invalid(f"metadata.{MetaKeys.ARTIFACTS} must be a list")
-        finished = self.store.submit_result(
-            task.id,
-            agent.name,
-            status,
-            summary,
-            [item if isinstance(item, dict) else {"value": item} for item in artifacts],
-        )
-        return _task_object(finished, agent.context_id)
+        _check_schema_version(metadata)
+        operation_id = metadata.get(MetaKeys.OPERATION_ID)
+        if operation_id is not None:
+            if not isinstance(operation_id, str) or not operation_id.strip():
+                raise _invalid(f"metadata.{MetaKeys.OPERATION_ID} must be a non-empty string")
+            operation_id = operation_id.strip()
+
+        raw_result = metadata.get(MetaKeys.RESULT)
+        typed_result: TaskResult
+        if raw_result is not None:
+            if not isinstance(raw_result, dict):
+                raise ResultValidationError(f"metadata.{MetaKeys.RESULT} must be an object")
+            result_dict = dict(raw_result)
+            if not result_dict.get("summary") and summary:
+                result_dict["summary"] = summary
+            try:
+                if task.role == "implementer":
+                    typed_result = ImplementerResult.model_validate(result_dict)
+                elif task.role == "reviewer":
+                    typed_result = ReviewerResult.model_validate(result_dict)
+                elif "outcome" in result_dict:
+                    typed_result = ImplementerResult.model_validate(result_dict)
+                elif "verdict" in result_dict:
+                    typed_result = ReviewerResult.model_validate(result_dict)
+                else:
+                    raise ValueError("result must specify 'outcome' or 'verdict'")
+            except ValidationError as exc:
+                first_err = exc.errors()[0]
+                msg = first_err.get("msg", str(exc))
+                loc = ".".join(str(part) for part in first_err.get("loc", []))
+                raise ResultValidationError(f"{loc}: {msg}" if loc else msg) from exc
+            except ValueError as exc:
+                raise ResultValidationError(str(exc)) from exc
+        else:
+            raw_status = metadata.get(MetaKeys.STATUS)
+            if raw_status is None:
+                msg = f"metadata.{MetaKeys.STATUS} must be 'completed' or 'failed'"
+                raise _invalid(msg)
+            try:
+                status = TaskState(str(raw_status))
+                if status not in (TaskState.COMPLETED, TaskState.FAILED):
+                    raise ValueError("not terminal")
+            except ValueError as exc:
+                msg = f"metadata.{MetaKeys.STATUS} must be 'completed' or 'failed'"
+                raise _invalid(msg) from exc
+            artifacts = metadata.get(MetaKeys.ARTIFACTS) or []
+            if not isinstance(artifacts, list):
+                raise _invalid(f"metadata.{MetaKeys.ARTIFACTS} must be a list")
+            if task.role == "implementer":
+                pr_url = None
+                head_sha = None
+                for a in artifacts:
+                    if isinstance(a, dict):
+                        if "url" in a:
+                            pr_url = a["url"]
+                        if "sha" in a:
+                            head_sha = a["sha"]
+                outcome = (
+                    ImplementerOutcome.COMPLETED
+                    if status is TaskState.COMPLETED
+                    else ImplementerOutcome.FAILED
+                )
+                if outcome == ImplementerOutcome.COMPLETED and (not pr_url or not head_sha):
+                    pr_url = pr_url or "https://github.com/unknown/pr"
+                    head_sha = head_sha or "0000000"
+                typed_result = ImplementerResult(
+                    outcome=outcome,
+                    pr_url=pr_url,
+                    head_sha=head_sha,
+                    summary=summary or "Legacy result",
+                )
+            elif task.role == "reviewer":
+                verdict = (
+                    ReviewerVerdict.APPROVED
+                    if status is TaskState.COMPLETED
+                    else ReviewerVerdict.FAILED
+                )
+                reviewed_head_sha = "0000000" if verdict == ReviewerVerdict.APPROVED else None
+                typed_result = ReviewerResult(
+                    verdict=verdict,
+                    reviewed_head_sha=reviewed_head_sha,
+                    summary=summary or "Legacy review result",
+                )
+            else:
+                typed_result = ImplementerResult(
+                    outcome=ImplementerOutcome.COMPLETED
+                    if status is TaskState.COMPLETED
+                    else ImplementerOutcome.FAILED,
+                    pr_url="https://github.com/unknown/pr",
+                    head_sha="0000000",
+                    summary=summary,
+                )
+
+        payload_hash: str | None = None
+        if operation_id is not None:
+            payload_hash = _hash_payload({
+                "intent": "result",
+                "task_id": task.id,
+                "result": typed_result.model_dump(mode="json"),
+            })
+            existing = self.store.get_operation(agent.name, operation_id)
+            if existing is not None:
+                if existing["payload_hash"] != payload_hash:
+                    raise IdempotencyConflictError(
+                        f"operation {operation_id!r} already executed with different payload"
+                    )
+                return Task.model_validate(json.loads(existing["response_json"]))
+
+        finished = self.store.submit_result(task.id, agent.name, typed_result)
+        task_obj = _task_object(finished, agent.context_id)
+        if operation_id is not None and payload_hash is not None:
+            self.store.record_operation(
+                agent.name,
+                operation_id,
+                payload_hash,
+                json.dumps(task_obj.model_dump(mode="json", exclude_none=True)),
+            )
+        return task_obj
 
     # -- message/stream -----------------------------------------------------
 
