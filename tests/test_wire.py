@@ -236,7 +236,7 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
     assert q_id > 0
     store.reply(task.id, "Use MetaKeys constants")
 
-    # Directly insert a legacy transcript row with raw, unprefixed keys to test
+    # Directly insert legacy transcript rows with raw, unprefixed keys to test
     # backward compatibility for existing persisted databases.
     with database(db_path) as conn:
         legacy_parts = json.dumps(
@@ -253,6 +253,32 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
             " VALUES (?, ?, ?, ?, ?, ?)",
             (task.id, "ctx-bob", "bob", "to_alice", legacy_parts, "2026-09-01T12:00:00Z"),
         )
+        # Old question format persisted prior to issue #22 using message_id for correlation
+        legacy_q_parts = json.dumps(
+            [
+                {
+                    "kind": "text",
+                    "text": "old question text",
+                    "metadata": {"kind": "question", "message_id": "legacy-q-999"},
+                }
+            ]
+        )
+        cursor = conn.execute(
+            "INSERT INTO message (task_id, context_id, sender, direction, parts_json, ts)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (task.id, "ctx-bob", "bob", "to_alice", legacy_q_parts, "2026-09-01T12:01:00Z"),
+        )
+        legacy_q_row_id = cursor.lastrowid
+
+    # Verify that a retry of the legacy question recognizes and reuses the existing row
+    events_before = store.pending_events()
+    history_len_before = len(store.task_history(task.id))
+    reused_id = store.open_question(task.id, "bob", "old question text", sent_as="legacy-q-999")
+    assert reused_id == legacy_q_row_id
+    assert (
+        store.pending_events() == events_before
+    ), "Retried question must not queue duplicate event"
+    assert len(store.task_history(task.id)) == history_len_before, "No new row should be added"
 
     # Dispatch tasks/get with full history
     get_req = {
@@ -268,7 +294,7 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
     JSONRPCSuccessResponse.model_validate(resp_data)
     task_result = Task.model_validate(resp_data["result"])
     assert task_result.history is not None
-    assert len(task_result.history) >= 5
+    assert len(task_result.history) >= 6
 
     # Check all metadata keys recursively across entire response
     all_keys = _collect_metadata_keys(resp_data)
@@ -284,13 +310,13 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
         for part in msg.get("parts", [])
         if "metadata" in part
     ]
-    assert len(part_metas) >= 5, "Expected part metadata on history messages"
+    assert len(part_metas) >= 6, "Expected part metadata on history messages"
     for pmeta in part_metas:
         assert isinstance(pmeta, dict)
         for key in pmeta:
             assert key.startswith("hub."), f"Found unprefixed part metadata key {key!r}"
 
-    # Verify that the legacy row's metadata was normalized to hub.*
+    # Verify that the legacy progress row's metadata was normalized to hub.*
     legacy_msg = next(
         msg
         for msg in history
@@ -300,4 +326,16 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
     assert legacy_part["metadata"] == {
         "hub.kind": "progress",
         "hub.role": "implementer",
+    }
+
+    # Verify that the legacy question row's message_id was normalized to hub.retry_as_message_id
+    legacy_q_msg = next(
+        msg
+        for msg in history
+        if any(p.get("text") == "old question text" for p in msg.get("parts", []))
+    )
+    legacy_q_part = legacy_q_msg["parts"][0]
+    assert legacy_q_part["metadata"] == {
+        "hub.kind": "question",
+        "hub.retry_as_message_id": "legacy-q-999",
     }

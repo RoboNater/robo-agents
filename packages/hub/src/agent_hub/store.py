@@ -152,6 +152,7 @@ _LEGACY_KEY_MAP: dict[str, str] = {
     "timeout": MetaKeys.TIMEOUT.value,
     "timeout_s": MetaKeys.TIMEOUT_S.value,
     "retry_as_message_id": MetaKeys.RETRY_AS_MESSAGE_ID.value,
+    "message_id": MetaKeys.RETRY_AS_MESSAGE_ID.value,
     "release": MetaKeys.RELEASE.value,
     "result": MetaKeys.RESULT.value,
     "role": MetaKeys.ROLE.value,
@@ -538,7 +539,7 @@ class HubStore:
             ).fetchall()
         history = [_message(row) for row in rows]
         if limit is not None and limit >= 0:
-            history = history[len(history) - limit :] if limit else []
+            history = history[-limit:] if limit else []
         return history
 
     def record_progress(self, task_id: str, agent: str, note: str) -> None:
