@@ -351,7 +351,9 @@ class A2AProtocol:
 
         if message.task_id is not None:
             if metadata.get(MetaKeys.KIND) != "question":
-                raise _invalid(f"a streaming call on a task must be metadata.{MetaKeys.KIND}=question")
+                raise _invalid(
+                    f"a streaming call on a task must be metadata.{MetaKeys.KIND}=question"
+                )
             agent = self._resolve_agent(message, metadata)
             task = self._owned_task(message.task_id, agent)
             question = _text(message)

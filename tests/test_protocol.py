@@ -341,7 +341,12 @@ async def test_a_worker_cannot_act_on_another_workers_task(
     body = await post(
         client,
         "message/send",
-        message("mine now", context_id=charlie, task_id=task_id, metadata={MetaKeys.KIND: "progress"}),
+        message(
+            "mine now",
+            context_id=charlie,
+            task_id=task_id,
+            metadata={MetaKeys.KIND: "progress"},
+        ),
     )
 
     assert body["error"]["code"] == -32602

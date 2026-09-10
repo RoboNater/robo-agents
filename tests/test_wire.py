@@ -19,12 +19,6 @@ from agent_hub.store import HubStore
 from agent_hub_common import HubSettings, MetaKeys
 
 WIRE_DIR = Path(__file__).parent / "wire"
-REQUEST_MODELS = {
-    "message/send": SendMessageRequest,
-    "message/stream": SendStreamingMessageRequest,
-    "tasks/get": GetTaskRequest,
-    "tasks/cancel": CancelTaskRequest,
-}
 
 
 def _collect_metadata_keys(obj: Any) -> list[str]:
@@ -55,21 +49,42 @@ def test_wire_fixtures_round_trip_a2a_sdk_models(fixture_name: str) -> None:
     data = json.loads(fixture_path.read_text(encoding="utf-8"))
 
     method = data["method"]
-    req_model = REQUEST_MODELS[method]
 
     # Validate request against a2a-sdk model and assert wire shape round-trips
-    validated_req = req_model.model_validate(data["request"])
+    validated_req: (
+        SendMessageRequest
+        | SendStreamingMessageRequest
+        | GetTaskRequest
+        | CancelTaskRequest
+    )
+    if method == "message/send":
+        validated_req = SendMessageRequest.model_validate(data["request"])
+    elif method == "message/stream":
+        validated_req = SendStreamingMessageRequest.model_validate(data["request"])
+    elif method == "tasks/get":
+        validated_req = GetTaskRequest.model_validate(data["request"])
+    elif method == "tasks/cancel":
+        validated_req = CancelTaskRequest.model_validate(data["request"])
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
     dumped_req = validated_req.model_dump(mode="json", exclude_none=True, by_alias=True)
     assert dumped_req == data["request"]
 
     # Validate response against a2a-sdk model and assert wire shape round-trips
     validated_resp = JSONRPCSuccessResponse.model_validate(data["response"])
     if method == "message/send":
-        validated_result = Message.model_validate(data["response"]["result"])
-        assert validated_result.model_dump(mode="json", exclude_none=True, by_alias=True) == data["response"]["result"]
+        msg_result = Message.model_validate(data["response"]["result"])
+        dumped_result = msg_result.model_dump(
+            mode="json", exclude_none=True, by_alias=True
+        )
+        assert dumped_result == data["response"]["result"]
     else:
-        validated_result = Task.model_validate(data["response"]["result"])
-        assert validated_result.model_dump(mode="json", exclude_none=True, by_alias=True) == data["response"]["result"]
+        task_result = Task.model_validate(data["response"]["result"])
+        dumped_result = task_result.model_dump(
+            mode="json", exclude_none=True, by_alias=True
+        )
+        assert dumped_result == data["response"]["result"]
     dumped_resp = validated_resp.model_dump(mode="json", exclude_none=True, by_alias=True)
     assert dumped_resp == data["response"]
 
@@ -105,20 +120,25 @@ def test_no_unprefixed_hub_keys_in_packages_code() -> None:
 
         tree = ast.parse(text, filename=str(py_file))
         for node in ast.walk(tree):
-            if isinstance(node, ast.keyword) and node.arg == "metadata" and isinstance(node.value, ast.Dict):
+            if (
+                isinstance(node, ast.keyword)
+                and node.arg == "metadata"
+                and isinstance(node.value, ast.Dict)
+            ):
                 for key_node in node.value.keys:
                     if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
                         assert key_node.value.startswith("hub."), (
                             f"{py_file}: Unprefixed key {key_node.value!r} in metadata literal"
                         )
-            elif isinstance(node, ast.Assign):
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
                 for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "metadata" and isinstance(node.value, ast.Dict):
+                    if isinstance(target, ast.Name) and target.id == "metadata":
                         for key_node in node.value.keys:
-                            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
-                                assert key_node.value.startswith("hub."), (
-                                    f"{py_file}: Unprefixed key {key_node.value!r} in metadata assignment"
-                                )
+                            if isinstance(key_node, ast.Constant) and isinstance(
+                                key_node.value, str
+                            ):
+                                msg = f"{py_file}: Unprefixed key {key_node.value!r} in metadata"
+                                assert key_node.value.startswith("hub."), msg
 
 
 async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
@@ -140,7 +160,7 @@ async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
     # 1. message/send check-in fixture
     send_fixture = json.loads((WIRE_DIR / "message_send.json").read_text(encoding="utf-8"))
     resp = await protocol.dispatch(send_fixture["request"])
-    resp_data = json.loads(resp.body.decode())
+    resp_data = json.loads(bytes(resp.body).decode("utf-8"))
     assert resp_data["id"] == send_fixture["request"]["id"]
     assert resp_data["result"]["kind"] == "message"
     assert resp_data["result"]["metadata"][MetaKeys.AGENT] == "bob"
@@ -155,7 +175,7 @@ async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
     get_req = dict(get_fixture["request"])
     get_req["params"] = {"id": task.id, "historyLength": 10}
     resp_get = await protocol.dispatch(get_req)
-    get_data = json.loads(resp_get.body.decode())
+    get_data = json.loads(bytes(resp_get.body).decode("utf-8"))
     assert get_data["result"]["id"] == task.id
     assert get_data["result"]["kind"] == "task"
     assert get_data["result"]["metadata"][MetaKeys.ROLE] == "implementer"
@@ -166,7 +186,7 @@ async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
     cancel_req = dict(cancel_fixture["request"])
     cancel_req["params"] = {"id": task.id}
     resp_cancel = await protocol.dispatch(cancel_req)
-    cancel_data = json.loads(resp_cancel.body.decode())
+    cancel_data = json.loads(bytes(resp_cancel.body).decode("utf-8"))
     assert cancel_data["result"]["id"] == task.id
     assert cancel_data["result"]["status"]["state"] == "canceled"
     assert cancel_data["result"]["metadata"][MetaKeys.ASSIGNEE] == "bob"
