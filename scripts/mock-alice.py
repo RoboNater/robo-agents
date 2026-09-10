@@ -181,6 +181,15 @@ async def drive_one_task_mcp(
                 kind,
                 payload.get("summary"),
             )
+            result_payload = payload.get("result")
+            if isinstance(result_payload, dict):
+                logger.info(
+                    "Typed result: outcome=%s verdict=%s pr_url=%s head_sha=%s",
+                    result_payload.get("outcome"),
+                    result_payload.get("verdict"),
+                    result_payload.get("pr_url"),
+                    result_payload.get("head_sha") or result_payload.get("reviewed_head_sha"),
+                )
 
     if not task_finished:
         raise TimeoutError(f"Task {task_id} did not finish within {timeout_s}s")
@@ -312,6 +321,15 @@ async def drive_one_task(
                     event.kind,
                     event.payload.get("summary"),
                 )
+                result_payload = event.payload.get("result")
+                if isinstance(result_payload, dict):
+                    logger.info(
+                        "Typed result: outcome=%s verdict=%s pr_url=%s head_sha=%s",
+                        result_payload.get("outcome"),
+                        result_payload.get("verdict"),
+                        result_payload.get("pr_url"),
+                        result_payload.get("head_sha") or result_payload.get("reviewed_head_sha"),
+                    )
 
     if not task_finished:
         raise TimeoutError(f"Task {task.id} did not finish within {timeout_s}s")
