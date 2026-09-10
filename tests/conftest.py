@@ -11,7 +11,7 @@ import pytest_asyncio
 from agent_hub import create_app
 from agent_hub.database import initialize_database
 from agent_hub.store import HubStore
-from agent_hub_common import HubSettings
+from agent_hub_common import HubSettings, MetaKeys
 from fastapi import FastAPI
 
 TOKEN = "test-token"
@@ -123,9 +123,9 @@ async def check_in(
             message(
                 "READY",
                 metadata={
-                    "agent": name,
-                    "capabilities": capabilities or ["python"],
-                    "runtime": "claude-code",
+                    MetaKeys.AGENT: name,
+                    MetaKeys.CAPABILITIES: capabilities or ["python"],
+                    MetaKeys.RUNTIME: "claude-code",
                 },
             ),
         ),

@@ -1,6 +1,7 @@
 import httpx
 import pytest
 from agent_hub.security import require_bearer
+from agent_hub_common import MetaKeys
 from conftest import BASE_URL, TOKEN, message, rpc
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -28,7 +29,7 @@ async def test_the_a2a_route_refuses_anything_but_the_shared_token(
     async with app.router.lifespan_context(app), await anonymous(app) as client:
         response = await client.post(
             "/a2a",
-            json=rpc("message/send", message("READY", metadata={"agent": "bob"})),
+            json=rpc("message/send", message("READY", metadata={MetaKeys.AGENT: "bob"})),
             headers=headers,
         )
 
@@ -40,7 +41,7 @@ async def test_the_token_is_accepted_in_any_case_of_the_scheme(app: FastAPI) -> 
     async with app.router.lifespan_context(app), await anonymous(app) as client:
         response = await client.post(
             "/a2a",
-            json=rpc("message/send", message("READY", metadata={"agent": "bob"})),
+            json=rpc("message/send", message("READY", metadata={MetaKeys.AGENT: "bob"})),
             headers={"Authorization": f"bearer {TOKEN}"},
         )
 

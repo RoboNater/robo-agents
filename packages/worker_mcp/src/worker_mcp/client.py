@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from agent_hub_common import MetaKeys
 
 from .config import WorkerSettings
 
@@ -259,9 +260,9 @@ class WorkerHubClient:
                 "role": "user",
                 "parts": [{"kind": "text", "text": "READY"}],
                 "metadata": {
-                    "agent": self.settings.agent_name,
-                    "capabilities": caps,
-                    "runtime": self.settings.runtime,
+                    MetaKeys.AGENT: self.settings.agent_name,
+                    MetaKeys.CAPABILITIES: caps,
+                    MetaKeys.RUNTIME: self.settings.runtime,
                 },
             }
         }
@@ -302,21 +303,21 @@ class WorkerHubClient:
                 "contextId": self.context_id,
                 "role": "user",
                 "parts": [{"kind": "text", "text": "NEXT"}],
-                "metadata": {"timeout_s": hold_s},
+                "metadata": {MetaKeys.TIMEOUT_S: hold_s},
             }
         }
         result = await self._stream_rpc("message/stream", params, hold_s)
         if not isinstance(result, dict):
             return {"timeout": True}
         metadata = result.get("metadata") or {}
-        if metadata.get("release") is True:
+        if metadata.get(MetaKeys.RELEASE) is True:
             return {"release": True}
-        if metadata.get("timeout") is True:
+        if metadata.get(MetaKeys.TIMEOUT) is True:
             return {"timeout": True}
 
         # Assignment received (A2A Task object)
         task_id = result.get("id")
-        role = metadata.get("role", "")
+        role = metadata.get(MetaKeys.ROLE, "")
         status_msg = (result.get("status") or {}).get("message") or {}
         parts = status_msg.get("parts") or []
         instructions = ""
@@ -347,7 +348,7 @@ class WorkerHubClient:
                 "contextId": self.context_id,
                 "role": "user",
                 "parts": [{"kind": "text", "text": note}],
-                "metadata": {"kind": "progress"},
+                "metadata": {MetaKeys.KIND: "progress"},
             }
         }
         await self._post_rpc("message/send", params)
@@ -384,7 +385,7 @@ class WorkerHubClient:
                 "contextId": self.context_id,
                 "role": "user",
                 "parts": [{"kind": "text", "text": question}],
-                "metadata": {"kind": "question", "timeout_s": hold_s},
+                "metadata": {MetaKeys.KIND: "question", MetaKeys.TIMEOUT_S: hold_s},
             }
         }
         result = await self._stream_rpc("message/stream", params, hold_s)
@@ -397,12 +398,12 @@ class WorkerHubClient:
         status_msg = status.get("message") or {}
         msg_metadata = status_msg.get("metadata") or {}
         overridden = (
-            msg_metadata.get("kind") == "state_override"
+            msg_metadata.get(MetaKeys.KIND) == "state_override"
             or state in ("canceled", "failed", "completed")
         )
         if overridden:
             self._pending_questions.pop(task_id, None)
-            task_result = (result.get("metadata") or {}).get("result")
+            task_result = (result.get("metadata") or {}).get(MetaKeys.RESULT)
             note = task_result.get("summary") if isinstance(task_result, dict) else None
             if not note:
                 parts = status_msg.get("parts") or []
@@ -415,9 +416,9 @@ class WorkerHubClient:
 
         # Check for hold timeout (§4.1)
         res_metadata = result.get("metadata") or {}
-        if res_metadata.get("timeout") is True:
+        if res_metadata.get(MetaKeys.TIMEOUT) is True:
             # Preserve retry_as_message_id if provided by hub
-            retry_id = res_metadata.get("retry_as_message_id", message_id)
+            retry_id = res_metadata.get(MetaKeys.RETRY_AS_MESSAGE_ID, message_id)
             self._pending_questions[task_id] = (question, retry_id)
             return {"timeout": True}
 
@@ -460,9 +461,9 @@ class WorkerHubClient:
                 "role": "user",
                 "parts": [{"kind": "text", "text": summary}],
                 "metadata": {
-                    "kind": "result",
-                    "status": clean_status,
-                    "artifacts": artifacts or [],
+                    MetaKeys.KIND: "result",
+                    MetaKeys.STATUS: clean_status,
+                    MetaKeys.ARTIFACTS: artifacts or [],
                 },
             }
         }

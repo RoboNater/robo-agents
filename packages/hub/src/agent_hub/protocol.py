@@ -44,7 +44,7 @@ from a2a.types import (
 )
 from a2a.types import Message as A2AMessage
 from a2a.types import TaskState as A2ATaskState
-from agent_hub_common import HubSettings, TaskState
+from agent_hub_common import HubSettings, MetaKeys, TaskState
 from fastapi import Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -57,6 +57,7 @@ from .store import (
     NotFoundError,
     Released,
     TaskRecord,
+    _normalize_part,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,10 +162,10 @@ def _stored_message(record: MessageRecord) -> A2AMessage:
     return A2AMessage(
         message_id=str(record.id),
         role=Role.user if record.direction == "to_alice" else Role.agent,
-        parts=[Part.model_validate(part) for part in record.parts],
+        parts=[Part.model_validate(_normalize_part(part)) for part in record.parts],
         context_id=record.context_id,
         task_id=record.task_id,
-        metadata={"sender": record.sender, "ts": record.ts},
+        metadata={MetaKeys.SENDER: record.sender, MetaKeys.TS: record.ts},
     )
 
 
@@ -202,7 +203,11 @@ def _task_object(
             record.instructions,
             context_id=context_id,
             task_id=record.id,
-            metadata={"kind": "assignment", "role": record.role, "title": record.title},
+            metadata={
+                MetaKeys.KIND: "assignment",
+                MetaKeys.ROLE: record.role,
+                MetaKeys.TITLE: record.title,
+            },
         )
     return Task(
         id=record.id,
@@ -215,11 +220,11 @@ def _task_object(
         history=history,
         artifacts=_artifacts(record),
         metadata={
-            "role": record.role,
-            "title": record.title,
-            "assignee": record.assignee,
-            "lease_expires": record.lease_expires,
-            "result": record.result,
+            MetaKeys.ROLE: record.role,
+            MetaKeys.TITLE: record.title,
+            MetaKeys.ASSIGNEE: record.assignee,
+            MetaKeys.LEASE_EXPIRES: record.lease_expires,
+            MetaKeys.RESULT: record.result,
         },
     )
 
@@ -279,7 +284,7 @@ class A2AProtocol:
 
         agent = self._resolve_agent(message, metadata)
         task = self._owned_task(message.task_id, agent)
-        kind = metadata.get("kind", "progress")
+        kind = metadata.get(MetaKeys.KIND, "progress")
         if kind == "result":
             return self._result(task, agent, _text(message), metadata)
         if kind == "progress":
@@ -288,30 +293,29 @@ class A2AProtocol:
                 "noted",
                 context_id=agent.context_id,
                 task_id=task.id,
-                metadata={"kind": "progress_ack"},
+                metadata={MetaKeys.KIND: "progress_ack"},
             )
-        raise _invalid(f"metadata.kind {kind!r} is not a message/send intent on a task")
+        raise _invalid(f"metadata.{MetaKeys.KIND} {kind!r} is not a message/send intent on a task")
 
     def _check_in(self, message: A2AMessage, metadata: dict[str, Any]) -> A2AMessage:
         if _text(message).upper() != CHECK_IN_TEXT:
             raise _invalid(f"a message with no taskId must be the {CHECK_IN_TEXT} check-in")
-        name = metadata.get("agent")
+        name = metadata.get(MetaKeys.AGENT)
         if not isinstance(name, str) or not name.strip():
-            raise _invalid("check-in requires metadata.agent")
-        runtime = metadata.get("runtime")
+            raise _invalid(f"check-in requires metadata.{MetaKeys.AGENT}")
+        runtime = metadata.get(MetaKeys.RUNTIME)
         agent = self.store.check_in(
             name.strip(),
-            _string_list(metadata.get("capabilities"), "capabilities"),
+            _string_list(metadata.get(MetaKeys.CAPABILITIES), MetaKeys.CAPABILITIES),
             runtime=str(runtime) if isinstance(runtime, str) else None,
         )
         return _agent_message(
             "REGISTERED",
             context_id=agent.context_id,
             metadata={
-                "kind": "check_in_ack",
-                "agent": agent.name,
-                "status": agent.status.value,
-                "contextId": agent.context_id,
+                MetaKeys.KIND: "check_in_ack",
+                MetaKeys.AGENT: agent.name,
+                MetaKeys.STATUS: agent.status.value,
             },
         )
 
@@ -322,14 +326,14 @@ class A2AProtocol:
         summary: str,
         metadata: dict[str, Any],
     ) -> Task:
-        raw_status = metadata.get("status")
+        raw_status = metadata.get(MetaKeys.STATUS)
         try:
             status = TaskState(str(raw_status))
         except ValueError as exc:
-            raise _invalid("metadata.status must be 'completed' or 'failed'") from exc
-        artifacts = metadata.get("artifacts") or []
+            raise _invalid(f"metadata.{MetaKeys.STATUS} must be 'completed' or 'failed'") from exc
+        artifacts = metadata.get(MetaKeys.ARTIFACTS) or []
         if not isinstance(artifacts, list):
-            raise _invalid("metadata.artifacts must be a list")
+            raise _invalid(f"metadata.{MetaKeys.ARTIFACTS} must be a list")
         finished = self.store.submit_result(
             task.id,
             agent.name,
@@ -347,8 +351,10 @@ class A2AProtocol:
         timeout_s = self._timeout(metadata)
 
         if message.task_id is not None:
-            if metadata.get("kind") != "question":
-                raise _invalid("a streaming call on a task must be metadata.kind=question")
+            if metadata.get(MetaKeys.KIND) != "question":
+                raise _invalid(
+                    f"a streaming call on a task must be metadata.{MetaKeys.KIND}=question"
+                )
             agent = self._resolve_agent(message, metadata)
             task = self._owned_task(message.task_id, agent)
             question = _text(message)
@@ -385,7 +391,7 @@ class A2AProtocol:
                     _agent_message(
                         "RELEASED",
                         context_id=agent.context_id,
-                        metadata={"kind": "release", "release": True},
+                        metadata={MetaKeys.KIND: "release", MetaKeys.RELEASE: True},
                     ),
                 )
             )
@@ -416,7 +422,7 @@ class A2AProtocol:
                 note,
                 context_id=agent.context_id,
                 task_id=current.id,
-                metadata={"kind": "state_override", "state": current.state.value},
+                metadata={MetaKeys.KIND: "state_override", MetaKeys.STATE: current.state.value},
             )
             yield _sse(
                 _success_body(
@@ -446,9 +452,9 @@ class A2AProtocol:
         original question.
         """
 
-        metadata: dict[str, Any] = {"kind": "timeout", "timeout": True}
+        metadata: dict[str, Any] = {MetaKeys.KIND: "timeout", MetaKeys.TIMEOUT: True}
         if sent_as is not None:
-            metadata["retry_as_message_id"] = sent_as
+            metadata[MetaKeys.RETRY_AS_MESSAGE_ID] = sent_as
         return _agent_message(
             "TIMEOUT",
             context_id=context_id,
@@ -457,11 +463,11 @@ class A2AProtocol:
         )
 
     def _timeout(self, metadata: Mapping[str, Any]) -> float:
-        requested = metadata.get("timeout_s")
+        requested = metadata.get(MetaKeys.TIMEOUT_S)
         if requested is None:
             return self.settings.bounded_wait(None)
         if not isinstance(requested, int | float) or isinstance(requested, bool):
-            raise _invalid("metadata.timeout_s must be a number of seconds")
+            raise _invalid(f"metadata.{MetaKeys.TIMEOUT_S} must be a number of seconds")
         return self.settings.bounded_wait(float(requested))
 
     # -- tasks/get and tasks/cancel ----------------------------------------
@@ -496,13 +502,13 @@ class A2AProtocol:
             if agent is None:
                 raise _invalid(f"unknown contextId {message.context_id!r}; check in first")
             return agent
-        name = metadata.get("agent")
+        name = metadata.get(MetaKeys.AGENT)
         if isinstance(name, str) and name.strip():
             agent = self.store.agent_by_name(name.strip())
             if agent is None:
                 raise _invalid(f"unknown agent {name!r}; check in first")
             return agent
-        raise _invalid("the message needs a contextId or metadata.agent")
+        raise _invalid(f"the message needs a contextId or metadata.{MetaKeys.AGENT}")
 
     def _owned_task(self, task_id: str, agent: AgentRecord) -> TaskRecord:
         task = self.store.get_task(task_id)
