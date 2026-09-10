@@ -35,7 +35,7 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
                                                 │ HTTP :8420  (A2A JSON-RPC + agent card)
                  ┌──────────────────────────────┴──────────────────────────────┐
                  ▼                                                              ▼
- ┌──── Bob: Claude Code ─────┐                                     ┌──── Charlie: other CLI ────┐
+ ┌──── Bob: Claude Code ─────┐                                     ┌──── Charlie: Codex CLI ────┐
  │ LLM runtime ─stdio MCP─▶ worker-mcp (A2A client)               │ LLM runtime ─stdio MCP─▶ worker-mcp
  │   role guide via get_role_guide(role) ◀── served by hub ──▶    │   role guide via get_role_guide(role)
  └───────────────────────────┘                                     └────────────────────────────┘
