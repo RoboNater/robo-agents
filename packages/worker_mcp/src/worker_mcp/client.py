@@ -10,7 +10,12 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from agent_hub_common import MetaKeys
+from agent_hub_common import (
+    SCHEMA_VERSION,
+    ImplementerResult,
+    MetaKeys,
+    ReviewerResult,
+)
 
 from .config import WorkerSettings
 
@@ -43,6 +48,8 @@ class WorkerHubClient:
         self.context_id: str | None = None
         # Active pending question (question_text, message_id) per task (§4.1)
         self._pending_questions: dict[str, tuple[str, str]] = {}
+        # Active pending result (result_dict, operation_id) per task (§4.1)
+        self._pending_results: dict[str, tuple[dict[str, Any], str]] = {}
 
     async def __aenter__(self) -> WorkerHubClient:
         if self._client is None:
@@ -131,7 +138,21 @@ class WorkerHubClient:
             "params": params,
         }
         response = await self._request_with_retry("POST", "/a2a", json_body=payload)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                data = response.json()
+                if isinstance(data, dict) and "error" in data:
+                    err = data["error"]
+                    code = err.get("code") if isinstance(err, dict) else None
+                    msg = (
+                        err.get("message", "Unknown JSON-RPC error")
+                        if isinstance(err, dict)
+                        else str(err)
+                    )
+                    raise WorkerProtocolError(code, msg)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):
             raise WorkerProtocolError(None, "Hub response was not a JSON object")
@@ -187,7 +208,22 @@ class WorkerHubClient:
                         )
                         await asyncio.sleep(delay)
                         continue
-                    response.raise_for_status()
+                    if response.status_code >= 400:
+                        content = await response.aread()
+                        try:
+                            data = json.loads(content)
+                            if isinstance(data, dict) and "error" in data:
+                                err = data["error"]
+                                code = err.get("code") if isinstance(err, dict) else None
+                                msg = (
+                                    err.get("message", "Unknown JSON-RPC error")
+                                    if isinstance(err, dict)
+                                    else str(err)
+                                )
+                                raise WorkerProtocolError(code, msg)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        response.raise_for_status()
                     content_type = response.headers.get("content-type", "")
                     if "text/event-stream" not in content_type:
                         content = await response.aread()
@@ -251,9 +287,14 @@ class WorkerHubClient:
                     continue
                 raise
 
-    async def check_in(self, capabilities: list[str] | None = None) -> dict[str, Any]:
+    async def check_in(
+        self,
+        capabilities: list[str] | None = None,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Register the worker with the hub and store the returned contextId."""
         caps = capabilities if capabilities is not None else ["python"]
+        op_id = operation_id or uuid4().hex
         params = {
             "message": {
                 "messageId": uuid4().hex,
@@ -263,6 +304,8 @@ class WorkerHubClient:
                     MetaKeys.AGENT: self.settings.agent_name,
                     MetaKeys.CAPABILITIES: caps,
                     MetaKeys.RUNTIME: self.settings.runtime,
+                    MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                    MetaKeys.OPERATION_ID: op_id,
                 },
             }
         }
@@ -337,10 +380,16 @@ class WorkerHubClient:
             "instructions": instructions,
         }
 
-    async def report_progress(self, task_id: str, note: str) -> dict[str, Any]:
+    async def report_progress(
+        self,
+        task_id: str,
+        note: str,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Send a progress note to Alice."""
         if not self.context_id:
             raise RuntimeError("Worker has not checked in yet; call check_in first")
+        op_id = operation_id or uuid4().hex
         params = {
             "message": {
                 "messageId": uuid4().hex,
@@ -348,7 +397,11 @@ class WorkerHubClient:
                 "contextId": self.context_id,
                 "role": "user",
                 "parts": [{"kind": "text", "text": note}],
-                "metadata": {MetaKeys.KIND: "progress"},
+                "metadata": {
+                    MetaKeys.KIND: "progress",
+                    MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                    MetaKeys.OPERATION_ID: op_id,
+                },
             }
         }
         await self._post_rpc("message/send", params)
@@ -385,7 +438,11 @@ class WorkerHubClient:
                 "contextId": self.context_id,
                 "role": "user",
                 "parts": [{"kind": "text", "text": question}],
-                "metadata": {MetaKeys.KIND: "question", MetaKeys.TIMEOUT_S: hold_s},
+                "metadata": {
+                    MetaKeys.KIND: "question",
+                    MetaKeys.TIMEOUT_S: hold_s,
+                    MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                },
             }
         }
         result = await self._stream_rpc("message/stream", params, hold_s)
@@ -441,35 +498,87 @@ class WorkerHubClient:
     async def submit_result(
         self,
         task_id: str,
-        status: str,
-        summary: str,
+        result: ImplementerResult | ReviewerResult | dict[str, Any] | str,
+        summary: str | None = None,
         artifacts: list[Any] | None = None,
+        operation_id: str | None = None,
     ) -> dict[str, Any]:
-        """Report final result (completed or failed) with artifacts and summary."""
+        """Report final typed result (or status/summary) for a task."""
         if not self.context_id:
             raise RuntimeError("Worker has not checked in yet; call check_in first")
-        clean_status = status.strip().lower()
-        if clean_status not in ("completed", "failed"):
-            raise ValueError(f"status must be 'completed' or 'failed', got {status!r}")
 
         self._pending_questions.pop(task_id, None)
+
+        if isinstance(result, (ImplementerResult, ReviewerResult)):
+            result_dict = result.model_dump(mode="json")
+            summary_text = result.summary
+        elif isinstance(result, dict):
+            result_dict = result
+            summary_text = str(result.get("summary", ""))
+        elif isinstance(result, str):
+            clean_status = result.strip().lower()
+            if clean_status not in ("completed", "failed"):
+                raise ValueError(f"status must be 'completed' or 'failed', got {result!r}")
+            summary_text = summary or ""
+            result_dict = {
+                "outcome": clean_status,
+                "summary": summary_text,
+            }
+            if artifacts:
+                for art in artifacts:
+                    if isinstance(art, dict) and "url" in art:
+                        result_dict["pr_url"] = art["url"]
+                        result_dict["head_sha"] = "0" * 40
+        else:
+            raise TypeError(
+                "result must be ImplementerResult, ReviewerResult, dict, or str, "
+                f"got {type(result)}"
+            )
+
+        outcome = result_dict.get("outcome")
+        verdict = result_dict.get("verdict")
+        if outcome == "completed" or verdict in ("approved", "changes_requested"):
+            terminal_status = "completed"
+        elif outcome in ("blocked", "failed") or verdict == "failed":
+            terminal_status = "failed"
+        else:
+            terminal_status = (
+                "completed" if isinstance(result, str) and result == "completed" else "failed"
+            )
+
+        if operation_id is not None:
+            op_id = operation_id
+        else:
+            pending = self._pending_results.get(task_id)
+            if pending is not None and pending[0] == result_dict:
+                op_id = pending[1]
+            else:
+                op_id = uuid4().hex
+                self._pending_results[task_id] = (result_dict, op_id)
+
+        metadata: dict[str, Any] = {
+            MetaKeys.KIND: "result",
+            MetaKeys.STATUS: terminal_status,
+            MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+            MetaKeys.OPERATION_ID: op_id,
+            MetaKeys.RESULT: result_dict,
+            MetaKeys.ARTIFACTS: artifacts or [],
+        }
+
         params = {
             "message": {
                 "messageId": uuid4().hex,
                 "taskId": task_id,
                 "contextId": self.context_id,
                 "role": "user",
-                "parts": [{"kind": "text", "text": summary}],
-                "metadata": {
-                    MetaKeys.KIND: "result",
-                    MetaKeys.STATUS: clean_status,
-                    MetaKeys.ARTIFACTS: artifacts or [],
-                },
+                "parts": [{"kind": "text", "text": summary_text}],
+                "metadata": metadata,
             }
         }
         await self._post_rpc("message/send", params)
         return {
-            "status": clean_status,
+            "status": terminal_status,
             "task_id": task_id,
-            "summary": summary,
+            "summary": summary_text,
+            "result": result_dict,
         }

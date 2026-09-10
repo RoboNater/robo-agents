@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
+from agent_hub_common import ImplementerResult, ReviewerResult
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
@@ -62,11 +63,9 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
     @server.tool()
     async def submit_result(
         task_id: str,
-        status: Literal["completed", "failed"],
-        summary: str,
-        artifacts: list[Any] | None = None,
+        result: ImplementerResult | ReviewerResult,
     ) -> dict[str, Any]:
-        """Submit the final result for a task, marking it completed or failed."""
-        return await client.submit_result(task_id, status, summary, artifacts)
+        """Submit the final result for a task, validated against the role's schema."""
+        return await client.submit_result(task_id, result)
 
     return server
