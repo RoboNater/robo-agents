@@ -20,7 +20,7 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 **Non-goals (PoC)**
 - Multiple concurrent workflows per hub
 - Artifact transfer between agents (GitHub *is* the shared work product store: PRs, commits, comments)
-- TLS / real auth (pre-shared bearer token only; use a tunnel/VPN across networks)
+- TLS / real auth (pre-shared bearer token only; use a tunnel/VPN across networks) — trust assumption: all token holders are trusted not to impersonate other agents; identity and model metadata are self-declared
 - Headless Alice (decision: **interactive** for the PoC — escalation = Alice ends her turn with a question; cheapest path to a working user channel)
 
 ---
@@ -301,3 +301,4 @@ Suggested order of effort: 1–2 (1 day, done), 3–4 (1 day, done), 4A (durabil
 - Context sharing: plan/acceptance-criteria artifacts served from hub, not just in instructions
 - User channel for headless Alice (webhook/Slack/CLI inbox)
 - Standalone hub service with real auth/TLS
+- Per-agent credentials mapping to an immutable server-derived identity (not `hub.agent`); bound to `worker_instance_id`; revoked on supersede/release; TLS mandatory on any path outside a trusted tunnel/VPN; scoped GitHub tokens per role. Note that this must not change the task/result protocol
