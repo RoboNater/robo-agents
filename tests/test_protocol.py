@@ -4,7 +4,7 @@ from typing import Any
 import httpx
 import pytest
 from agent_hub.store import HubStore
-from agent_hub_common import EventKind, TaskState
+from agent_hub_common import EventKind, MetaKeys, TaskState
 from conftest import check_in, message, rpc, sse_results
 
 
@@ -32,18 +32,20 @@ async def test_check_in_returns_the_context_the_worker_must_use(
     body = await post(
         client,
         "message/send",
-        message("READY", metadata={"agent": "bob", "capabilities": ["python"]}),
+        message("READY", metadata={MetaKeys.AGENT: "bob", MetaKeys.CAPABILITIES: ["python"]}),
     )
 
     result = body["result"]
     agent = hub_store.agent_by_name("bob")
     assert result["kind"] == "message"
-    assert result["metadata"]["agent"] == "bob"
+    assert result["metadata"][MetaKeys.AGENT] == "bob"
     assert agent is not None and result["contextId"] == agent.context_id
 
 
 async def test_a_message_with_no_task_must_be_the_check_in(client: httpx.AsyncClient) -> None:
-    body = await post(client, "message/send", message("hello", metadata={"agent": "bob"}))
+    body = await post(
+        client, "message/send", message("hello", metadata={MetaKeys.AGENT: "bob"})
+    )
 
     assert body["error"]["code"] == -32602
     assert "READY" in body["error"]["message"]
@@ -83,7 +85,7 @@ async def test_next_holds_until_alice_assigns(
     assert result["status"]["state"] == "working"
     # The first message of the returned task is the assignment's instructions.
     assert result["status"]["message"]["parts"][0]["text"] == "Open a PR"
-    assert result["metadata"]["role"] == "implementer"
+    assert result["metadata"][MetaKeys.ROLE] == "implementer"
 
 
 async def test_next_returns_a_timeout_marker_when_nothing_is_assigned(
@@ -95,12 +97,12 @@ async def test_next_returns_a_timeout_marker_when_nothing_is_assigned(
         "/a2a",
         json=rpc(
             "message/stream",
-            message("NEXT", context_id=context_id, metadata={"timeout_s": 0.05}),
+            message("NEXT", context_id=context_id, metadata={MetaKeys.TIMEOUT_S: 0.05}),
         ),
     )
 
     result = sse_results(response)[0]
-    assert result["metadata"]["timeout"] is True
+    assert result["metadata"][MetaKeys.TIMEOUT] is True
 
 
 async def test_next_reports_release(client: httpx.AsyncClient, hub_store: HubStore) -> None:
@@ -112,7 +114,7 @@ async def test_next_reports_release(client: httpx.AsyncClient, hub_store: HubSto
     )
 
     result = sse_results(response)[0]
-    assert result["metadata"]["release"] is True
+    assert result["metadata"][MetaKeys.RELEASE] is True
 
 
 async def test_next_rejects_an_unknown_context(client: httpx.AsyncClient) -> None:
@@ -135,12 +137,12 @@ async def test_progress_is_acknowledged_and_queued_for_alice(
             "branch pushed",
             context_id=context_id,
             task_id=task_id,
-            metadata={"kind": "progress"},
+            metadata={MetaKeys.KIND: "progress"},
         ),
     )
 
     event = hub_store.next_event()
-    assert body["result"]["metadata"]["kind"] == "progress_ack"
+    assert body["result"]["metadata"][MetaKeys.KIND] == "progress_ack"
     assert event is not None and event.kind is EventKind.TASK_PROGRESS
     assert event.payload["note"] == "branch pushed"
 
@@ -166,7 +168,7 @@ async def test_a_question_holds_until_alice_replies(
                     "Which base branch?",
                     context_id=context_id,
                     task_id=task_id,
-                    metadata={"kind": "question"},
+                    metadata={MetaKeys.KIND: "question"},
                 ),
             ),
         )
@@ -192,13 +194,13 @@ async def test_an_unanswered_question_times_out_and_stays_parked(
                 "Which base branch?",
                 context_id=context_id,
                 task_id=task_id,
-                metadata={"kind": "question", "timeout_s": 0.05},
+                metadata={MetaKeys.KIND: "question", MetaKeys.TIMEOUT_S: 0.05},
             ),
         ),
     )
 
     task = hub_store.get_task(task_id)
-    assert sse_results(response)[0]["metadata"]["timeout"] is True
+    assert sse_results(response)[0]["metadata"][MetaKeys.TIMEOUT] is True
     assert task is not None and task.state is TaskState.INPUT_REQUIRED
 
 
@@ -214,7 +216,7 @@ async def test_a_retried_question_still_receives_a_reply_sent_in_the_gap(
             "Which base branch?",
             context_id=context_id,
             task_id=task_id,
-            metadata={"kind": "question", "timeout_s": 0.05},
+            metadata={MetaKeys.KIND: "question", MetaKeys.TIMEOUT_S: 0.05},
         ),
     )
 
@@ -224,9 +226,9 @@ async def test_a_retried_question_still_receives_a_reply_sent_in_the_gap(
     retried = await client.post("/a2a", json=ask)
 
     marker = sse_results(timed_out)[0]
-    assert marker["metadata"]["timeout"] is True
+    assert marker["metadata"][MetaKeys.TIMEOUT] is True
     # The marker names the id the retry has to be sent under.
-    assert marker["metadata"]["retry_as_message_id"] == ask["params"]["message"]["messageId"]
+    assert marker["metadata"][MetaKeys.RETRY_AS_MESSAGE_ID] == ask["params"]["message"]["messageId"]
     assert sse_results(retried)[0]["parts"][0]["text"] == "main"
     assert hub_store.next_event() is not None
     assert hub_store.next_event() is None
@@ -244,7 +246,7 @@ async def test_a_worker_released_while_away_is_released_when_it_returns(
         "/a2a", json=rpc("message/stream", message("NEXT", context_id=context_id))
     )
 
-    assert sse_results(response)[0]["metadata"]["release"] is True
+    assert sse_results(response)[0]["metadata"][MetaKeys.RELEASE] is True
 
 
 async def test_a_streaming_call_on_a_task_must_be_a_question(
@@ -255,7 +257,7 @@ async def test_a_streaming_call_on_a_task_must_be_a_question(
     body = await post(
         client,
         "message/stream",
-        message("hi", context_id=context_id, task_id=task_id, metadata={"kind": "progress"}),
+        message("hi", context_id=context_id, task_id=task_id, metadata={MetaKeys.KIND: "progress"}),
     )
 
     assert body["error"]["code"] == -32602
@@ -276,9 +278,9 @@ async def test_a_result_ends_the_task_and_carries_its_artifacts(
             context_id=context_id,
             task_id=task_id,
             metadata={
-                "kind": "result",
-                "status": "completed",
-                "artifacts": [{"name": "pr", "url": "https://example.test/pr/1"}],
+                MetaKeys.KIND: "result",
+                MetaKeys.STATUS: "completed",
+                MetaKeys.ARTIFACTS: [{"name": "pr", "url": "https://example.test/pr/1"}],
             },
         ),
     )
@@ -303,7 +305,7 @@ async def test_a_failed_result_is_reported_as_such(
             "tests will not pass",
             context_id=context_id,
             task_id=task_id,
-            metadata={"kind": "result", "status": "failed"},
+            metadata={MetaKeys.KIND: "result", MetaKeys.STATUS: "failed"},
         ),
     )
 
@@ -323,7 +325,7 @@ async def test_a_result_needs_a_terminal_status(
             "done",
             context_id=context_id,
             task_id=task_id,
-            metadata={"kind": "result", "status": status},
+            metadata={MetaKeys.KIND: "result", MetaKeys.STATUS: status},
         ),
     )
 
@@ -339,7 +341,7 @@ async def test_a_worker_cannot_act_on_another_workers_task(
     body = await post(
         client,
         "message/send",
-        message("mine now", context_id=charlie, task_id=task_id, metadata={"kind": "progress"}),
+        message("mine now", context_id=charlie, task_id=task_id, metadata={MetaKeys.KIND: "progress"}),
     )
 
     assert body["error"]["code"] == -32602
@@ -406,12 +408,12 @@ async def test_a_requested_timeout_is_clamped_to_the_configured_ceiling(
         "/a2a",
         json=rpc(
             "message/stream",
-            message("NEXT", context_id=context_id, metadata={"timeout_s": 9000}),
+            message("NEXT", context_id=context_id, metadata={MetaKeys.TIMEOUT_S: 9000}),
         ),
         timeout=10,
     )
 
-    assert sse_results(response)[0]["metadata"]["timeout"] is True
+    assert sse_results(response)[0]["metadata"][MetaKeys.TIMEOUT] is True
 
 
 async def test_a_non_numeric_timeout_is_rejected(client: httpx.AsyncClient) -> None:
@@ -420,7 +422,7 @@ async def test_a_non_numeric_timeout_is_rejected(client: httpx.AsyncClient) -> N
     body = await post(
         client,
         "message/stream",
-        message("NEXT", context_id=context_id, metadata={"timeout_s": "soon"}),
+        message("NEXT", context_id=context_id, metadata={MetaKeys.TIMEOUT_S: "soon"}),
     )
 
     assert body["error"]["code"] == -32602
@@ -440,7 +442,7 @@ async def test_manual_override_returns_terminal_task_to_question_stream(
                     "Which?",
                     context_id=context_id,
                     task_id=task_id,
-                    metadata={"kind": "question"},
+                    metadata={MetaKeys.KIND: "question"},
                 ),
             ),
         )
@@ -457,7 +459,7 @@ async def test_manual_override_returns_terminal_task_to_question_stream(
     assert result["status"]["state"] == state.value
     assert result["status"]["message"]["parts"][0]["text"] == "Superseded"
     assert result["status"]["message"]["metadata"] == {
-        "kind": "state_override",
-        "state": state.value,
+        MetaKeys.KIND: "state_override",
+        MetaKeys.STATE: state.value,
     }
-    assert result["metadata"]["result"]["summary"] == "Superseded"
+    assert result["metadata"][MetaKeys.RESULT]["summary"] == "Superseded"
