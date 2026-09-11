@@ -590,6 +590,18 @@ def test_heartbeat_lease_renewal_stops_at_cap_and_expires_once(store: HubStore) 
     assert second == []
 
 
+def test_initial_lease_is_also_bounded_by_the_workflow_cap(store: HubStore) -> None:
+    clock = FakeClock()
+    store.clock = clock
+    store.ensure_workflow(policy={"max_task_lease_min": 10})
+    store.check_in("bob", worker_instance_id="bob-1")
+
+    task = store.assign_task("bob", "implementer", "Task", "Work", lease_min=30)
+
+    assert task.lease_expires == to_iso(clock.now + timedelta(minutes=10))
+    assert task.lease_duration_s == 30 * 60
+
+
 def test_state_reports_heartbeat_and_progress_ages_separately(store: HubStore) -> None:
     clock = FakeClock()
     store.clock = clock

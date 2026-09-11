@@ -128,10 +128,14 @@ def _legacy_database(path: Path, version: int) -> None:
         """)
 
 
-def _agent_columns(path: Path) -> dict[str, tuple[str, int, str | None]]:
+def _table_columns(path: Path, table: str) -> dict[str, tuple[str, int, str | None]]:
     with database(path) as connection:
-        rows = connection.execute("PRAGMA table_info(agent)").fetchall()
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     return {row["name"]: (row["type"], row["notnull"], row["dflt_value"]) for row in rows}
+
+
+def _agent_columns(path: Path) -> dict[str, tuple[str, int, str | None]]:
+    return _table_columns(path, "agent")
 
 
 def test_migration_from_v1_adds_an_unknown_profile(tmp_path: Path) -> None:
@@ -275,6 +279,7 @@ def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) 
     initialize_database(migrated)
 
     assert _agent_columns(migrated) == _agent_columns(fresh)
+    assert _table_columns(migrated, "task") == _table_columns(fresh, "task")
 
 
 def test_model_source_is_constrained_to_its_enum(tmp_path: Path) -> None:

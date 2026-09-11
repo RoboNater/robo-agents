@@ -137,7 +137,7 @@ class WorkerHubClient:
         )
         if not isinstance(result, dict):
             raise WorkerProtocolError(None, "heartbeat response was not a dict")
-        return (result.get("metadata") or {}).get("hub.accepted") is True
+        return (result.get("metadata") or {}).get(MetaKeys.ACCEPTED) is True
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:

@@ -586,10 +586,16 @@ class HubStore:
             cap = _parse_timestamp(task.created) + timedelta(minutes=cap_minutes)
             # An already-expired lease stays expired even if the sweeper has not
             # observed it yet. The next pass will emit its one durable event.
-            if current_expiry <= now or cap <= now:
+            if current_expiry <= now:
+                return True
+            if cap <= now:
+                connection.execute(
+                    "UPDATE task SET lease_expires = ?, updated = ? WHERE id = ?",
+                    (to_iso(cap), now_iso, task.id),
+                )
                 return True
             renewed = min(now + timedelta(seconds=task.lease_duration_s), cap)
-            if renewed > current_expiry:
+            if renewed != current_expiry:
                 connection.execute(
                     "UPDATE task SET lease_expires = ?, updated = ? WHERE id = ?",
                     (to_iso(renewed), now_iso, task.id),
@@ -657,6 +663,8 @@ class HubStore:
                     "it must check in again before it can be given work"
                 )
             workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            lease_cap_min = self._max_task_lease_min(connection, workflow_id)
+            effective_lease_min = min(lease_min, lease_cap_min)
             task_id = uuid4().hex
             connection.execute(
                 "INSERT INTO task (id, workflow_id, assignee, role, title, instructions, state,"
@@ -670,7 +678,7 @@ class HubStore:
                     title,
                     instructions,
                     TaskState.SUBMITTED.value,
-                    to_iso(now_moment + timedelta(minutes=lease_min)),
+                    to_iso(now_moment + timedelta(minutes=effective_lease_min)),
                     lease_min * 60,
                     now,
                     now,

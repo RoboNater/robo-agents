@@ -539,7 +539,7 @@ class A2AProtocol:
             metadata={
                 MetaKeys.KIND: "heartbeat_ack",
                 MetaKeys.AGENT: agent_name,
-                "hub.accepted": accepted,
+                MetaKeys.ACCEPTED: accepted,
             },
         )
 

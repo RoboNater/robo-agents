@@ -105,7 +105,7 @@ async def test_heartbeat_is_an_immediate_message_send_intent(
     assert body["result"]["metadata"] == {
         MetaKeys.KIND: "heartbeat_ack",
         MetaKeys.AGENT: "bob",
-        "hub.accepted": True,
+        MetaKeys.ACCEPTED: True,
     }
     assert after is not None and after.last_heartbeat >= before.last_heartbeat
 

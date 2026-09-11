@@ -38,6 +38,7 @@ def _collect_metadata_keys(obj: Any) -> list[str]:
     "fixture_name",
     [
         "message_send.json",
+        "heartbeat.json",
         "message_stream.json",
         "tasks_get.json",
         "tasks_cancel.json",
