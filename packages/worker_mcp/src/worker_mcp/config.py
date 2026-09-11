@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from agent_hub_common import ConfigurationError
+from agent_hub_common import AgentProfile, ConfigurationError, profile_from_env
 
 DEFAULT_WAIT_S = 120.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_FACTOR_S = 0.5
-DEFAULT_RUNTIME = "claude-code"
 
 
 def _positive_seconds(env: Mapping[str, str], name: str, default: float) -> float:
@@ -47,7 +46,8 @@ class WorkerSettings:
     hub_url: str
     token: str
     agent_name: str
-    runtime: str = DEFAULT_RUNTIME
+    # What the launcher says this worker is; reported at check-in (§4.3).
+    profile: AgentProfile = field(default_factory=AgentProfile)
     default_wait_s: float = DEFAULT_WAIT_S
     max_retries: int = DEFAULT_MAX_RETRIES
     backoff_factor_s: float = DEFAULT_BACKOFF_FACTOR_S
@@ -73,10 +73,6 @@ class WorkerSettings:
             raise ConfigurationError("AGENT_NAME must be set")
         agent_name = raw_agent_name.strip()
 
-        runtime = env.get("AGENT_RUNTIME", DEFAULT_RUNTIME).strip()
-        if not runtime:
-            runtime = DEFAULT_RUNTIME
-
         default_wait_s = _positive_seconds(env, "HUB_DEFAULT_WAIT_S", DEFAULT_WAIT_S)
         max_retries = _non_negative_int(env, "HUB_MAX_RETRIES", DEFAULT_MAX_RETRIES)
         backoff_factor_s = _positive_seconds(env, "HUB_BACKOFF_FACTOR_S", DEFAULT_BACKOFF_FACTOR_S)
@@ -85,7 +81,7 @@ class WorkerSettings:
             hub_url=hub_url,
             token=token,
             agent_name=agent_name,
-            runtime=runtime,
+            profile=profile_from_env(env),
             default_wait_s=default_wait_s,
             max_retries=max_retries,
             backoff_factor_s=backoff_factor_s,

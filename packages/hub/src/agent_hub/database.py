@@ -8,9 +8,16 @@ from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 
-from agent_hub_common import AgentStatus, EventKind, TaskState, WorkflowStatus
+from agent_hub_common import (
+    UNKNOWN,
+    AgentStatus,
+    EventKind,
+    ModelSource,
+    TaskState,
+    WorkflowStatus,
+)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class DatabaseVersionError(RuntimeError):
@@ -20,6 +27,20 @@ class DatabaseVersionError(RuntimeError):
 def _sql_values(enum_type: type[StrEnum]) -> str:
     # Values come only from closed application enums, never from runtime input.
     return ", ".join(f"'{item.value}'" for item in enum_type)
+
+
+# The worker identity profile (spec §3). Declared once so a fresh schema and a
+# migrated one get identical columns.
+PROFILE_COLUMNS = {
+    "harness": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'",
+    "harness_version": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'",
+    "provider": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'",
+    "model": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'",
+    "model_source": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'"
+    f" CHECK (model_source IN ({_sql_values(ModelSource)}))",
+    "workspace_id": "TEXT",
+}
+_PROFILE_SQL = "".join(f"\n    {name} {spec}," for name, spec in PROFILE_COLUMNS.items())
 
 
 SCHEMA = f"""
@@ -37,8 +58,7 @@ CREATE TABLE IF NOT EXISTS agent (
     status TEXT NOT NULL CHECK (status IN ({_sql_values(AgentStatus)})),
     context_id TEXT UNIQUE,
     last_seen TEXT NOT NULL,
-    current_task_id TEXT,
-    runtime TEXT,
+    current_task_id TEXT,{_PROFILE_SQL}
     FOREIGN KEY (current_task_id) REFERENCES task(id) ON DELETE SET NULL
 );
 
@@ -114,19 +134,38 @@ def initialize_database(path: Path) -> None:
             connection.executescript(SCHEMA)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
-        if current_version == 1:
-            columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(agent)").fetchall()
-            }
-            if "runtime" not in columns:
-                connection.execute("ALTER TABLE agent ADD COLUMN runtime TEXT")
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            return
-        raise DatabaseVersionError(
-            f"database schema version {current_version} is incompatible with "
-            f"expected version {SCHEMA_VERSION}"
+        if current_version > SCHEMA_VERSION:
+            raise DatabaseVersionError(
+                f"database schema version {current_version} is incompatible with "
+                f"expected version {SCHEMA_VERSION}"
+            )
+        # Each step inspects the table rather than trusting the version number,
+        # so it is safe to re-run and the Step 4A changes compose into the one
+        # migration §7 calls for.
+        _migrate_agent_profile(connection)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_agent_profile(connection: sqlite3.Connection) -> None:
+    """Replace the v2 `runtime` column with the identity profile (#26).
+
+    A recorded runtime was the harness name, so it carries over as `harness`;
+    everything the old schema never captured is `unknown`.
+    """
+
+    columns = _columns(connection, "agent")
+    for name, spec in PROFILE_COLUMNS.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE agent ADD COLUMN {name} {spec}")
+    if "runtime" in columns:
+        connection.execute(
+            "UPDATE agent SET harness = trim(runtime) WHERE trim(coalesce(runtime, '')) != ''"
         )
+        connection.execute("ALTER TABLE agent DROP COLUMN runtime")
 
 
 @contextmanager

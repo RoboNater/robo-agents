@@ -20,9 +20,12 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from agent_hub_common import (
+    UNKNOWN,
+    AgentProfile,
     AgentStatus,
     EventKind,
     MetaKeys,
+    ModelSource,
     TaskState,
     WorkflowStatus,
     to_iso,
@@ -35,6 +38,7 @@ from .signals import EVENT_KEY, Signals, context_key, task_key
 
 DEFAULT_GOAL = "Drive the assigned GitHub issue to a merged pull request."
 DEFAULT_LEASE_MIN = 30.0
+DEFAULT_PROFILE = AgentProfile()
 LOST_REASON = "lost"
 
 TERMINAL_STATES = (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED)
@@ -63,7 +67,13 @@ class AgentRecord:
     context_id: str
     last_seen: str
     current_task_id: str | None
-    runtime: str | None = None
+    # The identity profile (§3), flat so `get_state` shows it per agent.
+    harness: str = UNKNOWN
+    harness_version: str = UNKNOWN
+    provider: str = UNKNOWN
+    model: str = UNKNOWN
+    model_source: ModelSource = ModelSource.UNKNOWN
+    workspace_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,8 +133,27 @@ def _agent(row: Row) -> AgentRecord:
         context_id=row["context_id"],
         last_seen=row["last_seen"],
         current_task_id=row["current_task_id"],
-        runtime=row["runtime"],
+        harness=row["harness"],
+        harness_version=row["harness_version"],
+        provider=row["provider"],
+        model=row["model"],
+        model_source=ModelSource(row["model_source"]),
+        workspace_id=row["workspace_id"],
     )
+
+
+def _profile_fields(profile: AgentProfile) -> dict[str, Any]:
+    """The profile as an event payload: what Alice pairs workers on (§5)."""
+
+    return {
+        "harness": profile.harness,
+        "harness_version": profile.harness_version,
+        "provider": profile.provider,
+        "model": profile.model,
+        "model_source": profile.model_source.value,
+        "capabilities": list(profile.capabilities),
+        "workspace_id": profile.workspace_id,
+    }
 
 
 def _task(row: Row) -> TaskRecord:
@@ -147,7 +176,6 @@ _LEGACY_KEY_MAP: dict[str, str] = {
     "kind": MetaKeys.KIND.value,
     "agent": MetaKeys.AGENT.value,
     "capabilities": MetaKeys.CAPABILITIES.value,
-    "runtime": MetaKeys.RUNTIME.value,
     "status": MetaKeys.STATUS.value,
     "timeout": MetaKeys.TIMEOUT.value,
     "timeout_s": MetaKeys.TIMEOUT_S.value,
@@ -323,31 +351,33 @@ class HubStore:
 
     # -- agents -------------------------------------------------------------
 
-    def check_in(
-        self,
-        name: str,
-        capabilities: Sequence[str],
-        runtime: str | None = None,
-    ) -> AgentRecord:
-        """Register a worker, or re-admit a returning one on its own context."""
+    def check_in(self, name: str, profile: AgentProfile = DEFAULT_PROFILE) -> AgentRecord:
+        """Register a worker, or re-admit a returning one on its own context.
+
+        The profile replaces whatever was recorded before, field by field: a
+        returning worker may be a different harness or model under the same
+        name, and a stale value would mislead role selection.
+        """
 
         now = utcnow_iso()
+        profile_values = (
+            json.dumps(list(profile.capabilities)),
+            profile.harness,
+            profile.harness_version,
+            profile.provider,
+            profile.model,
+            profile.model_source.value,
+            profile.workspace_id,
+        )
         with database(self.path) as connection:
             row = connection.execute("SELECT * FROM agent WHERE name = ?", (name,)).fetchone()
             if row is None:
                 context_id = uuid4().hex
                 connection.execute(
-                    "INSERT INTO agent "
-                    "(name, capabilities_json, status, context_id, last_seen, runtime)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        name,
-                        json.dumps(list(capabilities)),
-                        AgentStatus.IDLE.value,
-                        context_id,
-                        now,
-                        runtime,
-                    ),
+                    "INSERT INTO agent (name, status, context_id, last_seen, capabilities_json,"
+                    " harness, harness_version, provider, model, model_source, workspace_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (name, AgentStatus.IDLE.value, context_id, now, *profile_values),
                 )
             else:
                 # A returning worker keeps its context id so Alice reads one
@@ -355,37 +385,36 @@ class HubStore:
                 context_id = row["context_id"]
                 current = self._open_task_id(connection, row["current_task_id"])
                 connection.execute(
-                    "UPDATE agent SET capabilities_json = ?, status = ?, last_seen = ?,"
-                    " current_task_id = ?, runtime = coalesce(?, runtime) WHERE name = ?",
+                    "UPDATE agent SET status = ?, last_seen = ?, current_task_id = ?,"
+                    " capabilities_json = ?, harness = ?, harness_version = ?, provider = ?,"
+                    " model = ?, model_source = ?, workspace_id = ? WHERE name = ?",
                     (
-                        json.dumps(list(capabilities)),
                         _readmitted(AgentStatus(row["status"]), current).value,
                         now,
                         current,
-                        runtime,
+                        *profile_values,
                         name,
                     ),
                 )
-            check_in_meta: dict[str, Any] = {MetaKeys.KIND: "check_in"}
-            if runtime is not None:
-                check_in_meta[MetaKeys.RUNTIME] = runtime
+            profile_payload = _profile_fields(profile)
             self._add_message(
                 connection,
                 task_id=None,
                 context_id=context_id,
                 sender=name,
                 direction="to_alice",
-                parts=[text_part("READY", metadata=check_in_meta)],
+                parts=[
+                    text_part(
+                        "READY",
+                        metadata={MetaKeys.KIND: "check_in"}
+                        | {f"hub.{key}": value for key, value in profile_payload.items()},
+                    )
+                ],
             )
             self._add_event(
                 connection,
                 EventKind.AGENT_CHECKED_IN,
-                {
-                    "agent": name,
-                    "capabilities": list(capabilities),
-                    "runtime": runtime,
-                    "context_id": context_id,
-                },
+                {"agent": name} | profile_payload | {"context_id": context_id},
             )
             agent = self._require_agent(connection, name)
         self.signals.notify(EVENT_KEY)

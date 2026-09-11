@@ -44,7 +44,7 @@ from a2a.types import (
 )
 from a2a.types import Message as A2AMessage
 from a2a.types import TaskState as A2ATaskState
-from agent_hub_common import HubSettings, MetaKeys, TaskState
+from agent_hub_common import UNKNOWN, AgentProfile, HubSettings, MetaKeys, ModelSource, TaskState
 from fastapi import Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -137,6 +137,52 @@ def _string_list(value: Any, field: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise _invalid(f"metadata.{field} must be a list of strings")
     return [str(item) for item in value]
+
+
+def _profile_text(metadata: Mapping[str, Any], key: MetaKeys) -> str | None:
+    """Read one self-reported profile string; absent, blank or `unknown` is None."""
+
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _invalid(f"metadata.{key} must be a string")
+    text = value.strip()
+    return None if text in ("", UNKNOWN) else text
+
+
+def _profile(metadata: Mapping[str, Any]) -> AgentProfile:
+    """Read the identity profile a check-in carries (§4.3).
+
+    Whatever the worker does not report is recorded as `unknown`. A model with
+    no stated source is refused rather than assigned one, and a source with no
+    model is dropped, so `model_source` always describes the recorded model.
+    """
+
+    model = _profile_text(metadata, MetaKeys.MODEL)
+    raw_source = _profile_text(metadata, MetaKeys.MODEL_SOURCE) or UNKNOWN
+    try:
+        source = ModelSource(raw_source)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in ModelSource)
+        raise _invalid(f"metadata.{MetaKeys.MODEL_SOURCE} must be one of {allowed}") from exc
+    if model is None:
+        source = ModelSource.UNKNOWN
+    elif source is ModelSource.UNKNOWN:
+        raise _invalid(
+            f"metadata.{MetaKeys.MODEL} needs metadata.{MetaKeys.MODEL_SOURCE} "
+            f"({ModelSource.ENV.value} or {ModelSource.DECLARED.value})"
+        )
+    capabilities = _string_list(metadata.get(MetaKeys.CAPABILITIES), MetaKeys.CAPABILITIES)
+    return AgentProfile(
+        harness=_profile_text(metadata, MetaKeys.HARNESS) or UNKNOWN,
+        harness_version=_profile_text(metadata, MetaKeys.HARNESS_VERSION) or UNKNOWN,
+        provider=_profile_text(metadata, MetaKeys.PROVIDER) or UNKNOWN,
+        model=model or UNKNOWN,
+        model_source=source,
+        capabilities=tuple(dict.fromkeys(item.strip() for item in capabilities if item.strip())),
+        workspace_id=_profile_text(metadata, MetaKeys.WORKSPACE_ID),
+    )
 
 
 def _agent_message(
@@ -303,12 +349,7 @@ class A2AProtocol:
         name = metadata.get(MetaKeys.AGENT)
         if not isinstance(name, str) or not name.strip():
             raise _invalid(f"check-in requires metadata.{MetaKeys.AGENT}")
-        runtime = metadata.get(MetaKeys.RUNTIME)
-        agent = self.store.check_in(
-            name.strip(),
-            _string_list(metadata.get(MetaKeys.CAPABILITIES), MetaKeys.CAPABILITIES),
-            runtime=str(runtime) if isinstance(runtime, str) else None,
-        )
+        agent = self.store.check_in(name.strip(), _profile(metadata))
         return _agent_message(
             "REGISTERED",
             context_id=agent.context_id,

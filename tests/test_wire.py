@@ -16,7 +16,7 @@ from a2a.types import (
 from agent_hub.database import initialize_database
 from agent_hub.protocol import A2AProtocol
 from agent_hub.store import HubStore
-from agent_hub_common import HubSettings, MetaKeys
+from agent_hub_common import AgentProfile, HubSettings, MetaKeys
 
 WIRE_DIR = Path(__file__).parent / "wire"
 
@@ -176,6 +176,11 @@ async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
     assert resp_data["result"]["metadata"][MetaKeys.AGENT] == "bob"
     assert resp_data["result"]["metadata"][MetaKeys.KIND] == "check_in_ack"
     assert resp_data["result"]["metadata"][MetaKeys.STATUS] == "idle"
+    bob = store.agent_by_name("bob")
+    assert bob is not None
+    assert (bob.harness, bob.harness_version) == ("claude-code", "2.1.268")
+    assert bob.provider == "anthropic"
+    assert (bob.model, bob.model_source, bob.capabilities) == ("claude-opus-5", "env", ["python"])
 
     # Assign task so tasks/get and tasks/cancel work
     task = store.assign_task("bob", "implementer", "Fix #1", "Fix issue #1")
@@ -229,7 +234,7 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
     store = HubStore(db_path)
     protocol = A2AProtocol(store, settings)
 
-    store.check_in("bob", ["python"], runtime="claude-code")
+    store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
     task = store.assign_task("bob", "implementer", "Fix issue #22", "Do the work")
     store.record_progress(task.id, "bob", "working on fix")
     q_id = store.open_question(task.id, "bob", "Which approach?", sent_as="q-001")
