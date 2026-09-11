@@ -24,6 +24,7 @@ from agent_hub_common import (
     AgentProfile,
     AgentStatus,
     EventKind,
+    EventState,
     ImplementerOutcome,
     ImplementerResult,
     MetaKeys,
@@ -40,6 +41,7 @@ from agent_hub_common import (
 from .database import database
 from .signals import EVENT_KEY, Signals, context_key, task_key
 
+DEFAULT_EVENT_LEASE_S = 600.0
 DEFAULT_GOAL = "Drive the assigned GitHub issue to a merged pull request."
 DEFAULT_LEASE_MIN = 30.0
 DEFAULT_MAX_TASK_LEASE_MIN = 120.0
@@ -125,6 +127,12 @@ class EventRecord:
     kind: EventKind
     payload: dict[str, Any]
     ts: str
+    state: EventState = EventState.QUEUED
+    delivery_id: str | None = None
+    delivery_attempts: int = 0
+    delivered_at: str | None = None
+    delivery_expires: str | None = None
+    acked_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,11 +266,18 @@ def _message(row: Row) -> MessageRecord:
 
 
 def _event(row: Row) -> EventRecord:
+    keys = row.keys()
     return EventRecord(
         id=row["id"],
         kind=EventKind(row["kind"]),
         payload=_json_object(row["payload_json"]) or {},
         ts=row["ts"],
+        state=EventState(row["state"]) if "state" in keys else EventState.QUEUED,
+        delivery_id=row["delivery_id"] if "delivery_id" in keys else None,
+        delivery_attempts=row["delivery_attempts"] if "delivery_attempts" in keys else 0,
+        delivered_at=row["delivered_at"] if "delivered_at" in keys else None,
+        delivery_expires=row["delivery_expires"] if "delivery_expires" in keys else None,
+        acked_at=row["acked_at"] if "acked_at" in keys else None,
     )
 
 
@@ -282,6 +297,7 @@ class HubStore:
     path: Path
     signals: Signals = field(default_factory=Signals)
     clock: Callable[[], datetime] = utcnow
+    default_event_lease_s: float = DEFAULT_EVENT_LEASE_S
 
     def _now(self) -> datetime:
         return self.clock()
@@ -339,12 +355,36 @@ class HubStore:
                 summary["heartbeat_age_s"] = _age_seconds(summary["last_heartbeat"], now)
                 summary["progress_age_s"] = _age_seconds(summary["last_progress_at"], now)
                 agents.append(summary)
-        return {"workflow": workflow, "agents": agents, "tasks": tasks}
+            queued_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS n FROM event WHERE state = 'queued'"
+                ).fetchone()["n"]
+            )
+            unacked_rows = connection.execute(
+                "SELECT * FROM event WHERE state = 'delivered' ORDER BY id ASC"
+            ).fetchall()
+            unacked_delivered = [asdict(_event(r)) for r in unacked_rows]
+        return {
+            "workflow": workflow,
+            "agents": agents,
+            "tasks": tasks,
+            "queued_events": queued_count,
+            "unacked_delivered": unacked_delivered,
+            "events": {
+                "queued": queued_count,
+                "delivered": unacked_delivered,
+            },
+        }
 
     def set_workflow_status(self, status: WorkflowStatus, summary: str) -> None:
         """Persist status and its explanation atomically in the audit log."""
         with database(self.path) as connection:
             workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            row = connection.execute(
+                "SELECT status FROM workflow WHERE id = ?", (workflow_id,)
+            ).fetchone()
+            if row is not None and row["status"] == status.value:
+                return
             connection.execute(
                 "UPDATE workflow SET status = ? WHERE id = ?", (status.value, workflow_id)
             )
@@ -353,11 +393,19 @@ class HubStore:
                 (self._now_iso(), summary, f"Workflow status set to {status.value}"),
             )
 
-    def log_decision(self, summary: str, rationale: str) -> int:
+    def log_decision(
+        self, summary: str, rationale: str, key: str | None = None
+    ) -> int:
         with database(self.path) as connection:
+            if key is not None:
+                row = connection.execute(
+                    "SELECT id FROM decision WHERE key = ?", (key,)
+                ).fetchone()
+                if row is not None:
+                    return int(row["id"])
             cursor = connection.execute(
-                "INSERT INTO decision (ts, summary, rationale) VALUES (?, ?, ?)",
-                (self._now_iso(), summary, rationale),
+                "INSERT INTO decision (ts, summary, rationale, key) VALUES (?, ?, ?, ?)",
+                (self._now_iso(), summary, rationale, key),
             )
             return int(cursor.lastrowid or 0)
 
@@ -621,6 +669,8 @@ class HubStore:
 
         with database(self.path) as connection:
             agent = self._require_agent(connection, name)
+            if agent.status == AgentStatus.RELEASED:
+                return agent
             connection.execute(
                 "UPDATE agent SET status = ? WHERE name = ?",
                 (AgentStatus.RELEASED.value, name),
@@ -875,7 +925,9 @@ class HubStore:
         """Answer a worker question and put the task back to `working`."""
 
         with database(self.path) as connection:
-            task = self._require_open_task(connection, task_id)
+            task = self._require_task(connection, task_id)
+            if task.state != TaskState.INPUT_REQUIRED:
+                return
             context_id = self._task_context_id(connection, task)
             self._add_message(
                 connection,
@@ -1173,7 +1225,7 @@ class HubStore:
         self, connection: Connection, kind: EventKind, payload: Mapping[str, Any]
     ) -> int:
         cursor = connection.execute(
-            "INSERT INTO event (kind, payload_json, ts) VALUES (?, ?, ?)",
+            "INSERT INTO event (kind, payload_json, state, ts) VALUES (?, ?, 'queued', ?)",
             (kind.value, json.dumps(dict(payload)), self._now_iso()),
         )
         return int(cursor.lastrowid or 0)
@@ -1188,22 +1240,73 @@ class HubStore:
         self.signals.notify(EVENT_KEY)
         return event
 
-    def next_event(self) -> EventRecord | None:
-        """Consume the oldest unconsumed event, if any."""
+    def ack_event(self, delivery_id: str | None) -> bool:
+        """Acknowledge an active event delivery. Wrong or expired delivery_id is ignored."""
 
+        if not delivery_id:
+            return False
+        now = self._now_iso()
+        with database(self.path) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE event
+                SET state = 'acked',
+                    acked_at = ?
+                WHERE delivery_id = ?
+                  AND state = 'delivered'
+                  AND delivery_expires > ?
+                """,
+                (now, delivery_id, now),
+            )
+            return cursor.rowcount > 0
+
+    def lease_next_event(self, lease_s: float | None = None) -> EventRecord | None:
+        """Lease the oldest queued or expired-delivered event, returning it with delivery_id."""
+
+        effective_lease_s = self.default_event_lease_s if lease_s is None else lease_s
+        now_moment = self._now()
+        now = to_iso(now_moment)
+        expires = to_iso(now_moment + timedelta(seconds=effective_lease_s))
+        delivery_id = uuid4().hex
         with database(self.path) as connection:
             row = connection.execute(
-                "SELECT * FROM event WHERE consumed = 0 ORDER BY id LIMIT 1"
+                """
+                SELECT * FROM event
+                WHERE state = 'queued'
+                   OR (state = 'delivered' AND delivery_expires <= ?)
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (now,),
             ).fetchone()
             if row is None:
                 return None
-            connection.execute("UPDATE event SET consumed = 1 WHERE id = ?", (row["id"],))
-        return _event(row)
+            connection.execute(
+                """
+                UPDATE event
+                SET state = 'delivered',
+                    delivery_id = ?,
+                    delivery_attempts = delivery_attempts + 1,
+                    delivered_at = ?,
+                    delivery_expires = ?
+                WHERE id = ?
+                """,
+                (delivery_id, now, expires, row["id"]),
+            )
+            updated_row = connection.execute(
+                "SELECT * FROM event WHERE id = ?", (row["id"],)
+            ).fetchone()
+            return _event(updated_row)
+
+    def next_event(self, lease_s: float | None = None) -> EventRecord | None:
+        """Lease the oldest eligible event, if any."""
+
+        return self.lease_next_event(lease_s)
 
     def pending_events(self) -> int:
         with database(self.path) as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS n FROM event WHERE consumed = 0"
+                "SELECT COUNT(*) AS n FROM event WHERE state = 'queued'"
             ).fetchone()
         return int(row["n"])
 
@@ -1224,8 +1327,9 @@ class HubStore:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     return None
+                wait_step = min(remaining, 0.2)
                 with suppress(TimeoutError):
-                    await asyncio.wait_for(woken.wait(), remaining)
+                    await asyncio.wait_for(woken.wait(), wait_step)
 
     async def await_assignment(
         self, context_id: str, timeout_s: float
@@ -1266,10 +1370,17 @@ class HubStore:
             timeout_s,
         )
 
-    async def wait_for_event(self, timeout_s: float) -> EventRecord | None:
-        """Hold until Alice's inbox has an event, consuming it."""
+    async def wait_for_event(
+        self,
+        timeout_s: float,
+        ack: str | None = None,
+        lease_s: float | None = None,
+    ) -> EventRecord | None:
+        """Hold until Alice's inbox has an event, leasing it and acking prior delivery."""
 
-        return await self._wait_for(EVENT_KEY, self.next_event, timeout_s)
+        if ack is not None:
+            self.ack_event(ack)
+        return await self._wait_for(EVENT_KEY, lambda: self.lease_next_event(lease_s), timeout_s)
 
     # -- sweeper ------------------------------------------------------------
 

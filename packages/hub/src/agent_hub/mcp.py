@@ -33,9 +33,11 @@ def create_mcp(store: HubStore) -> FastMCP:
         return store.get_state()
 
     @server.tool()
-    async def wait_for_event(timeout_s: Timeout = 120) -> dict[str, Any]:
-        """Wait for and consume the oldest event. On event=null, call again."""
-        event = await store.wait_for_event(timeout_s)
+    async def wait_for_event(
+        timeout_s: Timeout = 120, ack: str | None = None
+    ) -> dict[str, Any]:
+        """Wait for and lease the oldest event. On event=null, call again."""
+        event = await store.wait_for_event(timeout_s=timeout_s, ack=ack)
         return {"event": None if event is None else asdict(event)}
 
     @server.tool()
@@ -70,9 +72,11 @@ def create_mcp(store: HubStore) -> FastMCP:
         return {"ok": True}
 
     @server.tool()
-    async def log_decision(summary: str, rationale: str) -> dict[str, int]:
+    async def log_decision(
+        summary: str, rationale: str, key: str | None = None
+    ) -> dict[str, int]:
         """Append a durable audit entry explaining Alice's decision."""
-        return {"id": store.log_decision(summary, rationale)}
+        return {"id": store.log_decision(summary, rationale, key=key)}
 
     return server
 

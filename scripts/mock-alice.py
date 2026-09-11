@@ -67,6 +67,10 @@ async def _call(
     return _extract_tool_data(result)
 
 
+class AliceCrashError(RuntimeError):
+    """Raised to simulate Alice crashing."""
+
+
 async def drive_one_task_mcp(
     session: ClientSession,
     expected_agent: str,
@@ -75,6 +79,7 @@ async def drive_one_task_mcp(
     instructions: str = "Implement the requested changes and add tests.",
     timeout_s: float = 60.0,
     expected_harness: str | None = None,
+    crash_at: str | None = None,
 ) -> dict[str, Any]:
     """Drive one worker using Alice's MCP tools over stdio."""
     logger.info("Alice (MCP) is ready. Waiting for worker %r to check in...", expected_agent)
@@ -82,6 +87,7 @@ async def drive_one_task_mcp(
     deadline = asyncio.get_running_loop().time() + timeout_s
     agent_name: str | None = None
     checked_in_harness: str | None = None
+    last_delivery_id: str | None = None
 
     while asyncio.get_running_loop().time() < deadline:
         # Check if agent already checked in before or between events
@@ -99,11 +105,22 @@ async def drive_one_task_mcp(
         if agent_name:
             break
 
-        remaining = max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
-        data = await _call(session, "wait_for_event", {"timeout_s": remaining})
+        if crash_at == "before_ack" and last_delivery_id:
+            raise AliceCrashError("Simulated Alice crash before ack")
+
+        wait_args: dict[str, Any] = {
+            "timeout_s": max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
+        }
+        if last_delivery_id:
+            wait_args["ack"] = last_delivery_id
+        data = await _call(session, "wait_for_event", wait_args)
         event = data.get("event") if isinstance(data, dict) else None
         if event is None:
             continue
+
+        last_delivery_id = event.get("delivery_id")
+        if crash_at == "delivery":
+            raise AliceCrashError("Simulated Alice crash at delivery")
 
         if (
             isinstance(event, dict)
@@ -142,17 +159,31 @@ async def drive_one_task_mcp(
         {
             "summary": f"Assigned task {task_id} to {agent_name}",
             "rationale": f"Initial assignment for role {role}",
+            "key": f"assign:{task_id}",
         },
     )
+
+    if crash_at == "after_action":
+        raise AliceCrashError("Simulated Alice crash after action")
 
     task_finished = False
     result_data: dict[str, Any] = {}
 
     while not task_finished and asyncio.get_running_loop().time() < deadline:
-        data = await _call(session, "wait_for_event", {"timeout_s": 5.0})
+        if crash_at == "before_ack" and last_delivery_id:
+            raise AliceCrashError("Simulated Alice crash before ack")
+
+        wait_args = {"timeout_s": 5.0}
+        if last_delivery_id:
+            wait_args["ack"] = last_delivery_id
+        data = await _call(session, "wait_for_event", wait_args)
         event = data.get("event") if isinstance(data, dict) else None
         if not event or not isinstance(event, dict):
             continue
+
+        last_delivery_id = event.get("delivery_id")
+        if crash_at == "delivery":
+            raise AliceCrashError("Simulated Alice crash at delivery")
 
         kind = event.get("kind")
         payload = event.get("payload") or {}
@@ -213,6 +244,7 @@ async def drive_one_task(
     instructions: str = "Implement the requested changes and add tests.",
     timeout_s: float = 60.0,
     expected_harness: str | None = None,
+    crash_at: str | None = None,
 ) -> dict[str, Any]:
     """Drive one worker through the full lifecycle using HubStore directly:
 
@@ -224,6 +256,7 @@ async def drive_one_task(
     deadline = asyncio.get_running_loop().time() + timeout_s
     agent_name: str | None = None
     checked_in_harness: str | None = None
+    last_delivery_id: str | None = None
 
     while asyncio.get_running_loop().time() < deadline:
         # Check if agent already checked in before or between events
@@ -233,10 +266,17 @@ async def drive_one_task(
             checked_in_harness = agent.harness
             break
 
+        if crash_at == "before_ack" and last_delivery_id:
+            raise AliceCrashError("Simulated Alice crash before ack")
+
         remaining = max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
-        event = await store.wait_for_event(timeout_s=remaining)
+        event = await store.wait_for_event(timeout_s=remaining, ack=last_delivery_id)
         if event is None:
             continue
+        last_delivery_id = event.delivery_id
+        if crash_at == "delivery":
+            raise AliceCrashError("Simulated Alice crash at delivery")
+
         matched = (
             event.kind == EventKind.AGENT_CHECKED_IN
             and event.payload.get("agent") == expected_agent
@@ -271,16 +311,27 @@ async def drive_one_task(
     store.log_decision(
         f"Assigned task {task.id} to {agent_name}",
         f"Initial assignment for role {role}",
+        key=f"assign:{task.id}",
     )
+
+    if crash_at == "after_action":
+        raise AliceCrashError("Simulated Alice crash after action")
 
     # 3. Wait for progress / question / completion
     task_finished = False
     result_data: dict[str, Any] = {}
 
     while not task_finished and asyncio.get_running_loop().time() < deadline:
-        event = await store.wait_for_event(timeout_s=5.0)
+        if crash_at == "before_ack" and last_delivery_id:
+            raise AliceCrashError("Simulated Alice crash before ack")
+
+        event = await store.wait_for_event(timeout_s=5.0, ack=last_delivery_id)
         if event is None:
             continue
+        last_delivery_id = event.delivery_id
+        if crash_at == "delivery":
+            raise AliceCrashError("Simulated Alice crash at delivery")
+
         logger.info("Observed event: %s", event.kind)
 
         if event.kind == EventKind.TASK_PROGRESS:
@@ -292,6 +343,8 @@ async def drive_one_task(
             logger.info("Worker asked question on %s: %r", q_task_id, question)
             store.reply(q_task_id, "Approved. Proceed with the proposed design.")
             logger.info("Alice replied to question on %s", q_task_id)
+            if crash_at == "after_action":
+                raise AliceCrashError("Simulated Alice crash after action")
 
         elif event.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
             completed_id = event.payload.get("task_id")
@@ -313,6 +366,8 @@ async def drive_one_task(
                         result_payload.get("pr_url"),
                         result_payload.get("head_sha") or result_payload.get("reviewed_head_sha"),
                     )
+                if crash_at == "after_action":
+                    raise AliceCrashError("Simulated Alice crash after action")
 
     if not task_finished:
         raise TimeoutError(f"Task {task.id} did not finish within {timeout_s}s")
@@ -358,6 +413,12 @@ def main() -> None:
     )
     parser.add_argument("--timeout", type=float, default=60.0, help="Hold timeout in seconds")
     parser.add_argument(
+        "--crash-at",
+        choices=["delivery", "after_action", "before_ack"],
+        default=None,
+        help="Simulate crash point for Alice",
+    )
+    parser.add_argument(
         "--mcp",
         action="store_true",
         help="Drive Alice over MCP stdio by launching the hub server process",
@@ -391,6 +452,7 @@ def main() -> None:
                         role=args.role,
                         timeout_s=args.timeout,
                         expected_harness=args.harness,
+                        crash_at=args.crash_at,
                     )
 
             result = asyncio.run(run_mcp_session())
@@ -405,6 +467,7 @@ def main() -> None:
                     role=args.role,
                     timeout_s=args.timeout,
                     expected_harness=args.harness,
+                    crash_at=args.crash_at,
                 )
             )
         print(f"SUCCESS: {result}")

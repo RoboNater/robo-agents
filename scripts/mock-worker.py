@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from agent_hub_common import (
@@ -42,6 +43,8 @@ async def run_worker(
     ask_question: str | None = None,
     fail: bool = False,
     timeout_s: float = 60.0,
+    crash_alice: str | None = None,
+    crash_hook: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Execute the full worker coordination lifecycle:
 
@@ -56,6 +59,10 @@ async def run_worker(
         )
         checkin_res = await client.check_in(["python", "testing"])
         logger.info("Checked in successfully: context_id=%s", checkin_res.get("context_id"))
+        if crash_hook:
+            crash_hook("after_check_in")
+        if crash_alice and crash_hook:
+            crash_hook(crash_alice)
 
         logger.info("Waiting for task assignment (timeout=%.1fs)...", timeout_s)
         assignment = await client.await_assignment(timeout_s=timeout_s)
@@ -121,6 +128,8 @@ async def run_worker(
         logger.info("Submitting typed result: %s", type(result).__name__)
         submit_res = await client.submit_result(task_id, result)
         logger.info("Result submitted: status=%s", submit_res.get("status"))
+        if crash_hook:
+            crash_hook("after_result")
 
         logger.info("Awaiting final release from Alice...")
         release_res = await client.await_assignment(timeout_s=timeout_s)
@@ -155,6 +164,12 @@ def main() -> None:
         default=60.0,
         help="Timeout in seconds waiting for assignments",
     )
+    parser.add_argument(
+        "--crash-alice",
+        choices=["delivery", "after_action", "before_ack"],
+        default=None,
+        help="Crash Alice injection hook point",
+    )
     args = parser.parse_args()
 
     settings = WorkerSettings(
@@ -172,6 +187,7 @@ def main() -> None:
                 ask_question=args.ask,
                 fail=args.fail,
                 timeout_s=args.timeout,
+                crash_alice=args.crash_alice,
             )
         )
     except KeyboardInterrupt:

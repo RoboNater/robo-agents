@@ -12,12 +12,13 @@ from agent_hub_common import (
     UNKNOWN,
     AgentStatus,
     EventKind,
+    EventState,
     ModelSource,
     TaskState,
     WorkflowStatus,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class DatabaseVersionError(RuntimeError):
@@ -97,7 +98,12 @@ CREATE TABLE IF NOT EXISTS event (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK (kind IN ({_sql_values(EventKind)})),
     payload_json TEXT NOT NULL,
-    consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0, 1)),
+    state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ({_sql_values(EventState)})),
+    delivery_id TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at TEXT,
+    delivery_expires TEXT,
+    acked_at TEXT,
     ts TEXT NOT NULL
 );
 
@@ -105,7 +111,8 @@ CREATE TABLE IF NOT EXISTS decision (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
     summary TEXT NOT NULL,
-    rationale TEXT NOT NULL
+    rationale TEXT NOT NULL,
+    key TEXT UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS operation (
@@ -120,7 +127,9 @@ CREATE TABLE IF NOT EXISTS operation (
 CREATE INDEX IF NOT EXISTS idx_task_workflow_state ON task(workflow_id, state);
 CREATE INDEX IF NOT EXISTS idx_task_assignee ON task(assignee);
 CREATE INDEX IF NOT EXISTS idx_message_context_ts ON message(context_id, ts);
-CREATE INDEX IF NOT EXISTS idx_event_inbox ON event(consumed, id);
+CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id);
+CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_key ON decision(key) WHERE key IS NOT NULL;
 """
 
 
@@ -158,6 +167,8 @@ def initialize_database(path: Path) -> None:
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
         _migrate_worker_heartbeat(connection)
+        _migrate_event_delivery(connection)
+        _migrate_decision_key(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -232,6 +243,51 @@ def _migrate_worker_heartbeat(connection: sqlite3.Connection) -> None:
               AND julianday(lease_expires) IS NOT NULL
               AND julianday(created) IS NOT NULL
         """)
+
+
+def _migrate_event_delivery(connection: sqlite3.Connection) -> None:
+    """Migrate event table from consumed flag (v1-v5) to durable delivery leasing (v6)."""
+
+    columns = _columns(connection, "event")
+    if "state" not in columns:
+        connection.execute(
+            f"ALTER TABLE event ADD COLUMN state TEXT NOT NULL DEFAULT 'queued'"
+            f" CHECK (state IN ({_sql_values(EventState)}))"
+        )
+    if "delivery_id" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN delivery_id TEXT")
+    if "delivery_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE event ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    if "delivered_at" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN delivered_at TEXT")
+    if "delivery_expires" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN delivery_expires TEXT")
+    if "acked_at" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN acked_at TEXT")
+
+    if "consumed" in columns:
+        connection.execute(
+            "UPDATE event SET state = 'acked', acked_at = ts, delivery_attempts = 1 "
+            "WHERE consumed = 1"
+        )
+        connection.execute("ALTER TABLE event DROP COLUMN consumed")
+
+    connection.execute("DROP INDEX IF EXISTS idx_event_inbox")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id)")
+
+
+def _migrate_decision_key(connection: sqlite3.Connection) -> None:
+    """Add decision deduplication key column for schema v6."""
+
+    columns = _columns(connection, "decision")
+    if "key" not in columns:
+        connection.execute("ALTER TABLE decision ADD COLUMN key TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_key ON decision(key) WHERE key IS NOT NULL"
+    )
 
 
 @contextmanager
