@@ -22,6 +22,7 @@ DEFAULT_WAIT_S = 120.0
 MAX_WAIT_FACTOR = 2.5
 DEFAULT_LOST_AFTER_S = 180.0
 DEFAULT_SWEEP_INTERVAL_S = 10.0
+DEFAULT_EVENT_LEASE_S = 600.0
 
 
 _HostAddress = ipaddress.IPv4Address | ipaddress.IPv6Address | None
@@ -170,6 +171,7 @@ class HubSettings:
     # Liveness comes from worker-mcp's timer, independently of LLM tool calls.
     lost_after_s: float = DEFAULT_LOST_AFTER_S
     sweep_interval_s: float = 10.0
+    event_lease_s: float = DEFAULT_EVENT_LEASE_S
 
     def bounded_wait(self, requested: float | None) -> float:
         """Clamp a caller-requested hold to the configured ceiling."""
@@ -257,5 +259,8 @@ class HubSettings:
             lost_after_s=_positive_seconds(env, "HUB_LOST_AFTER_S", DEFAULT_LOST_AFTER_S),
             sweep_interval_s=_positive_seconds(
                 env, "HUB_SWEEP_INTERVAL_S", DEFAULT_SWEEP_INTERVAL_S
+            ),
+            event_lease_s=_positive_seconds(
+                env, "HUB_EVENT_LEASE_S", DEFAULT_EVENT_LEASE_S
             ),
         )

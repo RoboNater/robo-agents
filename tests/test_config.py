@@ -25,6 +25,7 @@ def test_settings_have_local_defaults(tmp_path: Path) -> None:
     # Guides are checkout content, not state: the default is the repository's
     # own top-level guides/ directory (§6).
     assert settings.guides_dir == Path(__file__).resolve().parents[1] / "guides"
+    assert settings.event_lease_s == 600.0
 
 
 def test_state_paths_ignore_the_working_directory(
@@ -257,3 +258,11 @@ def test_profile_accepts_the_step_4_runtime_name_for_the_harness() -> None:
 
 def test_a_model_named_unknown_has_no_source() -> None:
     assert profile_from_env({"HUB_MODEL": UNKNOWN}).model_source is ModelSource.UNKNOWN
+
+
+def test_custom_event_lease_seconds(tmp_path: Path) -> None:
+    settings = HubSettings.from_env({
+        "XDG_STATE_HOME": str(tmp_path),
+        "HUB_EVENT_LEASE_S": "300",
+    })
+    assert settings.event_lease_s == 300.0
