@@ -2,7 +2,15 @@ import socket
 from pathlib import Path
 
 import pytest
-from agent_hub_common import ConfigurationError, HubSettings, config
+from agent_hub_common import (
+    UNKNOWN,
+    AgentProfile,
+    ConfigurationError,
+    HubSettings,
+    ModelSource,
+    config,
+    profile_from_env,
+)
 
 
 def test_settings_have_local_defaults(tmp_path: Path) -> None:
@@ -207,3 +215,50 @@ def test_guides_fall_back_to_the_state_directory_outside_a_checkout(
     settings = HubSettings.from_env({"HUB_STATE_DIR": str(tmp_path / "state")})
 
     assert settings.guides_dir == tmp_path / "state/guides"
+
+
+def test_profile_reads_the_launcher_environment() -> None:
+    profile = profile_from_env(
+        {
+            "HUB_HARNESS": " claude-code ",
+            "HUB_HARNESS_VERSION": "2.1.268",
+            "HUB_PROVIDER": "anthropic",
+            "HUB_MODEL": "claude-opus-5",
+            "HUB_CAPABILITIES": "python,gh, python ,",
+        }
+    )
+
+    assert profile == AgentProfile(
+        harness="claude-code",
+        harness_version="2.1.268",
+        provider="anthropic",
+        model="claude-opus-5",
+        model_source=ModelSource.ENV,
+        capabilities=("python", "gh"),
+    )
+
+
+@pytest.mark.parametrize(
+    "env", [{}, {"HUB_HARNESS": " ", "HUB_MODEL": "", "HUB_CAPABILITIES": ","}]
+)
+def test_profile_fields_left_unset_are_unknown(env: dict[str, str]) -> None:
+    profile = profile_from_env(env)
+
+    assert profile == AgentProfile()
+    assert (profile.harness, profile.harness_version, profile.provider, profile.model) == (
+        UNKNOWN,
+        UNKNOWN,
+        UNKNOWN,
+        UNKNOWN,
+    )
+    assert profile.model_source is ModelSource.UNKNOWN
+    assert profile.capabilities == ()
+
+
+def test_profile_accepts_the_step_4_runtime_name_for_the_harness() -> None:
+    assert profile_from_env({"AGENT_RUNTIME": "codex"}).harness == "codex"
+    assert profile_from_env({"AGENT_RUNTIME": "codex", "HUB_HARNESS": "gemini"}).harness == "gemini"
+
+
+def test_a_model_named_unknown_has_no_source() -> None:
+    assert profile_from_env({"HUB_MODEL": UNKNOWN}).model_source is ModelSource.UNKNOWN

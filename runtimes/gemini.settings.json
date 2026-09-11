@@ -12,7 +12,11 @@
         "HUB_URL": "http://alice-host:8420",
         "HUB_TOKEN": "...",
         "AGENT_NAME": "charlie",
-        "AGENT_RUNTIME": "gemini"
+        "HUB_HARNESS": "gemini",
+        "HUB_HARNESS_VERSION": "",
+        "HUB_PROVIDER": "google",
+        "HUB_MODEL": "",
+        "HUB_CAPABILITIES": ""
       }
     }
   }

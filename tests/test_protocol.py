@@ -4,7 +4,7 @@ from typing import Any
 import httpx
 import pytest
 from agent_hub.store import HubStore
-from agent_hub_common import EventKind, MetaKeys, TaskState
+from agent_hub_common import UNKNOWN, EventKind, MetaKeys, ModelSource, TaskState
 from conftest import check_in, message, rpc, sse_results
 
 
@@ -79,6 +79,91 @@ async def test_check_in_needs_the_agent_name(client: httpx.AsyncClient) -> None:
 
     assert body["error"]["code"] == -32602
     assert "agent" in body["error"]["message"].lower()
+
+
+async def test_check_in_records_the_reported_profile(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "READY",
+            metadata={
+                MetaKeys.AGENT: "charlie",
+                MetaKeys.CAPABILITIES: ["python", " gh ", "python", ""],
+                MetaKeys.HARNESS: "codex",
+                MetaKeys.HARNESS_VERSION: "0.154.0",
+                MetaKeys.PROVIDER: " openai ",
+                MetaKeys.MODEL: "example-codex-model",
+                MetaKeys.MODEL_SOURCE: "declared",
+                MetaKeys.WORKSPACE_ID: "ws-charlie",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-proto-profile-1",
+            },
+        ),
+    )
+
+    assert "error" not in body
+    agent = hub_store.agent_by_name("charlie")
+    assert agent is not None
+    assert agent.capabilities == ["python", "gh"]
+    assert (agent.harness, agent.harness_version, agent.provider) == ("codex", "0.154.0", "openai")
+    assert (agent.model, agent.model_source) == ("example-codex-model", ModelSource.DECLARED)
+    assert agent.workspace_id == "ws-charlie"
+
+
+async def test_a_check_in_without_a_profile_records_unknown(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    # A source with no model describes nothing, so it is dropped too.
+    metadata: dict[str, Any] = {
+        MetaKeys.AGENT: "bob",
+        MetaKeys.HARNESS: "",
+        MetaKeys.MODEL_SOURCE: "env",
+        MetaKeys.SCHEMA_VERSION: 1,
+        MetaKeys.OPERATION_ID: "op-proto-profile-unknown",
+    }
+    body = await post(client, "message/send", message("READY", metadata=metadata))
+
+    assert "error" not in body
+    agent = hub_store.agent_by_name("bob")
+    assert agent is not None
+    assert (agent.harness, agent.harness_version, agent.provider, agent.model) == (
+        UNKNOWN,
+        UNKNOWN,
+        UNKNOWN,
+        UNKNOWN,
+    )
+    assert agent.model_source is ModelSource.UNKNOWN
+    assert agent.capabilities == []
+    assert agent.workspace_id is None
+
+
+@pytest.mark.parametrize(
+    ("profile", "complaint"),
+    [
+        ({MetaKeys.HARNESS: ["codex"]}, MetaKeys.HARNESS),
+        ({MetaKeys.MODEL: "m"}, MetaKeys.MODEL_SOURCE),
+        ({MetaKeys.MODEL: "m", MetaKeys.MODEL_SOURCE: "unknown"}, MetaKeys.MODEL_SOURCE),
+        ({MetaKeys.MODEL: "m", MetaKeys.MODEL_SOURCE: "guessed"}, MetaKeys.MODEL_SOURCE),
+        ({MetaKeys.CAPABILITIES: "python"}, MetaKeys.CAPABILITIES),
+    ],
+)
+async def test_a_malformed_profile_is_refused(
+    client: httpx.AsyncClient, hub_store: HubStore, profile: dict[str, Any], complaint: str
+) -> None:
+    metadata = {
+        MetaKeys.AGENT: "bob",
+        MetaKeys.SCHEMA_VERSION: 1,
+        MetaKeys.OPERATION_ID: "op-proto-profile-malformed",
+        **profile,
+    }
+    body = await post(client, "message/send", message("READY", metadata=metadata))
+
+    assert body["error"]["code"] == -32602
+    assert complaint in body["error"]["message"]
+    assert hub_store.agent_by_name("bob") is None
 
 
 async def test_next_holds_until_alice_assigns(

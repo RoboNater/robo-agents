@@ -13,7 +13,25 @@ from agent_hub.store import (
     NotFoundError,
     Released,
 )
-from agent_hub_common import AgentStatus, EventKind, TaskState, iso_after, to_iso, utcnow
+from agent_hub_common import (
+    AgentProfile,
+    AgentStatus,
+    EventKind,
+    ModelSource,
+    TaskState,
+    iso_after,
+    to_iso,
+    utcnow,
+)
+
+CLAUDE = AgentProfile(
+    harness="claude-code",
+    harness_version="2.1.268",
+    provider="anthropic",
+    model="claude-opus-5",
+    model_source=ModelSource.ENV,
+    capabilities=("python",),
+)
 
 
 def assign(store: HubStore, agent: str = "bob", role: str = "implementer") -> str:
@@ -24,7 +42,7 @@ def test_state_uses_one_read_snapshot(tmp_path: Path, monkeypatch: pytest.Monkey
     path = tmp_path / "hub.db"
     initialize_database(path)
     store = HubStore(path)
-    store.check_in("bob", [])
+    store.check_in("bob")
     task = store.assign_task("bob", "implementer", "Fix", "Instructions")
     changed = False
 
@@ -51,7 +69,7 @@ def test_state_uses_one_read_snapshot(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_check_in_registers_an_agent_and_queues_the_event(store: HubStore) -> None:
-    agent = store.check_in("bob", ["python"], runtime="claude-code")
+    agent = store.check_in("bob", CLAUDE)
 
     event = store.next_event()
 
@@ -60,34 +78,79 @@ def test_check_in_registers_an_agent_and_queues_the_event(store: HubStore) -> No
     assert agent.capabilities == ["python"]
     assert event is not None
     assert event.kind is EventKind.AGENT_CHECKED_IN
-    assert event.payload["runtime"] == "claude-code"
+    assert event.payload == {
+        "agent": "bob",
+        "harness": "claude-code",
+        "harness_version": "2.1.268",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "model_source": "env",
+        "capabilities": ["python"],
+        "workspace_id": None,
+        "context_id": agent.context_id,
+    }
+
+
+def test_get_state_shows_each_workers_profile(store: HubStore) -> None:
+    store.check_in("bob", CLAUDE)
+    store.check_in("charlie", AgentProfile(harness="codex"))
+
+    agents = {agent["name"]: agent for agent in store.get_state()["agents"]}
+
+    assert agents["bob"] | {"context_id": "", "last_seen": ""} == {
+        "name": "bob",
+        "status": "idle",
+        "context_id": "",
+        "last_seen": "",
+        "current_task_id": None,
+        "harness": "claude-code",
+        "harness_version": "2.1.268",
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "model_source": "env",
+        "capabilities": ["python"],
+        "workspace_id": None,
+    }
+    # Whatever charlie's launcher left unset reads `unknown`, not a guess.
+    charlie = agents["charlie"]
+    assert charlie["harness"] == "codex"
+    assert charlie["harness_version"] == charlie["provider"] == charlie["model"] == "unknown"
+    assert charlie["model_source"] == "unknown"
+    assert charlie["capabilities"] == []
 
 
 def test_returning_worker_keeps_its_context_and_drops_a_finished_task(store: HubStore) -> None:
-    first = store.check_in("bob", ["python"])
+    first = store.check_in("bob", CLAUDE)
     task_id = assign(store)
     store.submit_result(task_id, "bob", TaskState.COMPLETED, "done")
 
-    second = store.check_in("bob", ["python", "docs"])
+    second = store.check_in("bob", AgentProfile(capabilities=("python", "docs")))
 
     assert second.context_id == first.context_id
     assert second.status is AgentStatus.IDLE
     assert second.current_task_id is None
     assert second.capabilities == ["python", "docs"]
+    # The new profile replaces the old one outright: a worker back under the
+    # same name may be a different harness, and a stale one would mislead.
+    assert (second.harness, second.model, second.model_source) == (
+        "unknown",
+        "unknown",
+        ModelSource.UNKNOWN,
+    )
 
 
 def test_returning_worker_stays_busy_while_its_task_is_open(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
 
-    returned = store.check_in("bob", [])
+    returned = store.check_in("bob")
 
     assert returned.status is AgentStatus.BUSY
     assert returned.current_task_id == task_id
 
 
 def test_assignment_marks_the_agent_busy_and_records_the_instructions(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
 
     task = store.assign_task("bob", "implementer", "Fix #1", "Open a PR")
 
@@ -101,7 +164,7 @@ def test_assignment_marks_the_agent_busy_and_records_the_instructions(store: Hub
 
 
 def test_a_second_assignment_to_a_busy_agent_is_refused(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     assign(store)
 
     with pytest.raises(ConflictError, match="already holds"):
@@ -109,7 +172,7 @@ def test_a_second_assignment_to_a_busy_agent_is_refused(store: HubStore) -> None
 
 
 def test_a_released_agent_takes_no_further_assignment(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     store.release_agent("bob")
 
     with pytest.raises(ConflictError, match="released"):
@@ -122,7 +185,7 @@ def test_assigning_to_an_unknown_agent_is_refused(store: HubStore) -> None:
 
 
 async def test_waiting_worker_gets_the_task_and_claims_it(store: HubStore) -> None:
-    agent = store.check_in("bob", [])
+    agent = store.check_in("bob")
 
     async def alice() -> None:
         await asyncio.sleep(0.01)
@@ -138,7 +201,7 @@ async def test_waiting_worker_gets_the_task_and_claims_it(store: HubStore) -> No
 
 
 async def test_waiting_worker_is_released_while_it_waits(store: HubStore) -> None:
-    agent = store.check_in("bob", [])
+    agent = store.check_in("bob")
 
     async def alice() -> None:
         await asyncio.sleep(0.01)
@@ -150,7 +213,7 @@ async def test_waiting_worker_is_released_while_it_waits(store: HubStore) -> Non
 
 
 async def test_assignment_wait_times_out_without_work(store: HubStore) -> None:
-    agent = store.check_in("bob", [])
+    agent = store.check_in("bob")
 
     assert await store.await_assignment(agent.context_id, 0.05) is None
 
@@ -161,7 +224,7 @@ async def test_assignment_wait_rejects_an_unknown_context(store: HubStore) -> No
 
 
 def test_progress_is_recorded_as_an_event(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     store.next_event()
 
@@ -174,7 +237,7 @@ def test_progress_is_recorded_as_an_event(store: HubStore) -> None:
 
 
 async def test_a_question_parks_the_task_until_alice_replies(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
 
     question_id = store.open_question(task_id, "bob", "Which base branch?", "q-1")
@@ -194,7 +257,7 @@ async def test_a_question_parks_the_task_until_alice_replies(store: HubStore) ->
 
 
 async def test_an_unanswered_question_times_out(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     question_id = store.open_question(task_id, "bob", "Which base branch?", "q-1")
 
@@ -209,7 +272,7 @@ async def test_a_reply_that_lands_between_attempts_reaches_the_retry(
 ) -> None:
     """ "Call again" is only safe if a retry can still see the answer it missed."""
 
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     first = store.open_question(task_id, "bob", "Which base branch?", "q-1")
     assert await store.await_reply(task_id, first, 0.05) is None
@@ -225,7 +288,7 @@ async def test_a_reply_that_lands_between_attempts_reaches_the_retry(
 
 
 def test_a_retried_question_does_not_ask_alice_twice(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     while store.next_event():
         pass
@@ -239,7 +302,7 @@ def test_a_retried_question_does_not_ask_alice_twice(store: HubStore) -> None:
 
 
 def test_a_different_question_is_a_new_question(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
 
     first = store.open_question(task_id, "bob", "Which base branch?", "q-1")
@@ -258,7 +321,7 @@ def test_a_different_question_is_a_new_question(store: HubStore) -> None:
 def test_a_result_ends_the_task_and_frees_the_worker(
     store: HubStore, status: TaskState, kind: EventKind
 ) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     while store.next_event():
         pass
@@ -280,7 +343,7 @@ def test_a_result_ends_the_task_and_frees_the_worker(
 
 
 def test_a_result_must_be_terminal_and_can_only_be_reported_once(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
 
     with pytest.raises(ConflictError, match="completed or failed"):
@@ -292,7 +355,7 @@ def test_a_result_must_be_terminal_and_can_only_be_reported_once(store: HubStore
 
 
 def test_cancelling_frees_the_worker_and_only_works_once(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
 
     canceled = store.cancel_task(task_id)
@@ -305,7 +368,7 @@ def test_cancelling_frees_the_worker_and_only_works_once(store: HubStore) -> Non
 
 
 def test_events_are_consumed_once_and_in_order(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     store.record_progress(task_id, "bob", "one")
 
@@ -319,7 +382,7 @@ def test_events_are_consumed_once_and_in_order(store: HubStore) -> None:
 async def test_waiting_for_an_event_returns_as_soon_as_one_is_queued(store: HubStore) -> None:
     async def worker() -> None:
         await asyncio.sleep(0.01)
-        store.check_in("bob", [])
+        store.check_in("bob")
 
     event, _ = await asyncio.gather(store.wait_for_event(2.0), worker())
 
@@ -331,7 +394,7 @@ async def test_waiting_for_an_event_times_out_on_an_empty_inbox(store: HubStore)
 
 
 def test_history_can_be_trimmed_to_the_most_recent_messages(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     store.record_progress(task_id, "bob", "one")
     store.record_progress(task_id, "bob", "two")
@@ -342,7 +405,7 @@ def test_history_can_be_trimmed_to_the_most_recent_messages(store: HubStore) -> 
 
 
 def test_an_overdue_lease_is_reported_exactly_once(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = store.assign_task("bob", "implementer", "Fix #1", "Open a PR", lease_min=-1).id
 
     first = store.sweep(heartbeat_timeout_s=3600)
@@ -357,7 +420,7 @@ def test_an_overdue_lease_is_reported_exactly_once(store: HubStore) -> None:
 
 
 def test_a_silent_worker_is_lost_and_its_task_fails(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
     store.sweep(heartbeat_timeout_s=-1)
 
@@ -372,44 +435,44 @@ def test_a_silent_worker_is_lost_and_its_task_fails(store: HubStore) -> None:
 def test_a_release_survives_the_worker_restarting(store: HubStore) -> None:
     # Alice releases at wrap-up; a worker that comes back afterwards has to be
     # told to stop rather than left polling for work nobody will assign.
-    store.check_in("bob", [])
+    store.check_in("bob")
     store.release_agent("bob")
 
-    returned = store.check_in("bob", ["python"])
+    returned = store.check_in("bob", AgentProfile(capabilities=("python",)))
 
     assert returned.status is AgentStatus.RELEASED
     assert returned.capabilities == ["python"]
 
 
 def test_checking_in_readmits_a_lost_worker(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     store.sweep(heartbeat_timeout_s=-1)
 
-    returned = store.check_in("bob", [])
+    returned = store.check_in("bob")
 
     assert returned.status is AgentStatus.IDLE
 
 
 def test_a_lost_worker_is_given_no_work_until_it_checks_in_again(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     store.sweep(heartbeat_timeout_s=-1)
 
     with pytest.raises(ConflictError, match="not idle"):
         assign(store)
 
-    store.check_in("bob", [])
+    store.check_in("bob")
     assert store.get_task(assign(store)) is not None
 
 
 def test_a_released_worker_is_never_declared_lost(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     store.release_agent("bob")
 
     assert store.sweep(heartbeat_timeout_s=-1) == []
 
 
 def test_a_worker_that_keeps_calling_stays_live(store: HubStore) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     store.touch("bob")
 
     assert store.sweep(heartbeat_timeout_s=60) == []
@@ -417,7 +480,7 @@ def test_a_worker_that_keeps_calling_stays_live(store: HubStore) -> None:
 
 def test_the_single_workflow_is_created_once(store: HubStore) -> None:
     first = store.ensure_workflow()
-    store.check_in("bob", [])
+    store.check_in("bob")
     task_id = assign(store)
 
     task = store.get_task(task_id)

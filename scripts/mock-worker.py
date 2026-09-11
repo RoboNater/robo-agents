@@ -16,6 +16,7 @@ import sys
 from typing import Any
 
 from agent_hub_common import (
+    AgentProfile,
     ConfigurationError,
     HubSettings,
     ImplementerOutcome,
@@ -50,7 +51,7 @@ async def run_worker(
         logger.info(
             "Worker %r (%s) checking in at %s...",
             settings.agent_name,
-            settings.runtime,
+            settings.profile.harness,
             settings.hub_url,
         )
         checkin_res = await client.check_in(["python", "testing"])
@@ -160,7 +161,7 @@ def main() -> None:
         hub_url=args.hub_url,
         token=args.token,
         agent_name=args.agent,
-        runtime=args.runtime,
+        profile=AgentProfile(harness=args.runtime),
         default_wait_s=args.timeout,
     )
 

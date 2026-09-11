@@ -7,6 +7,7 @@ from agent_hub.database import database
 from agent_hub.store import HubStore
 from agent_hub_common import (
     SCHEMA_VERSION,
+    AgentProfile,
     AgentStatus,
     EventKind,
     Finding,
@@ -47,7 +48,7 @@ async def test_check_in_idempotency_and_conflict(
                 "metadata": {
                     MetaKeys.AGENT: "bob",
                     MetaKeys.CAPABILITIES: ["python"],
-                    MetaKeys.RUNTIME: "claude-code",
+                    MetaKeys.HARNESS: "claude-code",
                     MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
                     MetaKeys.OPERATION_ID: op_id,
                 },
@@ -93,7 +94,7 @@ async def test_check_in_idempotency_and_conflict(
                 "metadata": {
                     MetaKeys.AGENT: "bob",
                     MetaKeys.CAPABILITIES: ["go", "rust"],
-                    MetaKeys.RUNTIME: "claude-code",
+                    MetaKeys.HARNESS: "claude-code",
                     MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
                     MetaKeys.OPERATION_ID: op_id,
                 },
@@ -111,7 +112,7 @@ async def test_progress_idempotency_and_conflict(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
     # Check in bob
-    hub_store.check_in("bob", ["python"], runtime="claude-code")
+    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "Task 1", "Instructions")
@@ -186,7 +187,7 @@ async def test_progress_idempotency_and_conflict(
 async def test_result_idempotency_and_conflict(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
-    hub_store.check_in("bob", ["python"], runtime="claude-code")
+    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "Task 1", "Instructions")
@@ -274,7 +275,7 @@ async def test_validation_failure_leaves_task_working(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
     # 1. Reviewer validation failures
-    hub_store.check_in("charlie", ["python"], runtime="codex")
+    hub_store.check_in("charlie", AgentProfile(harness="codex", capabilities=("python",)))
     agent = hub_store.agent_by_name("charlie")
     assert agent is not None
     rev_task = hub_store.assign_task("charlie", "reviewer", "Review PR", "Review instructions")
@@ -352,7 +353,7 @@ async def test_validation_failure_leaves_task_working(
     assert "blocking_findings to be empty" in resp.json()["error"]["message"]
 
     # 2. Implementer validation failure
-    hub_store.check_in("bob", ["python"], runtime="claude-code")
+    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
     bob_agent = hub_store.agent_by_name("bob")
     assert bob_agent is not None
     imp_task = hub_store.assign_task("bob", "implementer", "Fix bug", "Fix instructions")
@@ -464,7 +465,7 @@ async def test_schema_version_rejections(
 async def test_typed_result_roundtrip_a2a_to_get_state(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
-    hub_store.check_in("bob", ["python"], runtime="claude-code")
+    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "Task Implementer", "Inst")
@@ -523,7 +524,7 @@ async def test_typed_result_roundtrip_a2a_to_get_state(
     assert matching[0]["result"]["resolved_finding_ids"] == ["r1-1", "r1-2"]
 
     # 3. Test ReviewerResult with findings
-    hub_store.check_in("charlie", ["python"], runtime="codex")
+    hub_store.check_in("charlie", AgentProfile(harness="codex", capabilities=("python",)))
     charlie_agent = hub_store.agent_by_name("charlie")
     assert charlie_agent is not None
     rev_task = hub_store.assign_task("charlie", "reviewer", "Task Review", "Inst")
@@ -628,7 +629,7 @@ async def test_missing_schema_version_and_operation_id_rejected_with_400(
     assert "operation_id is required" in resp.json()["error"]["message"]
 
     # Now valid check-in
-    hub_store.check_in("bob", ["python"])
+    hub_store.check_in("bob", AgentProfile(capabilities=("python",)))
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "T1", "Inst")
@@ -775,7 +776,7 @@ async def test_atomic_rollback_on_failure(
     with pytest.raises(RuntimeError, match="Simulated builder failure"):
         hub_store.check_in(
             "dave",
-            ["python"],
+            AgentProfile(capabilities=("python",)),
             operation_id=op_id,
             payload_hash=payload_hash,
             response_builder=fail_builder,
@@ -800,7 +801,7 @@ async def test_atomic_rollback_on_failure(
         )
 
     # Submit result failure rollback
-    hub_store.check_in("dave", ["python"])
+    hub_store.check_in("dave", AgentProfile(capabilities=("python",)))
     dave = hub_store.agent_by_name("dave")
     assert dave is not None
     task = hub_store.assign_task("dave", "implementer", "T1", "Inst")
@@ -850,7 +851,7 @@ async def test_worker_client_ambiguous_timeout_and_id_reuse(
         agent_name="bob",
         hub_url="http://hub.test",
         token="test-token",
-        runtime="claude-code",
+        profile=AgentProfile(harness="claude-code"),
         max_retries=2,
         backoff_factor_s=0.01,
     )
@@ -966,7 +967,7 @@ async def test_worker_client_clears_pending_ids_after_success(
         agent_name="alice-worker",
         hub_url="http://hub.test",
         token="test-token",
-        runtime="claude-code",
+        profile=AgentProfile(harness="claude-code"),
     )
     worker = WorkerHubClient(settings, http_client=client)
 
@@ -1059,4 +1060,3 @@ async def test_worker_client_clears_pending_ids_after_success(
         ).fetchall()
         assert len(ops_after) == 6
         assert len(set(row["operation_id"] for row in ops_after)) == 6
-

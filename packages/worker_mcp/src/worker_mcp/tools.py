@@ -24,9 +24,17 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
     )
 
     @server.tool()
-    async def check_in(capabilities: list[str] | None = None) -> dict[str, Any]:
-        """One-time registration with the hub; registers agent capabilities."""
-        return await client.check_in(capabilities)
+    async def check_in(
+        capabilities: list[str] | None = None, model: str | None = None
+    ) -> dict[str, Any]:
+        """One-time registration with the hub, reporting this worker's identity profile.
+
+        Harness, provider and configured capabilities come from the launcher.
+        capabilities: optional extra capabilities to declare.
+        model: your exact model ID if you know it; ignored when the launcher
+        already names the model. Omit rather than guess.
+        """
+        return await client.check_in(capabilities, model)
 
     @server.tool()
     async def get_role_guide(role: str) -> str:

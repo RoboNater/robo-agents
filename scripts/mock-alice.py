@@ -3,14 +3,14 @@
 
 Usage:
     # 1. Stdio MCP mode: launches hub and runs Alice MCP over stdio (in-process events):
-    python scripts/mock-alice.py --mcp --agent bob --runtime claude-code
-    python scripts/mock-alice.py --mcp --agent charlie --runtime codex
+    python scripts/mock-alice.py --mcp --agent bob --harness claude-code
+    python scripts/mock-alice.py --mcp --agent charlie --harness codex
 
     # 2. Database mode: runs against an existing HubStore database.
     # Note: Cross-process database polling only re-evaluates holds at timeout deadlines
     # (spec §2: Alice MCP tools run in-process with the hub). Use lower HUB_DEFAULT_WAIT_S
     # or stdio MCP mode for responsive handoffs.
-    python scripts/mock-alice.py --db /path/to/hub.db --agent bob --runtime claude-code
+    python scripts/mock-alice.py --db /path/to/hub.db --agent bob --harness claude-code
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_hub.database import database, initialize_database
+from agent_hub.database import initialize_database
 from agent_hub.store import HubStore
 from agent_hub_common import AgentStatus, ConfigurationError, EventKind, HubSettings, WorkflowStatus
 from mcp import ClientSession, StdioServerParameters
@@ -74,14 +74,14 @@ async def drive_one_task_mcp(
     title: str = "Fix issue #1",
     instructions: str = "Implement the requested changes and add tests.",
     timeout_s: float = 60.0,
-    expected_runtime: str | None = None,
+    expected_harness: str | None = None,
 ) -> dict[str, Any]:
     """Drive one worker using Alice's MCP tools over stdio."""
     logger.info("Alice (MCP) is ready. Waiting for worker %r to check in...", expected_agent)
 
     deadline = asyncio.get_running_loop().time() + timeout_s
     agent_name: str | None = None
-    checked_in_runtime: str | None = None
+    checked_in_harness: str | None = None
 
     while asyncio.get_running_loop().time() < deadline:
         # Check if agent already checked in before or between events
@@ -94,7 +94,7 @@ async def drive_one_task_mcp(
                 and ag.get("status") != AgentStatus.RELEASED.value
             ):
                 agent_name = expected_agent
-                checked_in_runtime = ag.get("runtime")
+                checked_in_harness = ag.get("harness")
                 break
         if agent_name:
             break
@@ -112,19 +112,19 @@ async def drive_one_task_mcp(
         ):
             agent_name = expected_agent
             payload = event.get("payload") or {}
-            checked_in_runtime = payload.get("runtime")
+            checked_in_harness = payload.get("harness")
             break
 
     if not agent_name:
         raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
 
-    if expected_runtime is not None:
-        if checked_in_runtime != expected_runtime:
+    if expected_harness is not None:
+        if checked_in_harness != expected_harness:
             raise ValueError(
-                f"Worker {agent_name!r} checked in with runtime {checked_in_runtime!r}, "
-                f"expected {expected_runtime!r}"
+                f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
+                f"expected {expected_harness!r}"
             )
-        logger.info("Worker %r runtime verified: %s", agent_name, checked_in_runtime)
+        logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
     logger.info("Worker %r checked in! Assigning task...", agent_name)
 
@@ -205,22 +205,6 @@ async def drive_one_task_mcp(
     return result_data
 
 
-def _agent_runtime(store: HubStore, agent_name: str) -> str | None:
-    agent = store.agent_by_name(agent_name)
-    if agent is not None and agent.runtime is not None:
-        return agent.runtime
-    with database(store.path) as connection:
-        rows = connection.execute(
-            "SELECT payload_json FROM event WHERE kind = ? ORDER BY id DESC",
-            (EventKind.AGENT_CHECKED_IN.value,),
-        ).fetchall()
-        for r in rows:
-            p = json.loads(r["payload_json"])
-            if p.get("agent") == agent_name:
-                return p.get("runtime")
-    return None
-
-
 async def drive_one_task(
     store: HubStore,
     expected_agent: str,
@@ -228,7 +212,7 @@ async def drive_one_task(
     title: str = "Fix issue #1",
     instructions: str = "Implement the requested changes and add tests.",
     timeout_s: float = 60.0,
-    expected_runtime: str | None = None,
+    expected_harness: str | None = None,
 ) -> dict[str, Any]:
     """Drive one worker through the full lifecycle using HubStore directly:
 
@@ -239,14 +223,14 @@ async def drive_one_task(
     # 1. Wait for agent check-in
     deadline = asyncio.get_running_loop().time() + timeout_s
     agent_name: str | None = None
-    checked_in_runtime: str | None = None
+    checked_in_harness: str | None = None
 
     while asyncio.get_running_loop().time() < deadline:
         # Check if agent already checked in before or between events
         agent = store.agent_by_name(expected_agent)
         if agent is not None and agent.status != AgentStatus.RELEASED:
             agent_name = agent.name
-            checked_in_runtime = agent.runtime or _agent_runtime(store, agent_name)
+            checked_in_harness = agent.harness
             break
 
         remaining = max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
@@ -259,20 +243,19 @@ async def drive_one_task(
         )
         if matched:
             agent_name = expected_agent
-            checked_in_runtime = event.payload.get("runtime")
+            checked_in_harness = event.payload.get("harness")
             break
 
     if not agent_name:
         raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
 
-    if expected_runtime is not None:
-        runtime = checked_in_runtime or _agent_runtime(store, agent_name)
-        if runtime != expected_runtime:
+    if expected_harness is not None:
+        if checked_in_harness != expected_harness:
             raise ValueError(
-                f"Worker {agent_name!r} checked in with runtime {runtime!r}, "
-                f"expected {expected_runtime!r}"
+                f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
+                f"expected {expected_harness!r}"
             )
-        logger.info("Worker %r runtime verified: %s", agent_name, runtime)
+        logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
     logger.info("Worker %r checked in! Assigning task...", agent_name)
 
@@ -367,9 +350,11 @@ def main() -> None:
     parser.add_argument("--agent", default="bob", help="Expected worker agent name")
     parser.add_argument("--role", default="implementer", help="Task role to assign")
     parser.add_argument(
+        "--harness",
         "--runtime",
+        dest="harness",
         default="claude-code",
-        help="Worker runtime (claude-code, codex, etc.)",
+        help="Expected worker harness (claude-code, codex, etc.); --runtime is the Step 4 name",
     )
     parser.add_argument("--timeout", type=float, default=60.0, help="Hold timeout in seconds")
     parser.add_argument(
@@ -405,7 +390,7 @@ def main() -> None:
                         expected_agent=args.agent,
                         role=args.role,
                         timeout_s=args.timeout,
-                        expected_runtime=args.runtime,
+                        expected_harness=args.harness,
                     )
 
             result = asyncio.run(run_mcp_session())
@@ -419,7 +404,7 @@ def main() -> None:
                     expected_agent=args.agent,
                     role=args.role,
                     timeout_s=args.timeout,
-                    expected_runtime=args.runtime,
+                    expected_harness=args.harness,
                 )
             )
         print(f"SUCCESS: {result}")

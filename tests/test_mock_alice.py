@@ -8,7 +8,7 @@ import pytest
 from agent_hub import create_app
 from agent_hub.database import database, initialize_database
 from agent_hub.store import HubStore
-from agent_hub_common import HubSettings, TaskState, WorkflowStatus
+from agent_hub_common import AgentProfile, HubSettings, TaskState, WorkflowStatus
 from conftest import BASE_URL, TOKEN
 from worker_mcp.client import WorkerHubClient
 from worker_mcp.config import WorkerSettings
@@ -21,7 +21,7 @@ spec.loader.exec_module(mock_alice)
 
 
 @pytest.mark.parametrize(
-    ("agent_name", "runtime"),
+    ("agent_name", "harness"),
     [
         ("bob", "claude-code"),
         ("charlie", "codex"),
@@ -29,7 +29,7 @@ spec.loader.exec_module(mock_alice)
 )
 async def test_mock_alice_drives_worker_through_full_task(
     agent_name: str,
-    runtime: str,
+    harness: str,
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / f"hub_{agent_name}.db"
@@ -55,7 +55,7 @@ async def test_mock_alice_drives_worker_through_full_task(
         hub_url=BASE_URL,
         token=TOKEN,
         agent_name=agent_name,
-        runtime=runtime,
+        profile=AgentProfile(harness=harness),
         default_wait_s=0.5,
         max_retries=2,
         backoff_factor_s=0.01,
@@ -110,7 +110,7 @@ async def test_mock_alice_drives_worker_through_full_task(
                 title="Test Issue",
                 instructions="Please fix the issue.",
                 timeout_s=5.0,
-                expected_runtime=runtime,
+                expected_harness=harness,
             )
         )
         worker_task = asyncio.create_task(run_worker())
@@ -124,22 +124,22 @@ async def test_mock_alice_drives_worker_through_full_task(
             assert any("Assigned task" in d["summary"] for d in decisions)
 
 
-async def test_mock_alice_rejects_unexpected_runtime(tmp_path: Path) -> None:
+async def test_mock_alice_rejects_unexpected_harness(tmp_path: Path) -> None:
     db_path = tmp_path / "hub_mismatch.db"
     initialize_database(db_path)
     store = HubStore(db_path)
 
     # Bob checks in as claude-code
-    store.check_in("bob", ["python"], runtime="claude-code")
+    store.check_in("bob", AgentProfile(harness="claude-code"))
 
     # Mock Alice expects codex
-    match_msg = "Worker 'bob' checked in with runtime 'claude-code', expected 'codex'"
+    match_msg = "Worker 'bob' checked in with harness 'claude-code', expected 'codex'"
     with pytest.raises(ValueError, match=match_msg):
         await mock_alice.drive_one_task(
             store=store,
             expected_agent="bob",
             timeout_s=1.0,
-            expected_runtime="codex",
+            expected_harness="codex",
         )
 
 
@@ -157,7 +157,7 @@ def test_mock_alice_main_cli_parses_arguments(
         nonlocal called
         called = True
         assert expected_agent == "charlie"
-        assert kwargs.get("expected_runtime") == "codex"
+        assert kwargs.get("expected_harness") == "codex"
         return {"status": "ok"}
 
     monkeypatch.setattr(mock_alice, "drive_one_task", fake_drive_one_task)
@@ -187,7 +187,7 @@ async def test_mock_alice_agent_already_checked_in_event_consumed(tmp_path: Path
     store = HubStore(db_path)
 
     # Bob checks in as codex
-    store.check_in("bob", ["python"], runtime="codex")
+    store.check_in("bob", AgentProfile(harness="codex"))
 
     # Consume the check_in event so wait_for_event returns None
     event = await store.wait_for_event(timeout_s=0.01)
@@ -213,7 +213,7 @@ async def test_mock_alice_agent_already_checked_in_event_consumed(tmp_path: Path
             store=store,
             expected_agent="bob",
             timeout_s=2.0,
-            expected_runtime="codex",
+            expected_harness="codex",
         )
     )
     finish_fut = asyncio.create_task(finish_task())
@@ -227,18 +227,18 @@ async def test_mock_alice_agent_already_checked_in_mismatch(tmp_path: Path) -> N
     store = HubStore(db_path)
 
     # Bob checks in as codex
-    store.check_in("bob", ["python"], runtime="codex")
+    store.check_in("bob", AgentProfile(harness="codex"))
 
     # Consume the check_in event
     await store.wait_for_event(timeout_s=0.01)
 
-    match_msg = "Worker 'bob' checked in with runtime 'codex', expected 'claude-code'"
+    match_msg = "Worker 'bob' checked in with harness 'codex', expected 'claude-code'"
     with pytest.raises(ValueError, match=match_msg):
         await mock_alice.drive_one_task(
             store=store,
             expected_agent="bob",
             timeout_s=1.0,
-            expected_runtime="claude-code",
+            expected_harness="claude-code",
         )
 
 
@@ -301,7 +301,7 @@ def test_mock_alice_main_cli_mcp_flag(monkeypatch: pytest.MonkeyPatch) -> None:
             "--mcp",
             "--agent",
             "bob",
-            "--runtime",
+            "--harness",
             "claude-code",
         ],
     )

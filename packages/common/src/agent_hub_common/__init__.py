@@ -1,17 +1,20 @@
 """Shared building blocks for the hub and worker MCP processes."""
 
 from .clock import iso_after, to_iso, utcnow, utcnow_iso
-from .config import ConfigurationError, HubSettings
+from .config import ConfigurationError, HubSettings, profile_from_env
 from .constants import MetaKeys
 from .models import (
     IMPLEMENTER_RESULT_SCHEMA,
     REVIEWER_RESULT_SCHEMA,
     SCHEMA_VERSION,
+    UNKNOWN,
+    AgentProfile,
     AgentStatus,
     EventKind,
     Finding,
     ImplementerOutcome,
     ImplementerResult,
+    ModelSource,
     ReviewerResult,
     ReviewerVerdict,
     TaskResult,
@@ -26,6 +29,8 @@ __all__ = [
     "IMPLEMENTER_RESULT_SCHEMA",
     "REVIEWER_RESULT_SCHEMA",
     "SCHEMA_VERSION",
+    "UNKNOWN",
+    "AgentProfile",
     "AgentStatus",
     "ConfigurationError",
     "EventKind",
@@ -34,6 +39,7 @@ __all__ = [
     "ImplementerOutcome",
     "ImplementerResult",
     "MetaKeys",
+    "ModelSource",
     "ReviewerResult",
     "ReviewerVerdict",
     "TaskResult",
@@ -43,6 +49,7 @@ __all__ = [
     "WorkflowStatus",
     "iso_after",
     "load_or_create_token",
+    "profile_from_env",
     "reserve_stdout",
     "to_iso",
     "token_matches",

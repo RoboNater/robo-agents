@@ -1,12 +1,15 @@
 import asyncio
+from dataclasses import replace
 
 import httpx
 import pytest
 from agent_hub.store import HubStore
 from agent_hub_common import (
+    AgentProfile,
     HubSettings,
     ImplementerOutcome,
     ImplementerResult,
+    ModelSource,
     ReviewerResult,
     ReviewerVerdict,
     TaskState,
@@ -22,7 +25,7 @@ def worker_settings() -> WorkerSettings:
         hub_url=BASE_URL,
         token=TOKEN,
         agent_name="bob",
-        runtime="claude-code",
+        profile=AgentProfile(harness="claude-code"),
         default_wait_s=0.2,
         max_retries=2,
         backoff_factor_s=0.01,
@@ -39,6 +42,66 @@ async def test_worker_check_in_and_state(
     assert res["agent"] == "bob"
     assert worker.context_id is not None
     assert hub_store.agent_by_name("bob") is not None
+
+
+async def test_check_in_reports_the_launcher_profile_to_get_state(
+    client: httpx.AsyncClient, worker_settings: WorkerSettings, hub_store: HubStore
+) -> None:
+    configured = AgentProfile(
+        harness="codex",
+        harness_version="0.154.0",
+        provider="openai",
+        model="example-codex-model",
+        model_source=ModelSource.ENV,
+        capabilities=("python",),
+    )
+    worker = WorkerHubClient(replace(worker_settings, profile=configured), http_client=client)
+
+    # The launcher's model wins over the agent's own belief about itself.
+    res = await worker.check_in(["gh", "python"], model="something-else")
+
+    expected = {
+        "harness": "codex",
+        "harness_version": "0.154.0",
+        "provider": "openai",
+        "model": "example-codex-model",
+        "model_source": "env",
+        "capabilities": ["python", "gh"],
+        "workspace_id": None,
+    }
+    [agent] = hub_store.get_state()["agents"]
+    assert {key: agent[key] for key in expected} == expected
+    assert res["profile"] == expected
+
+
+@pytest.mark.parametrize(
+    ("declared", "model", "source"),
+    [
+        ("claude-opus-5", "claude-opus-5", "declared"),
+        (" ", "unknown", "unknown"),
+        ("unknown", "unknown", "unknown"),
+        (None, "unknown", "unknown"),
+    ],
+)
+async def test_a_declared_model_is_used_only_when_the_launcher_names_none(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+    declared: str | None,
+    model: str,
+    source: str,
+) -> None:
+    worker = WorkerHubClient(worker_settings, http_client=client)
+
+    await worker.check_in(model=declared)
+
+    [agent] = hub_store.get_state()["agents"]
+    assert (agent["harness"], agent["model"], agent["model_source"]) == (
+        "claude-code",
+        model,
+        source,
+    )
+    assert agent["provider"] == agent["harness_version"] == "unknown"
 
 
 async def test_get_role_guide_no_cache(
@@ -258,7 +321,7 @@ async def test_stream_rpc_json_error_raises_protocol_error(
 
     # 2. ask_alice on a task not assigned to bob raises WorkerProtocolError
     await worker.check_in()
-    hub_store.check_in("charlie", ["python"])
+    hub_store.check_in("charlie")
     charlie_task = hub_store.assign_task("charlie", "implementer", "Task Charlie", "Inst")
     with pytest.raises(WorkerProtocolError) as exc_info:
         await worker.ask_alice(charlie_task.id, "Question?", timeout_s=0.5)

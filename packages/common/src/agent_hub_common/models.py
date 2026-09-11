@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Self
 
 from pydantic import BaseModel, Field, model_validator
+
+# A profile field the adapter was not told is recorded as this, never guessed
+# (spec §4.3), so Alice can tell "not reported" apart from a real value.
+UNKNOWN = "unknown"
 
 
 class WorkflowStatus(StrEnum):
@@ -114,3 +119,33 @@ TaskResult = ImplementerResult | ReviewerResult
 
 IMPLEMENTER_RESULT_SCHEMA: dict[str, Any] = ImplementerResult.model_json_schema()
 REVIEWER_RESULT_SCHEMA: dict[str, Any] = ReviewerResult.model_json_schema()
+
+
+class ModelSource(StrEnum):
+    """Where a worker's `model` came from (spec §3).
+
+    `env` is the operator's launcher configuration (`HUB_MODEL`); `declared` is
+    the agent naming its own model at check-in, used only when the launcher
+    names none. Neither is attested (§1 non-goals).
+    """
+
+    DECLARED = "declared"
+    ENV = "env"
+    UNKNOWN = UNKNOWN
+
+
+@dataclass(frozen=True, slots=True)
+class AgentProfile:
+    """A worker's self-reported identity, which role selection evaluates (§5).
+
+    Observational only: the hub records what the worker says and verifies none
+    of it. `workspace_id` stays None until the worker reports one (#28).
+    """
+
+    harness: str = UNKNOWN
+    harness_version: str = UNKNOWN
+    provider: str = UNKNOWN
+    model: str = UNKNOWN
+    model_source: ModelSource = ModelSource.UNKNOWN
+    capabilities: tuple[str, ...] = field(default_factory=tuple)
+    workspace_id: str | None = None

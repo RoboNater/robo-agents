@@ -6,7 +6,7 @@ import httpx
 import pytest
 from agent_hub import create_app
 from agent_hub.database import initialize_database
-from agent_hub_common import HubSettings, TaskState
+from agent_hub_common import AgentProfile, HubSettings, TaskState
 from conftest import BASE_URL, TOKEN
 from worker_mcp.config import WorkerSettings
 
@@ -45,7 +45,7 @@ async def test_mock_worker_implements_task_end_to_end(tmp_path: Path) -> None:
         hub_url=BASE_URL,
         token=TOKEN,
         agent_name="bob",
-        runtime="claude-code",
+        profile=AgentProfile(harness="claude-code"),
         default_wait_s=0.5,
         max_retries=2,
         backoff_factor_s=0.01,
@@ -124,7 +124,7 @@ async def test_mock_worker_reviewer_task(tmp_path: Path) -> None:
         hub_url=BASE_URL,
         token=TOKEN,
         agent_name="charlie",
-        runtime="codex",
+        profile=AgentProfile(harness="codex"),
         default_wait_s=0.5,
         max_retries=2,
         backoff_factor_s=0.01,

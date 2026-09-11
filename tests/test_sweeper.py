@@ -14,7 +14,7 @@ async def drain(store: HubStore) -> None:
 async def test_the_loop_reports_an_overdue_lease_without_being_asked(
     store: HubStore,
 ) -> None:
-    store.check_in("bob", [])
+    store.check_in("bob")
     store.assign_task("bob", "implementer", "Fix #1", "Open a PR", lease_min=-1)
     await drain(store)
 

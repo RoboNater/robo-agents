@@ -6,14 +6,18 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import asdict, replace
 from typing import Any
 from uuid import uuid4
 
 import httpx
 from agent_hub_common import (
     SCHEMA_VERSION,
+    UNKNOWN,
+    AgentProfile,
     ImplementerResult,
     MetaKeys,
+    ModelSource,
     ReviewerResult,
 )
 
@@ -50,8 +54,8 @@ class WorkerHubClient:
         self._pending_questions: dict[str, tuple[str, str]] = {}
         # Active pending result (result_dict, operation_id) per task (§4.1)
         self._pending_results: dict[str, tuple[dict[str, Any], str]] = {}
-        # Active pending check-in (capabilities, runtime, operation_id)
-        self._pending_checkin: tuple[list[str], str | None, str] | None = None
+        # Active pending check-in (profile, operation_id)
+        self._pending_checkin: tuple[AgentProfile, str] | None = None
         # Active pending progress (note, operation_id) per task (§4.1)
         self._pending_progress: dict[str, tuple[str, str]] = {}
 
@@ -293,38 +297,66 @@ class WorkerHubClient:
                     continue
                 raise
 
+    def profile(
+        self, capabilities: list[str] | None = None, model: str | None = None
+    ) -> AgentProfile:
+        """Combine the launcher's profile with what the agent declares.
+
+        Declared capabilities add to the configured ones. A declared model is
+        used only when the launcher names none: the launcher is the operator's
+        statement of what runs, the agent's is its own belief (§3).
+        """
+
+        configured = self.settings.profile
+        declared_caps = (item.strip() for item in capabilities or [])
+        merged = dict.fromkeys([*configured.capabilities, *(c for c in declared_caps if c)])
+        declared_model = (model or "").strip()
+        if configured.model_source is ModelSource.UNKNOWN and declared_model not in ("", UNKNOWN):
+            return replace(
+                configured,
+                capabilities=tuple(merged),
+                model=declared_model,
+                model_source=ModelSource.DECLARED,
+            )
+        return replace(configured, capabilities=tuple(merged))
+
     async def check_in(
         self,
         capabilities: list[str] | None = None,
+        model: str | None = None,
         operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Register the worker with the hub and store the returned contextId."""
-        caps = capabilities if capabilities is not None else ["python"]
-        runtime = self.settings.runtime
+        profile = self.profile(capabilities, model)
         if operation_id is not None:
             op_id = operation_id
         else:
-            if (
-                self._pending_checkin is not None
-                and self._pending_checkin[0] == caps
-                and self._pending_checkin[1] == runtime
-            ):
-                op_id = self._pending_checkin[2]
+            if self._pending_checkin is not None and self._pending_checkin[0] == profile:
+                op_id = self._pending_checkin[1]
             else:
                 op_id = uuid4().hex
-                self._pending_checkin = (caps, runtime, op_id)
+                self._pending_checkin = (profile, op_id)
+
+        metadata: dict[str, Any] = {
+            MetaKeys.AGENT: self.settings.agent_name,
+            MetaKeys.CAPABILITIES: list(profile.capabilities),
+            MetaKeys.HARNESS: profile.harness,
+            MetaKeys.HARNESS_VERSION: profile.harness_version,
+            MetaKeys.PROVIDER: profile.provider,
+            MetaKeys.MODEL: profile.model,
+            MetaKeys.MODEL_SOURCE: profile.model_source.value,
+            MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+            MetaKeys.OPERATION_ID: op_id,
+        }
+        if profile.workspace_id is not None:
+            metadata[MetaKeys.WORKSPACE_ID] = profile.workspace_id
+
         params = {
             "message": {
                 "messageId": uuid4().hex,
                 "role": "user",
                 "parts": [{"kind": "text", "text": "READY"}],
-                "metadata": {
-                    MetaKeys.AGENT: self.settings.agent_name,
-                    MetaKeys.CAPABILITIES: caps,
-                    MetaKeys.RUNTIME: self.settings.runtime,
-                    MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
-                    MetaKeys.OPERATION_ID: op_id,
-                },
+                "metadata": metadata,
             }
         }
         result = await self._post_rpc("message/send", params)
@@ -339,6 +371,7 @@ class WorkerHubClient:
             "status": "registered",
             "agent": self.settings.agent_name,
             "context_id": self.context_id,
+            "profile": asdict(profile) | {"capabilities": list(profile.capabilities)},
         }
 
     async def get_role_guide(self, role: str) -> str:

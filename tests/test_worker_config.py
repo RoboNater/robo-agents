@@ -1,5 +1,5 @@
 import pytest
-from agent_hub_common import ConfigurationError
+from agent_hub_common import AgentProfile, ConfigurationError, ModelSource
 from worker_mcp.config import WorkerSettings
 
 
@@ -13,7 +13,8 @@ def test_worker_settings_parses_valid_env() -> None:
     assert settings.hub_url == "http://127.0.0.1:8420"
     assert settings.token == "secret-token"
     assert settings.agent_name == "bob"
-    assert settings.runtime == "claude-code"
+    # Nothing the launcher left unset is guessed, not even the harness.
+    assert settings.profile == AgentProfile()
     assert settings.default_wait_s == 120.0
     assert settings.max_retries == 3
     assert settings.backoff_factor_s == 0.5
@@ -24,7 +25,11 @@ def test_worker_settings_custom_overrides() -> None:
         "HUB_URL": "https://hub.example.com",
         "HUB_TOKEN": "token-123",
         "AGENT_NAME": "charlie",
-        "AGENT_RUNTIME": "codex",
+        "HUB_HARNESS": "codex",
+        "HUB_HARNESS_VERSION": "0.154.0",
+        "HUB_PROVIDER": "openai",
+        "HUB_MODEL": "example-codex-model",
+        "HUB_CAPABILITIES": "python, gh,,python",
         "HUB_DEFAULT_WAIT_S": "45.5",
         "HUB_MAX_RETRIES": "5",
         "HUB_BACKOFF_FACTOR_S": "1.5",
@@ -32,7 +37,14 @@ def test_worker_settings_custom_overrides() -> None:
     settings = WorkerSettings.from_env(env)
     assert settings.hub_url == "https://hub.example.com"
     assert settings.agent_name == "charlie"
-    assert settings.runtime == "codex"
+    assert settings.profile == AgentProfile(
+        harness="codex",
+        harness_version="0.154.0",
+        provider="openai",
+        model="example-codex-model",
+        model_source=ModelSource.ENV,
+        capabilities=("python", "gh"),
+    )
     assert settings.default_wait_s == 45.5
     assert settings.max_retries == 5
     assert settings.backoff_factor_s == 1.5

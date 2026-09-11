@@ -126,7 +126,7 @@ async def check_in(
                 metadata={
                     MetaKeys.AGENT: name,
                     MetaKeys.CAPABILITIES: capabilities or ["python"],
-                    MetaKeys.RUNTIME: "claude-code",
+                    MetaKeys.HARNESS: "claude-code",
                     MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
                     MetaKeys.OPERATION_ID: uuid4().hex,
                 },

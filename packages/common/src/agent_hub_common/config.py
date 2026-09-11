@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from .models import UNKNOWN, AgentProfile, ModelSource
+
 logger = logging.getLogger(__name__)
 
 # A bind address that means "every interface" is never dialable, so the
@@ -73,6 +75,38 @@ def _positive_seconds(env: Mapping[str, str], name: str, default: float) -> floa
     if seconds <= 0:
         raise ConfigurationError(f"{name} must be greater than zero")
     return seconds
+
+
+def _declared(env: Mapping[str, str], *names: str) -> str:
+    """Return the first non-blank value among `names`, else `unknown`."""
+
+    for name in names:
+        value = env.get(name, "").strip()
+        if value:
+            return value
+    return UNKNOWN
+
+
+def profile_from_env(environ: Mapping[str, str] | None = None) -> AgentProfile:
+    """Read the worker identity profile its launcher configured (spec §4.3).
+
+    Every field the launcher leaves unset is `unknown` rather than inferred from
+    the host: a guessed harness would satisfy role policy by luck, which is what
+    the profile exists to stop. `AGENT_RUNTIME`, the Step 4 name for the
+    harness, is still honoured when `HUB_HARNESS` is unset.
+    """
+
+    env = os.environ if environ is None else environ
+    model = _declared(env, "HUB_MODEL")
+    capabilities = (item.strip() for item in env.get("HUB_CAPABILITIES", "").split(","))
+    return AgentProfile(
+        harness=_declared(env, "HUB_HARNESS", "AGENT_RUNTIME"),
+        harness_version=_declared(env, "HUB_HARNESS_VERSION"),
+        provider=_declared(env, "HUB_PROVIDER"),
+        model=model,
+        model_source=ModelSource.UNKNOWN if model == UNKNOWN else ModelSource.ENV,
+        capabilities=tuple(dict.fromkeys(item for item in capabilities if item)),
+    )
 
 
 def _default_state_dir(env: Mapping[str, str]) -> Path:
