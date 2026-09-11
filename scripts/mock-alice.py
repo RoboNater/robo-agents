@@ -143,31 +143,53 @@ async def drive_one_task_mcp(
             )
         logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
-    logger.info("Worker %r checked in! Assigning task...", agent_name)
-
-    assign_data = await _call(
-        session,
-        "assign_task",
-        {"agent": agent_name, "role": role, "title": title, "instructions": instructions},
-    )
-    task_id = assign_data.get("id") if isinstance(assign_data, dict) else ""
-    logger.info("Task assigned: id=%s title=%r", task_id, title)
-
-    await _call(
-        session,
-        "log_decision",
-        {
-            "summary": f"Assigned task {task_id} to {agent_name}",
-            "rationale": f"Initial assignment for role {role}",
-            "key": f"assign:{task_id}",
-        },
-    )
-
-    if crash_at == "after_action":
-        raise AliceCrashError("Simulated Alice crash after action")
+    existing_task = None
+    state_tasks = state_data.get("tasks") if isinstance(state_data, dict) else []
+    for t in state_tasks or []:
+        if isinstance(t, dict) and t.get("assignee") == agent_name:
+            if t.get("state") in ("working", "submitted", "input_required"):
+                existing_task = t
+                break
+            elif t.get("state") in ("completed", "failed"):
+                existing_task = t
+                break
 
     task_finished = False
     result_data: dict[str, Any] = {}
+
+    if existing_task:
+        task_id = existing_task.get("id") or ""
+        logger.info(
+            "Worker %r already has task %s (state=%s), resuming...",
+            agent_name,
+            task_id,
+            existing_task.get("state"),
+        )
+        if existing_task.get("state") in ("completed", "failed"):
+            task_finished = True
+            result_data = existing_task.get("result") or {}
+    else:
+        logger.info("Worker %r checked in! Assigning task...", agent_name)
+        assign_data = await _call(
+            session,
+            "assign_task",
+            {"agent": agent_name, "role": role, "title": title, "instructions": instructions},
+        )
+        task_id = assign_data.get("id") if isinstance(assign_data, dict) else ""
+        logger.info("Task assigned: id=%s title=%r", task_id, title)
+
+        await _call(
+            session,
+            "log_decision",
+            {
+                "summary": f"Assigned task {task_id} to {agent_name}",
+                "rationale": f"Initial assignment for role {role}",
+                "key": f"assign:{task_id}",
+            },
+        )
+
+        if crash_at == "after_action":
+            raise AliceCrashError("Simulated Alice crash after action")
 
     while not task_finished and asyncio.get_running_loop().time() < deadline:
         if crash_at == "before_ack" and last_delivery_id:
@@ -189,7 +211,9 @@ async def drive_one_task_mcp(
         payload = event.get("payload") or {}
         logger.info("Observed event: %s", kind)
 
-        if kind == "task_progress":
+        if kind == "agent_checked_in":
+            continue
+        elif kind == "task_progress":
             logger.info("Progress reported: %s", payload.get("note"))
         elif kind == "worker_question":
             q_task_id = payload.get("task_id")
@@ -224,6 +248,9 @@ async def drive_one_task_mcp(
 
     if not task_finished:
         raise TimeoutError(f"Task {task_id} did not finish within {timeout_s}s")
+
+    if last_delivery_id:
+        await _call(session, "wait_for_event", {"timeout_s": 0.05, "ack": last_delivery_id})
 
     logger.info("Releasing worker %r...", agent_name)
     await _call(session, "release_agent", {"agent": agent_name})
@@ -297,30 +324,53 @@ async def drive_one_task(
             )
         logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
-    logger.info("Worker %r checked in! Assigning task...", agent_name)
+    existing_task = None
+    for t in store.get_state()["tasks"]:
+        if t["assignee"] == agent_name:
+            if t["state"] in ("working", "submitted", "input_required"):
+                existing_task = t
+                break
+            elif t["state"] in ("completed", "failed"):
+                existing_task = t
+                break
 
-    # 2. Assign task
-    task = store.assign_task(
-        agent=agent_name,
-        role=role,
-        title=title,
-        instructions=instructions,
-        lease_min=30,
-    )
-    logger.info("Task assigned: id=%s title=%r", task.id, title)
-    store.log_decision(
-        f"Assigned task {task.id} to {agent_name}",
-        f"Initial assignment for role {role}",
-        key=f"assign:{task.id}",
-    )
-
-    if crash_at == "after_action":
-        raise AliceCrashError("Simulated Alice crash after action")
-
-    # 3. Wait for progress / question / completion
     task_finished = False
     result_data: dict[str, Any] = {}
 
+    if existing_task:
+        task_record = store.get_task(existing_task["id"])
+        assert task_record is not None
+        task = task_record
+        logger.info(
+            "Worker %r already has task %s (state=%s), resuming...",
+            agent_name,
+            task.id,
+            existing_task["state"],
+        )
+        if existing_task["state"] in ("completed", "failed"):
+            task_finished = True
+            result_data = existing_task.get("result") or {}
+    else:
+        logger.info("Worker %r checked in! Assigning task...", agent_name)
+        # 2. Assign task
+        task = store.assign_task(
+            agent=agent_name,
+            role=role,
+            title=title,
+            instructions=instructions,
+            lease_min=30,
+        )
+        logger.info("Task assigned: id=%s title=%r", task.id, title)
+        store.log_decision(
+            f"Assigned task {task.id} to {agent_name}",
+            f"Initial assignment for role {role}",
+            key=f"assign:{task.id}",
+        )
+
+        if crash_at == "after_action":
+            raise AliceCrashError("Simulated Alice crash after action")
+
+    # 3. Wait for progress / question / completion
     while not task_finished and asyncio.get_running_loop().time() < deadline:
         if crash_at == "before_ack" and last_delivery_id:
             raise AliceCrashError("Simulated Alice crash before ack")
@@ -334,7 +384,9 @@ async def drive_one_task(
 
         logger.info("Observed event: %s", event.kind)
 
-        if event.kind == EventKind.TASK_PROGRESS:
+        if event.kind == EventKind.AGENT_CHECKED_IN:
+            continue
+        elif event.kind == EventKind.TASK_PROGRESS:
             logger.info("Progress reported by worker: %s", event.payload.get("note"))
 
         elif event.kind == EventKind.WORKER_QUESTION:
@@ -371,6 +423,9 @@ async def drive_one_task(
 
     if not task_finished:
         raise TimeoutError(f"Task {task.id} did not finish within {timeout_s}s")
+
+    if last_delivery_id:
+        store.ack_event(last_delivery_id)
 
     # 4. Release worker
     logger.info("Releasing worker %r...", agent_name)
