@@ -50,6 +50,10 @@ class WorkerHubClient:
         self._pending_questions: dict[str, tuple[str, str]] = {}
         # Active pending result (result_dict, operation_id) per task (§4.1)
         self._pending_results: dict[str, tuple[dict[str, Any], str]] = {}
+        # Active pending check-in (capabilities, runtime, operation_id)
+        self._pending_checkin: tuple[list[str], str | None, str] | None = None
+        # Active pending progress (note, operation_id) per task (§4.1)
+        self._pending_progress: dict[str, tuple[str, str]] = {}
 
     async def __aenter__(self) -> WorkerHubClient:
         if self._client is None:
@@ -113,12 +117,13 @@ class WorkerHubClient:
                     await asyncio.sleep(delay)
                     continue
                 return response
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempts < self.settings.max_retries:
                     attempts += 1
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
                     logger.warning(
-                        "Connection error (%s) on %s %s; retrying in %.2fs (attempt %d/%d)",
+                        "Transport or timeout error (%s) on %s %s; retrying in %.2fs "
+                        "(attempt %d/%d)",
                         exc,
                         method,
                         path,
@@ -272,12 +277,13 @@ class WorkerHubClient:
                     raise WorkerProtocolError(
                         None, "SSE stream closed without delivering a data event"
                     )
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempts < self.settings.max_retries:
                     attempts += 1
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
                     logger.warning(
-                        "Connection error (%s) on stream; retrying in %.2fs (attempt %d/%d)",
+                        "Transport or timeout error (%s) on stream; retrying in %.2fs "
+                        "(attempt %d/%d)",
                         exc,
                         delay,
                         attempts,
@@ -294,7 +300,19 @@ class WorkerHubClient:
     ) -> dict[str, Any]:
         """Register the worker with the hub and store the returned contextId."""
         caps = capabilities if capabilities is not None else ["python"]
-        op_id = operation_id or uuid4().hex
+        runtime = self.settings.runtime
+        if operation_id is not None:
+            op_id = operation_id
+        else:
+            if (
+                self._pending_checkin is not None
+                and self._pending_checkin[0] == caps
+                and self._pending_checkin[1] == runtime
+            ):
+                op_id = self._pending_checkin[2]
+            else:
+                op_id = uuid4().hex
+                self._pending_checkin = (caps, runtime, op_id)
         params = {
             "message": {
                 "messageId": uuid4().hex,
@@ -389,7 +407,15 @@ class WorkerHubClient:
         """Send a progress note to Alice."""
         if not self.context_id:
             raise RuntimeError("Worker has not checked in yet; call check_in first")
-        op_id = operation_id or uuid4().hex
+        if operation_id is not None:
+            op_id = operation_id
+        else:
+            pending = self._pending_progress.get(task_id)
+            if pending is not None and pending[0] == note:
+                op_id = pending[1]
+            else:
+                op_id = uuid4().hex
+                self._pending_progress[task_id] = (note, op_id)
         params = {
             "message": {
                 "messageId": uuid4().hex,

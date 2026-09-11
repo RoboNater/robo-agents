@@ -13,7 +13,9 @@
           "hub.capabilities": [
             "python"
           ],
-          "hub.runtime": "claude-code"
+          "hub.operation_id": "op-checkin-101",
+          "hub.runtime": "claude-code",
+          "hub.schema_version": 1
         },
         "parts": [
           {

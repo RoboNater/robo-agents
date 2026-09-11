@@ -1,7 +1,7 @@
 import httpx
 import pytest
 from agent_hub.security import require_bearer
-from agent_hub_common import MetaKeys
+from agent_hub_common import SCHEMA_VERSION, MetaKeys
 from conftest import BASE_URL, TOKEN, message, rpc
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -41,7 +41,17 @@ async def test_the_token_is_accepted_in_any_case_of_the_scheme(app: FastAPI) -> 
     async with app.router.lifespan_context(app), await anonymous(app) as client:
         response = await client.post(
             "/a2a",
-            json=rpc("message/send", message("READY", metadata={MetaKeys.AGENT: "bob"})),
+            json=rpc(
+                "message/send",
+                message(
+                    "READY",
+                    metadata={
+                        MetaKeys.AGENT: "bob",
+                        MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                        MetaKeys.OPERATION_ID: "op-sec-1",
+                    },
+                ),
+            ),
             headers={"Authorization": f"bearer {TOKEN}"},
         )
 

@@ -8,9 +8,14 @@ from agent_hub_common import EventKind, MetaKeys, TaskState
 from conftest import check_in, message, rpc, sse_results
 
 
-async def post(client: httpx.AsyncClient, method: str, params: dict[str, Any]) -> Any:
+async def post(
+    client: httpx.AsyncClient,
+    method: str,
+    params: dict[str, Any],
+    status_code: int = 200,
+) -> Any:
     response = await client.post("/a2a", json=rpc(method, params))
-    assert response.status_code == 200
+    assert response.status_code == status_code
     return response.json()
 
 
@@ -32,7 +37,15 @@ async def test_check_in_returns_the_context_the_worker_must_use(
     body = await post(
         client,
         "message/send",
-        message("READY", metadata={MetaKeys.AGENT: "bob", MetaKeys.CAPABILITIES: ["python"]}),
+        message(
+            "READY",
+            metadata={
+                MetaKeys.AGENT: "bob",
+                MetaKeys.CAPABILITIES: ["python"],
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-proto-checkin-1",
+            },
+        ),
     )
 
     result = body["result"]
@@ -52,9 +65,20 @@ async def test_a_message_with_no_task_must_be_the_check_in(client: httpx.AsyncCl
 
 
 async def test_check_in_needs_the_agent_name(client: httpx.AsyncClient) -> None:
-    body = await post(client, "message/send", message("READY"))
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "READY",
+            metadata={
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-proto-checkin-2",
+            },
+        ),
+    )
 
     assert body["error"]["code"] == -32602
+    assert "agent" in body["error"]["message"].lower()
 
 
 async def test_next_holds_until_alice_assigns(
@@ -137,7 +161,11 @@ async def test_progress_is_acknowledged_and_queued_for_alice(
             "branch pushed",
             context_id=context_id,
             task_id=task_id,
-            metadata={MetaKeys.KIND: "progress"},
+            metadata={
+                MetaKeys.KIND: "progress",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-proto-prog-ack",
+            },
         ),
     )
 
@@ -279,8 +307,14 @@ async def test_a_result_ends_the_task_and_carries_its_artifacts(
             task_id=task_id,
             metadata={
                 MetaKeys.KIND: "result",
-                MetaKeys.STATUS: "completed",
-                MetaKeys.ARTIFACTS: [{"name": "pr", "url": "https://example.test/pr/1"}],
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-proto-res-1",
+                MetaKeys.RESULT: {
+                    "outcome": "completed",
+                    "summary": "PR ready for review",
+                    "pr_url": "https://example.test/pr/1",
+                    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                },
             },
         ),
     )
@@ -305,18 +339,41 @@ async def test_a_failed_result_is_reported_as_such(
             "tests will not pass",
             context_id=context_id,
             task_id=task_id,
-            metadata={MetaKeys.KIND: "result", MetaKeys.STATUS: "failed"},
+            metadata={
+                MetaKeys.KIND: "result",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-proto-res-2",
+                MetaKeys.RESULT: {
+                    "outcome": "failed",
+                    "summary": "tests will not pass",
+                },
+            },
         ),
     )
 
     assert body["result"]["status"]["state"] == "failed"
 
 
-@pytest.mark.parametrize("status", ["unknown", "working", None])
-async def test_a_result_needs_a_terminal_status(
-    client: httpx.AsyncClient, hub_store: HubStore, status: str | None
+@pytest.mark.parametrize(
+    "bad_result",
+    [
+        "not a dict",
+        None,
+        {"outcome": "invalid_outcome", "summary": "bad"},
+    ],
+)
+async def test_a_result_requires_typed_result(
+    client: httpx.AsyncClient, hub_store: HubStore, bad_result: Any
 ) -> None:
     context_id, task_id = await assigned_context(client, hub_store)
+
+    meta: dict[str, Any] = {
+        MetaKeys.KIND: "result",
+        MetaKeys.SCHEMA_VERSION: 1,
+        MetaKeys.OPERATION_ID: "op-proto-res-bad",
+    }
+    if bad_result is not None:
+        meta[MetaKeys.RESULT] = bad_result
 
     body = await post(
         client,
@@ -325,11 +382,13 @@ async def test_a_result_needs_a_terminal_status(
             "done",
             context_id=context_id,
             task_id=task_id,
-            metadata={MetaKeys.KIND: "result", MetaKeys.STATUS: status},
+            metadata=meta,
         ),
+        status_code=400,
     )
 
     assert "error" in body
+    assert body["error"]["code"] == -32602
 
 
 async def test_a_worker_cannot_act_on_another_workers_task(
@@ -345,7 +404,11 @@ async def test_a_worker_cannot_act_on_another_workers_task(
             "mine now",
             context_id=charlie,
             task_id=task_id,
-            metadata={MetaKeys.KIND: "progress"},
+            metadata={
+                MetaKeys.KIND: "progress",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-act-1",
+            },
         ),
     )
 

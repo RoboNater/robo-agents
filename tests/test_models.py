@@ -12,6 +12,9 @@ from agent_hub_common.models import (
 )
 from pydantic import ValidationError
 
+VALID_SHA = "0123456789abcdef0123456789abcdef01234567"
+VALID_SHA_2 = "abcdef0123456789abcdef0123456789abcdef01"
+
 
 def test_schema_version_is_one() -> None:
     assert SCHEMA_VERSION == 1
@@ -21,14 +24,14 @@ def test_valid_implementer_result_completed() -> None:
     res = ImplementerResult(
         outcome=ImplementerOutcome.COMPLETED,
         pr_url="https://github.com/org/repo/pull/1",
-        head_sha="abc1234",
-        commits=["abc1234 feat: do something"],
+        head_sha=VALID_SHA,
+        commits=[f"{VALID_SHA} feat: do something"],
         tests=[TestResult(command="pytest", status="passed")],
         summary="Done successfully",
     )
     assert res.outcome == ImplementerOutcome.COMPLETED
     assert res.pr_url == "https://github.com/org/repo/pull/1"
-    assert res.head_sha == "abc1234"
+    assert res.head_sha == VALID_SHA
     assert len(res.commits) == 1
     assert len(res.tests) == 1
     assert res.summary == "Done successfully"
@@ -39,7 +42,7 @@ def test_implementer_result_completed_requires_pr_url_and_head_sha() -> None:
         ImplementerResult(
             outcome=ImplementerOutcome.COMPLETED,
             pr_url=None,
-            head_sha="abc1234",
+            head_sha=VALID_SHA,
             summary="Done",
         )
 
@@ -47,7 +50,7 @@ def test_implementer_result_completed_requires_pr_url_and_head_sha() -> None:
         ImplementerResult(
             outcome=ImplementerOutcome.COMPLETED,
             pr_url="",
-            head_sha="abc1234",
+            head_sha=VALID_SHA,
             summary="Done",
         )
 
@@ -59,12 +62,44 @@ def test_implementer_result_completed_requires_pr_url_and_head_sha() -> None:
             summary="Done",
         )
 
-    with pytest.raises(ValidationError, match="head_sha"):
+    with pytest.raises(ValidationError):
         ImplementerResult(
             outcome=ImplementerOutcome.COMPLETED,
             pr_url="https://github.com/org/repo/pull/1",
             head_sha="",
             summary="Done",
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_sha",
+    [
+        "abc1234",  # too short (7 chars)
+        "0123456789",  # too short (10 chars)
+        "g" * 40,  # non-hex char
+        "0123456789abcdef0123456789abcdef0123456g",  # non-hex char at end
+        "0" * 41,  # too long (41 chars)
+        "0" * 39,  # too short (39 chars)
+        "   0123456789abcdef0123456789abcdef01234567   ",  # whitespace
+    ],
+)
+def test_sha_pattern_rejections(invalid_sha: str) -> None:
+    # ImplementerResult rejects invalid head_sha
+    with pytest.raises(ValidationError):
+        ImplementerResult(
+            outcome=ImplementerOutcome.COMPLETED,
+            pr_url="https://github.com/org/repo/pull/1",
+            head_sha=invalid_sha,
+            summary="Done",
+        )
+
+    # ReviewerResult rejects invalid reviewed_head_sha
+    with pytest.raises(ValidationError):
+        ReviewerResult(
+            verdict=ReviewerVerdict.APPROVED,
+            reviewed_head_sha=invalid_sha,
+            blocking_findings=[],
+            summary="LGTM",
         )
 
 
@@ -90,13 +125,13 @@ def test_valid_reviewer_result_approved() -> None:
         verdict=ReviewerVerdict.APPROVED,
         pr_url="https://github.com/org/repo/pull/1",
         review_url="https://github.com/org/repo/pull/1#review-1",
-        reviewed_head_sha="abc1234",
+        reviewed_head_sha=VALID_SHA,
         blocking_findings=[],
         nonblocking_findings=[Finding(id="r1-1", text="Minor nit")],
         summary="LGTM",
     )
     assert res.verdict == ReviewerVerdict.APPROVED
-    assert res.reviewed_head_sha == "abc1234"
+    assert res.reviewed_head_sha == VALID_SHA
     assert len(res.blocking_findings) == 0
     assert len(res.nonblocking_findings) == 1
 
@@ -113,7 +148,7 @@ def test_reviewer_result_approved_requires_reviewed_head_sha_and_empty_blocking_
     with pytest.raises(ValidationError, match="blocking_findings to be empty"):
         ReviewerResult(
             verdict=ReviewerVerdict.APPROVED,
-            reviewed_head_sha="abc1234",
+            reviewed_head_sha=VALID_SHA,
             blocking_findings=[Finding(id="r1-1", text="Must fix this")],
             summary="LGTM",
         )
@@ -123,7 +158,7 @@ def test_reviewer_result_changes_requested() -> None:
     res = ReviewerResult(
         verdict=ReviewerVerdict.CHANGES_REQUESTED,
         pr_url="https://github.com/org/repo/pull/1",
-        reviewed_head_sha="abc1234",
+        reviewed_head_sha=VALID_SHA,
         blocking_findings=[Finding(id="r1-1", text="Null pointer exception on line 10")],
         summary="Changes requested",
     )

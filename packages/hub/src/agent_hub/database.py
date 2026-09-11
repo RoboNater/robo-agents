@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS operation (
     operation_id TEXT NOT NULL,
     payload_hash TEXT NOT NULL,
     response_json TEXT NOT NULL,
+    created TEXT NOT NULL,
     PRIMARY KEY (actor, operation_id)
 );
 
@@ -135,6 +136,7 @@ def initialize_database(path: Path) -> None:
                     operation_id TEXT NOT NULL,
                     payload_hash TEXT NOT NULL,
                     response_json TEXT NOT NULL,
+                    created TEXT NOT NULL,
                     PRIMARY KEY (actor, operation_id)
                 )
             """)
@@ -147,6 +149,7 @@ def initialize_database(path: Path) -> None:
                     operation_id TEXT NOT NULL,
                     payload_hash TEXT NOT NULL,
                     response_json TEXT NOT NULL,
+                    created TEXT NOT NULL,
                     PRIMARY KEY (actor, operation_id)
                 )
             """)

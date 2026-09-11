@@ -337,11 +337,29 @@ class HubStore:
         name: str,
         capabilities: Sequence[str],
         runtime: str | None = None,
-    ) -> AgentRecord:
+        *,
+        operation_id: str | None = None,
+        payload_hash: str | None = None,
+        response_builder: Callable[[AgentRecord], str] | None = None,
+    ) -> Any:
         """Register a worker, or re-admit a returning one on its own context."""
 
         now = utcnow_iso()
         with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if operation_id is not None and payload_hash is not None:
+                row = connection.execute(
+                    "SELECT payload_hash, response_json FROM operation "
+                    "WHERE actor = ? AND operation_id = ?",
+                    (name, operation_id),
+                ).fetchone()
+                if row is not None:
+                    if row["payload_hash"] != payload_hash:
+                        raise IdempotencyConflictError(
+                            f"operation {operation_id!r} already executed with different payload"
+                        )
+                    return (row["response_json"], False)
+
             row = connection.execute("SELECT * FROM agent WHERE name = ?", (name,)).fetchone()
             if row is None:
                 context_id = uuid4().hex
@@ -397,8 +415,27 @@ class HubStore:
                 },
             )
             agent = self._require_agent(connection, name)
+            res: tuple[Any, bool]
+            if (
+                operation_id is not None
+                and payload_hash is not None
+                and response_builder is not None
+            ):
+                resp_json = response_builder(agent)
+                connection.execute(
+                    "INSERT INTO operation ("
+                    "actor, operation_id, payload_hash, response_json, created"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (name, operation_id, payload_hash, resp_json, utcnow_iso()),
+                )
+                res = (resp_json, True)
+            else:
+                res = (agent, True)
+
         self.signals.notify(EVENT_KEY)
-        return agent
+        if operation_id is None:
+            return agent
+        return res
 
     def _open_task_id(self, connection: Connection, task_id: str | None) -> str | None:
         """Return `task_id` only while that task is still open."""
@@ -551,10 +588,33 @@ class HubStore:
             history = history[-limit:] if limit else []
         return history
 
-    def record_progress(self, task_id: str, agent: str, note: str) -> None:
+    def record_progress(
+        self,
+        task_id: str,
+        agent: str,
+        note: str,
+        *,
+        operation_id: str | None = None,
+        payload_hash: str | None = None,
+        response_builder: Callable[[], str] | None = None,
+    ) -> Any:
         """Record a fire-and-forget progress note and queue it for Alice."""
 
         with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if operation_id is not None and payload_hash is not None:
+                row = connection.execute(
+                    "SELECT payload_hash, response_json FROM operation "
+                    "WHERE actor = ? AND operation_id = ?",
+                    (agent, operation_id),
+                ).fetchone()
+                if row is not None:
+                    if row["payload_hash"] != payload_hash:
+                        raise IdempotencyConflictError(
+                            f"operation {operation_id!r} already executed with different payload"
+                        )
+                    return (row["response_json"], False)
+
             task = self._require_open_task(connection, task_id)
             record = self._require_agent(connection, agent)
             self._add_message(
@@ -571,7 +631,27 @@ class HubStore:
                 {"task_id": task.id, "agent": agent, "note": note},
             )
             self._touch(connection, agent)
+            res: tuple[Any, bool]
+            if (
+                operation_id is not None
+                and payload_hash is not None
+                and response_builder is not None
+            ):
+                resp_json = response_builder()
+                connection.execute(
+                    "INSERT INTO operation ("
+                    "actor, operation_id, payload_hash, response_json, created"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (agent, operation_id, payload_hash, resp_json, utcnow_iso()),
+                )
+                res = (resp_json, True)
+            else:
+                res = (None, True)
+
         self.signals.notify(EVENT_KEY)
+        if operation_id is None:
+            return None
+        return res
 
     def open_question(self, task_id: str, agent: str, question: str, sent_as: str) -> int:
         """Park a task on `input-required` and return the question's row id.
@@ -691,9 +771,9 @@ class HubStore:
         """Record an operation result for idempotency deduplication."""
         with database(self.path) as connection:
             connection.execute(
-                "INSERT INTO operation (actor, operation_id, payload_hash, response_json)"
-                " VALUES (?, ?, ?, ?)",
-                (actor, operation_id, payload_hash, response_json),
+                "INSERT INTO operation (actor, operation_id, payload_hash, response_json, created)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (actor, operation_id, payload_hash, response_json, utcnow_iso()),
             )
 
     def submit_result(
@@ -705,7 +785,10 @@ class HubStore:
         artifacts: Sequence[Mapping[str, Any]] = (),
         *,
         status: TaskState | None = None,
-    ) -> TaskRecord:
+        operation_id: str | None = None,
+        payload_hash: str | None = None,
+        response_builder: Callable[[TaskRecord], str] | None = None,
+    ) -> Any:
         """Drive a task to a terminal state and free its worker."""
 
         payload: dict[str, Any]
@@ -776,6 +859,20 @@ class HubStore:
             raise ConflictError(f"unsupported result type: {type(actual_result)}")
 
         with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if operation_id is not None and payload_hash is not None:
+                row = connection.execute(
+                    "SELECT payload_hash, response_json FROM operation "
+                    "WHERE actor = ? AND operation_id = ?",
+                    (agent, operation_id),
+                ).fetchone()
+                if row is not None:
+                    if row["payload_hash"] != payload_hash:
+                        raise IdempotencyConflictError(
+                            f"operation {operation_id!r} already executed with different payload"
+                        )
+                    return (row["response_json"], False)
+
             task = self._require_open_task(connection, task_id)
             record = self._require_agent(connection, agent)
             self._add_message(
@@ -811,8 +908,27 @@ class HubStore:
             )
             self._touch(connection, agent)
             finished = self._require_task(connection, task.id)
+            res: tuple[Any, bool]
+            if (
+                operation_id is not None
+                and payload_hash is not None
+                and response_builder is not None
+            ):
+                resp_json = response_builder(finished)
+                connection.execute(
+                    "INSERT INTO operation ("
+                    "actor, operation_id, payload_hash, response_json, created"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (agent, operation_id, payload_hash, resp_json, utcnow_iso()),
+                )
+                res = (resp_json, True)
+            else:
+                res = (finished, True)
+
         self.signals.notify(EVENT_KEY)
-        return finished
+        if operation_id is None:
+            return finished
+        return res
 
     def cancel_task(self, task_id: str) -> TaskRecord:
         """Cancel an open task and release whoever was holding it."""

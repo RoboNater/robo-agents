@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -11,7 +12,7 @@ import pytest_asyncio
 from agent_hub import create_app
 from agent_hub.database import initialize_database
 from agent_hub.store import HubStore
-from agent_hub_common import HubSettings, MetaKeys
+from agent_hub_common import SCHEMA_VERSION, HubSettings, MetaKeys
 from fastapi import FastAPI
 
 TOKEN = "test-token"
@@ -126,6 +127,8 @@ async def check_in(
                     MetaKeys.AGENT: name,
                     MetaKeys.CAPABILITIES: capabilities or ["python"],
                     MetaKeys.RUNTIME: "claude-code",
+                    MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                    MetaKeys.OPERATION_ID: uuid4().hex,
                 },
             ),
         ),

@@ -269,8 +269,8 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
         }
         # Insert into operation table to verify schema
         connection.execute(
-            "INSERT INTO operation (actor, operation_id, payload_hash, response_json) "
-            "VALUES ('bob', 'op-1', 'hash-1', '{\"ok\": true}')"
+            "INSERT INTO operation (actor, operation_id, payload_hash, response_json, created) "
+            "VALUES ('bob', 'op-1', 'hash-1', '{\"ok\": true}', '2026-09-07T00:00:00Z')"
         )
         row = connection.execute("SELECT * FROM operation WHERE actor = 'bob'").fetchone()
 
@@ -278,3 +278,4 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     assert "operation" in tables
     assert row["operation_id"] == "op-1"
     assert row["payload_hash"] == "hash-1"
+    assert row["created"] == "2026-09-07T00:00:00Z"

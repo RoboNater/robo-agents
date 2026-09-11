@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any, Self
 
@@ -41,6 +42,8 @@ class EventKind(StrEnum):
 
 SCHEMA_VERSION: int = 1
 
+SHA_HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
 
 class ImplementerOutcome(StrEnum):
     COMPLETED = "completed"
@@ -69,7 +72,7 @@ class Finding(BaseModel):
 class ImplementerResult(BaseModel):
     outcome: ImplementerOutcome
     pr_url: str | None = None
-    head_sha: str | None = None
+    head_sha: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{40}$")
     commits: list[str] = Field(default_factory=list)
     tests: list[TestResult] = Field(default_factory=list)
     blocker: str | None = None
@@ -82,7 +85,7 @@ class ImplementerResult(BaseModel):
         if self.outcome == ImplementerOutcome.COMPLETED:
             if not self.pr_url or not self.pr_url.strip():
                 raise ValueError("completed implementer result requires pr_url")
-            if not self.head_sha or not self.head_sha.strip():
+            if not self.head_sha or not SHA_HEX_40_RE.match(self.head_sha):
                 raise ValueError("completed implementer result requires head_sha")
         return self
 
@@ -91,7 +94,7 @@ class ReviewerResult(BaseModel):
     verdict: ReviewerVerdict
     pr_url: str | None = None
     review_url: str | None = None
-    reviewed_head_sha: str | None = None
+    reviewed_head_sha: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{40}$")
     blocking_findings: list[Finding] = Field(default_factory=list)
     nonblocking_findings: list[Finding] = Field(default_factory=list)
     tests: list[TestResult] | None = None
@@ -100,7 +103,7 @@ class ReviewerResult(BaseModel):
     @model_validator(mode="after")
     def validate_approved(self) -> Self:
         if self.verdict == ReviewerVerdict.APPROVED:
-            if not self.reviewed_head_sha or not self.reviewed_head_sha.strip():
+            if not self.reviewed_head_sha or not SHA_HEX_40_RE.match(self.reviewed_head_sha):
                 raise ValueError("approved reviewer result requires reviewed_head_sha")
             if len(self.blocking_findings) > 0:
                 raise ValueError("approved reviewer result requires blocking_findings to be empty")

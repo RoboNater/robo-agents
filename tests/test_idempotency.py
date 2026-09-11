@@ -575,3 +575,381 @@ async def test_typed_result_roundtrip_a2a_to_get_state(
     assert rev_row.result["blocking_findings"][0]["id"] == "r2-1"
     assert len(rev_row.result["nonblocking_findings"]) == 1
     assert rev_row.result["nonblocking_findings"][0]["id"] == "r2-2"
+
+
+async def test_missing_schema_version_and_operation_id_rejected_with_400(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    # 1. Check-in missing schema_version
+    resp = await client.post(
+        "/a2a",
+        json=_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "READY"}],
+                    "metadata": {
+                        MetaKeys.AGENT: "bob",
+                        MetaKeys.CAPABILITIES: ["python"],
+                        MetaKeys.OPERATION_ID: uuid4().hex,
+                    },
+                }
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == -32602
+    assert "schema_version is required" in resp.json()["error"]["message"]
+
+    # 2. Check-in missing operation_id
+    resp = await client.post(
+        "/a2a",
+        json=_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "READY"}],
+                    "metadata": {
+                        MetaKeys.AGENT: "bob",
+                        MetaKeys.CAPABILITIES: ["python"],
+                        MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                    },
+                }
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == -32602
+    assert "operation_id is required" in resp.json()["error"]["message"]
+
+    # Now valid check-in
+    hub_store.check_in("bob", ["python"])
+    agent = hub_store.agent_by_name("bob")
+    assert agent is not None
+    task = hub_store.assign_task("bob", "implementer", "T1", "Inst")
+
+    # 3. Progress missing schema_version
+    resp = await client.post(
+        "/a2a",
+        json=_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "taskId": task.id,
+                    "contextId": agent.context_id,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "working"}],
+                    "metadata": {
+                        MetaKeys.KIND: "progress",
+                        MetaKeys.OPERATION_ID: uuid4().hex,
+                    },
+                }
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "schema_version is required" in resp.json()["error"]["message"]
+
+    # 4. Progress missing operation_id
+    resp = await client.post(
+        "/a2a",
+        json=_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "taskId": task.id,
+                    "contextId": agent.context_id,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "working"}],
+                    "metadata": {
+                        MetaKeys.KIND: "progress",
+                        MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                    },
+                }
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "operation_id is required" in resp.json()["error"]["message"]
+
+    # 5. Result missing schema_version
+    resp = await client.post(
+        "/a2a",
+        json=_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "taskId": task.id,
+                    "contextId": agent.context_id,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "done"}],
+                    "metadata": {
+                        MetaKeys.KIND: "result",
+                        MetaKeys.OPERATION_ID: uuid4().hex,
+                        MetaKeys.RESULT: {
+                            "outcome": "completed",
+                            "summary": "done",
+                            "pr_url": "https://github.com/org/repo/pull/1",
+                            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                        },
+                    },
+                }
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "schema_version is required" in resp.json()["error"]["message"]
+
+    # 6. Result missing operation_id
+    resp = await client.post(
+        "/a2a",
+        json=_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "taskId": task.id,
+                    "contextId": agent.context_id,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "done"}],
+                    "metadata": {
+                        MetaKeys.KIND: "result",
+                        MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                        MetaKeys.RESULT: {
+                            "outcome": "completed",
+                            "summary": "done",
+                            "pr_url": "https://github.com/org/repo/pull/1",
+                            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                        },
+                    },
+                }
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "operation_id is required" in resp.json()["error"]["message"]
+
+    # 7. Result missing hub.result (with legacy hub.status) -> HTTP 400 (no fallback)
+    resp = await client.post(
+        "/a2a",
+        json=_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "taskId": task.id,
+                    "contextId": agent.context_id,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "done"}],
+                    "metadata": {
+                        MetaKeys.KIND: "result",
+                        MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                        MetaKeys.OPERATION_ID: uuid4().hex,
+                        MetaKeys.STATUS: "completed",
+                    },
+                }
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "result is required" in resp.json()["error"]["message"]
+
+
+async def test_atomic_rollback_on_failure(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    # Check-in failure rollback: response_builder throws exception
+    op_id = "op-rollback-checkin-1"
+    payload_hash = "hash-rollback-1"
+    def fail_builder(*args: Any) -> Any:
+        raise RuntimeError("Simulated builder failure")
+
+    with pytest.raises(RuntimeError, match="Simulated builder failure"):
+        hub_store.check_in(
+            "dave",
+            ["python"],
+            operation_id=op_id,
+            payload_hash=payload_hash,
+            response_builder=fail_builder,
+        )
+
+    # Verify atomic rollback: no agent, no message, no event, no operation record
+    assert hub_store.agent_by_name("dave") is None
+    with database(hub_store.path) as conn:
+        assert (
+            conn.execute("SELECT count(*) as c FROM agent WHERE name = 'dave'").fetchone()["c"]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT count(*) as c FROM message WHERE sender = 'dave'").fetchone()["c"]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT count(*) as c FROM operation WHERE operation_id = ?", (op_id,)
+            ).fetchone()["c"]
+            == 0
+        )
+
+    # Submit result failure rollback
+    hub_store.check_in("dave", ["python"])
+    dave = hub_store.agent_by_name("dave")
+    assert dave is not None
+    task = hub_store.assign_task("dave", "implementer", "T1", "Inst")
+
+    res = ImplementerResult(
+        outcome=ImplementerOutcome.COMPLETED,
+        summary="Done",
+        pr_url="https://github.com/org/repo/pull/1",
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    res_op_id = "op-rollback-res-1"
+
+    def fail_result_builder(*args: Any) -> Any:
+        raise RuntimeError("Simulated result failure")
+
+    with pytest.raises(RuntimeError, match="Simulated result failure"):
+        hub_store.submit_result(
+            task.id,
+            "dave",
+            res,
+            operation_id=res_op_id,
+            payload_hash="res-hash-1",
+            response_builder=fail_result_builder,
+        )
+
+    # Verify task remains SUBMITTED (not transitioned to COMPLETED) and no operation record exists
+    task_after = hub_store.get_task(task.id)
+    assert task_after is not None and task_after.state == TaskState.SUBMITTED
+    with database(hub_store.path) as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) as c FROM operation WHERE operation_id = ?", (res_op_id,)
+            ).fetchone()["c"]
+            == 0
+        )
+
+
+async def test_worker_client_ambiguous_timeout_and_id_reuse(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    from unittest.mock import patch
+
+    from worker_mcp.client import WorkerHubClient
+    from worker_mcp.config import WorkerSettings
+
+    settings = WorkerSettings(
+        agent_name="bob",
+        hub_url="http://hub.test",
+        token="test-token",
+        runtime="claude-code",
+        max_retries=2,
+        backoff_factor_s=0.01,
+    )
+
+    worker = WorkerHubClient(settings, http_client=client)
+
+    # 1. Test ambiguous timeout in _request_with_retry automatically retrying same op_id
+    original_request = client.request
+    call_count = 0
+    captured_payloads: list[dict[str, Any]] = []
+
+    async def mock_request_with_timeout(*args: Any, **kwargs: Any) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        json_body = kwargs.get("json")
+        if json_body:
+            captured_payloads.append(json_body)
+        if call_count == 1:
+            raise httpx.ReadTimeout("Read timed out")
+        return await original_request(*args, **kwargs)
+
+    with patch.object(client, "request", side_effect=mock_request_with_timeout):
+        reg = await worker.check_in()
+        assert reg["status"] == "registered"
+
+    # Verify 2 attempts were made with identical messageId and hub.operation_id
+    assert call_count == 2
+    assert len(captured_payloads) == 2
+    meta1 = captured_payloads[0]["params"]["message"]["metadata"]
+    meta2 = captured_payloads[1]["params"]["message"]["metadata"]
+    assert meta1[MetaKeys.OPERATION_ID] == meta2[MetaKeys.OPERATION_ID]
+
+    # 2. Test pending progress operation_id retention across caller-level retries
+    task = hub_store.assign_task("bob", "implementer", "T1", "Inst")
+
+    call_count_prog = 0
+    captured_progress_payloads: list[dict[str, Any]] = []
+
+    async def mock_progress_failure(*args: Any, **kwargs: Any) -> httpx.Response:
+        nonlocal call_count_prog
+        call_count_prog += 1
+        json_body = kwargs.get("json")
+        if json_body:
+            captured_progress_payloads.append(json_body)
+        if call_count_prog <= 3:  # Fail all internal transport retries
+            raise httpx.WriteTimeout("Write timed out")
+        return await original_request(*args, **kwargs)
+
+    with (
+        patch.object(client, "request", side_effect=mock_progress_failure),
+        pytest.raises(httpx.WriteTimeout),
+    ):
+        await worker.report_progress(task.id, "Step 1 progress")
+
+    # Second caller-level attempt: should reuse pending operation_id
+    call_count_prog_2 = 0
+
+    async def mock_progress_success(*args: Any, **kwargs: Any) -> httpx.Response:
+        nonlocal call_count_prog_2
+        call_count_prog_2 += 1
+        json_body = kwargs.get("json")
+        if json_body:
+            captured_progress_payloads.append(json_body)
+        return await original_request(*args, **kwargs)
+
+    with patch.object(client, "request", side_effect=mock_progress_success):
+        prog_res = await worker.report_progress(task.id, "Step 1 progress")
+        assert prog_res["ok"] is True
+
+    # Check that operation_id was retained across the two caller calls
+    first_attempt_meta = captured_progress_payloads[0]["params"]["message"]["metadata"]
+    second_attempt_meta = captured_progress_payloads[-1]["params"]["message"]["metadata"]
+    assert first_attempt_meta[MetaKeys.OPERATION_ID] == second_attempt_meta[MetaKeys.OPERATION_ID]
+
+
+async def test_operation_table_created_column(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    op_id = "op-created-col-1"
+    payload = _rpc(
+        "message/send",
+        {
+            "message": {
+                "messageId": uuid4().hex,
+                "role": "user",
+                "parts": [{"kind": "text", "text": "READY"}],
+                "metadata": {
+                    MetaKeys.AGENT: "eve",
+                    MetaKeys.CAPABILITIES: ["python"],
+                    MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                    MetaKeys.OPERATION_ID: op_id,
+                },
+            }
+        },
+    )
+    resp = await client.post("/a2a", json=payload)
+    assert resp.status_code == 200
+
+    with database(hub_store.path) as conn:
+        row = conn.execute("SELECT * FROM operation WHERE operation_id = ?", (op_id,)).fetchone()
+        assert row is not None
+        assert row["created"] is not None
+        assert "T" in row["created"]  # Valid ISO timestamp
