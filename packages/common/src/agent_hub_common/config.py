@@ -18,15 +18,9 @@ logger = logging.getLogger(__name__)
 # detected by value; "*" is a spelling no IP parser accepts.
 WILDCARD_HOST_ALIAS = "*"
 
-# The hold ceiling and the liveness threshold both scale with the default hold,
-# so raising or lowering HUB_DEFAULT_WAIT_S alone stays a consistent
-# configuration. Spec §4.3 puts the threshold at three times the timeout: a
-# worker that keeps re-calling touches the hub once per default hold, and the
-# ceiling stays below the threshold so a single long hold is never mistaken for
-# silence.
 DEFAULT_WAIT_S = 120.0
 MAX_WAIT_FACTOR = 2.5
-HEARTBEAT_FACTOR = 3.0
+DEFAULT_LOST_AFTER_S = 180.0
 DEFAULT_SWEEP_INTERVAL_S = 10.0
 
 
@@ -173,9 +167,8 @@ class HubSettings:
     # empty at the deadline and the caller is told to call again.
     default_wait_s: float = 120.0
     max_wait_s: float = 300.0
-    # An agent is only silent between two held calls, so the liveness threshold
-    # has to outlast the longest hold the hub will grant.
-    heartbeat_timeout_s: float = 360.0
+    # Liveness comes from worker-mcp's timer, independently of LLM tool calls.
+    lost_after_s: float = DEFAULT_LOST_AFTER_S
     sweep_interval_s: float = 10.0
 
     def bounded_wait(self, requested: float | None) -> float:
@@ -250,17 +243,6 @@ class HubSettings:
                 "HUB_MAX_WAIT_S must be at least HUB_DEFAULT_WAIT_S; "
                 "the ceiling cannot be below the default hold"
             )
-        heartbeat_timeout_s = _positive_seconds(
-            env, "HUB_HEARTBEAT_TIMEOUT_S", HEARTBEAT_FACTOR * default_wait_s
-        )
-        if heartbeat_timeout_s <= max_wait_s:
-            # A worker is out of contact for the whole of a held call; declaring
-            # it lost mid-hold would evict agents that are behaving correctly.
-            raise ConfigurationError(
-                "HUB_HEARTBEAT_TIMEOUT_S must exceed HUB_MAX_WAIT_S; "
-                "a worker is silent for the length of its longest held call"
-            )
-
         return cls(
             host=host,
             port=port,
@@ -272,7 +254,7 @@ class HubSettings:
             guides_dir=guides_dir,
             default_wait_s=default_wait_s,
             max_wait_s=max_wait_s,
-            heartbeat_timeout_s=heartbeat_timeout_s,
+            lost_after_s=_positive_seconds(env, "HUB_LOST_AFTER_S", DEFAULT_LOST_AFTER_S),
             sweep_interval_s=_positive_seconds(
                 env, "HUB_SWEEP_INTERVAL_S", DEFAULT_SWEEP_INTERVAL_S
             ),

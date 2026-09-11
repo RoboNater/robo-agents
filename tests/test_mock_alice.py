@@ -45,7 +45,7 @@ async def test_mock_alice_drives_worker_through_full_task(
         guides_dir=tmp_path / "guides",
         default_wait_s=0.5,
         max_wait_s=1.0,
-        heartbeat_timeout_s=60.0,
+        lost_after_s=60.0,
         sweep_interval_s=3600.0,
     )
     app = create_app(settings)

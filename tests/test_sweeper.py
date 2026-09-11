@@ -18,7 +18,7 @@ async def test_the_loop_reports_an_overdue_lease_without_being_asked(
     store.assign_task("bob", "implementer", "Fix #1", "Open a PR", lease_min=-1)
     await drain(store)
 
-    sweeper = start_sweeper(store, interval_s=0.01, heartbeat_timeout_s=3600)
+    sweeper = start_sweeper(store, interval_s=0.01, lost_after_s=3600)
     try:
         event = await store.wait_for_event(2.0)
     finally:
@@ -33,8 +33,8 @@ class FlakyStore:
     def __init__(self) -> None:
         self.calls: list[float] = []
 
-    def sweep(self, heartbeat_timeout_s: float) -> list[EventRecord]:
-        self.calls.append(heartbeat_timeout_s)
+    def sweep(self, lost_after_s: float) -> list[EventRecord]:
+        self.calls.append(lost_after_s)
         if len(self.calls) == 1:
             raise RuntimeError("database is locked")
         return []
@@ -43,7 +43,7 @@ class FlakyStore:
 async def test_a_failing_sweep_does_not_stop_the_loop() -> None:
     flaky = FlakyStore()
 
-    sweeper = start_sweeper(cast(HubStore, flaky), interval_s=0.01, heartbeat_timeout_s=3600)
+    sweeper = start_sweeper(cast(HubStore, flaky), interval_s=0.01, lost_after_s=3600)
     try:
         while len(flaky.calls) < 3:
             await asyncio.sleep(0.01)
@@ -54,7 +54,7 @@ async def test_a_failing_sweep_does_not_stop_the_loop() -> None:
 
 
 async def test_stopping_the_loop_leaves_no_task_running(store: HubStore) -> None:
-    sweeper = start_sweeper(store, interval_s=0.01, heartbeat_timeout_s=3600)
+    sweeper = start_sweeper(store, interval_s=0.01, lost_after_s=3600)
 
     await stop_sweeper(sweeper)
 

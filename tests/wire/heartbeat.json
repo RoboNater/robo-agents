@@ -1,31 +1,25 @@
 {
   "method": "message/send",
   "request": {
-    "id": 1,
+    "id": 5,
     "jsonrpc": "2.0",
     "method": "message/send",
     "params": {
       "message": {
+        "contextId": "ctx-101",
         "kind": "message",
-        "messageId": "msg-101",
+        "messageId": "msg-heartbeat-101",
         "metadata": {
           "hub.agent": "bob",
-          "hub.capabilities": [
-            "python"
-          ],
-          "hub.harness": "claude-code",
-          "hub.harness_version": "2.1.268",
-          "hub.model": "claude-opus-5",
-          "hub.model_source": "env",
-          "hub.provider": "anthropic",
-          "hub.operation_id": "op-checkin-101",
+          "hub.current_task_id": "task-101",
+          "hub.kind": "heartbeat",
           "hub.schema_version": 1,
           "hub.worker_instance_id": "worker-101"
         },
         "parts": [
           {
             "kind": "text",
-            "text": "READY"
+            "text": "HEARTBEAT"
           }
         ],
         "role": "user"
@@ -33,22 +27,21 @@
     }
   },
   "response": {
-    "id": 1,
+    "id": 5,
     "jsonrpc": "2.0",
     "result": {
       "contextId": "ctx-101",
       "kind": "message",
-      "messageId": "msg-ack-101",
+      "messageId": "msg-heartbeat-ack-101",
       "metadata": {
+        "hub.accepted": true,
         "hub.agent": "bob",
-        "hub.kind": "check_in_ack",
-        "hub.status": "idle",
-        "hub.worker_instance_id": "worker-101"
+        "hub.kind": "heartbeat_ack"
       },
       "parts": [
         {
           "kind": "text",
-          "text": "REGISTERED"
+          "text": "HEARTBEAT"
         }
       ],
       "role": "agent"
