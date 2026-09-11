@@ -334,6 +334,7 @@ class WorkerHubClient:
         if not context_id or not isinstance(context_id, str):
             raise WorkerProtocolError(None, "check_in response did not contain contextId")
         self.context_id = context_id
+        self._pending_checkin = None
         return {
             "status": "registered",
             "agent": self.settings.agent_name,
@@ -431,6 +432,7 @@ class WorkerHubClient:
             }
         }
         await self._post_rpc("message/send", params)
+        self._pending_progress.pop(task_id, None)
         return {"ok": True, "note": note}
 
     async def ask_alice(
@@ -602,6 +604,7 @@ class WorkerHubClient:
             }
         }
         await self._post_rpc("message/send", params)
+        self._pending_progress.pop(task_id, None)
         return {
             "status": terminal_status,
             "task_id": task_id,

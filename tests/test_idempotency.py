@@ -7,6 +7,7 @@ from agent_hub.database import database
 from agent_hub.store import HubStore
 from agent_hub_common import (
     SCHEMA_VERSION,
+    AgentStatus,
     EventKind,
     Finding,
     ImplementerOutcome,
@@ -953,3 +954,109 @@ async def test_operation_table_created_column(
         assert row is not None
         assert row["created"] is not None
         assert "T" in row["created"]  # Valid ISO timestamp
+
+
+async def test_worker_client_clears_pending_ids_after_success(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    from worker_mcp.client import WorkerHubClient
+    from worker_mcp.config import WorkerSettings
+
+    settings = WorkerSettings(
+        agent_name="alice-worker",
+        hub_url="http://hub.test",
+        token="test-token",
+        runtime="claude-code",
+    )
+    worker = WorkerHubClient(settings, http_client=client)
+
+    # 1. First check-in
+    reg1 = await worker.check_in(["python"])
+    assert reg1["status"] == "registered"
+    assert worker._pending_checkin is None
+
+    agent1 = hub_store.agent_by_name("alice-worker")
+    assert agent1 is not None and agent1.status == AgentStatus.IDLE
+
+    # 2. Assign task and test two consecutive identical progress reports
+    task = hub_store.assign_task("alice-worker", "implementer", "Task 1", "Instructions")
+
+    prog1 = await worker.report_progress(task.id, "still working")
+    assert prog1["ok"] is True
+    assert worker._pending_progress.get(task.id) is None
+
+    prog2 = await worker.report_progress(task.id, "still working")
+    assert prog2["ok"] is True
+    assert worker._pending_progress.get(task.id) is None
+
+    # Verify that two distinct task_progress events and operations were created
+    with database(hub_store.path) as conn:
+        events = conn.execute(
+            "SELECT * FROM event WHERE kind = ? ORDER BY id ASC",
+            (EventKind.TASK_PROGRESS.value,),
+        ).fetchall()
+        assert len(events) == 2
+
+        ops = conn.execute(
+            "SELECT operation_id FROM operation WHERE actor = ?",
+            ("alice-worker",),
+        ).fetchall()
+        # 1 check-in + 2 progress = 3 distinct operations
+        assert len(ops) == 3
+        assert len(set(row["operation_id"] for row in ops)) == 3
+
+    # 3. Complete the task
+    res = ImplementerResult(
+        outcome=ImplementerOutcome.COMPLETED,
+        summary="Done",
+        pr_url="https://github.com/org/repo/pull/1",
+        head_sha="0123456789abcdef0123456789abcdef01234567",
+    )
+    submit_res = await worker.submit_result(task.id, res)
+    assert submit_res["status"] == "completed"
+    assert worker._pending_results.get(task.id) is not None
+    assert worker._pending_progress.get(task.id) is None
+
+    # 4. Re-admission test: simulate heartbeat timeout marking worker LOST
+    hub_store.sweep(heartbeat_timeout_s=-1)
+    agent_lost = hub_store.agent_by_name("alice-worker")
+    assert agent_lost is not None and agent_lost.status == AgentStatus.LOST
+
+    # Lost worker cannot be assigned tasks
+    with pytest.raises(Exception, match="not idle"):
+        hub_store.assign_task("alice-worker", "implementer", "Task 2", "Inst 2")
+
+    # Calling check_in again on the same client must generate a new operation_id
+    # and re-admit the worker from LOST to IDLE
+    reg2 = await worker.check_in(["python"])
+    assert reg2["status"] == "registered"
+    assert worker._pending_checkin is None
+
+    agent_reopened = hub_store.agent_by_name("alice-worker")
+    assert agent_reopened is not None
+    assert agent_reopened.status == AgentStatus.IDLE
+
+    # Worker can now be assigned work again
+    task2 = hub_store.assign_task("alice-worker", "implementer", "Task 2", "Inst 2")
+    assert task2 is not None
+
+    # 5. Check-in after release: must use distinct op_id and reflect RELEASED
+    hub_store.release_agent("alice-worker")
+    agent_released = hub_store.agent_by_name("alice-worker")
+    assert agent_released is not None and agent_released.status == AgentStatus.RELEASED
+
+    reg3 = await worker.check_in(["python"])
+    assert reg3["status"] == "registered"
+    assert worker._pending_checkin is None
+
+    # Total operations recorded for alice-worker should be 6 distinct IDs
+    # (check-in 1, prog 1, prog 2, submit_result 1, check-in 2 re-admission,
+    # check-in 3 post-release)
+    with database(hub_store.path) as conn:
+        ops_after = conn.execute(
+            "SELECT operation_id FROM operation WHERE actor = ?",
+            ("alice-worker",),
+        ).fetchall()
+        assert len(ops_after) == 6
+        assert len(set(row["operation_id"] for row in ops_after)) == 6
+
