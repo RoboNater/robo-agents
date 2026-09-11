@@ -148,6 +148,9 @@ async def drive_one_task_mcp(
                 if known_ag is not None
                 else max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
             )
+        checkin_event_id: Any = None
+        while not agent_name and asyncio.get_running_loop().time() < deadline:
+            timeout_to_use = 0.05 if (known_ag is not None and not last_delivery_id) else 5.0
             wait_args: dict[str, Any] = {"timeout_s": timeout_to_use}
             if last_delivery_id:
                 wait_args["ack"] = last_delivery_id
@@ -172,6 +175,7 @@ async def drive_one_task_mcp(
                 agent_name = expected_agent
                 payload = event.get("payload") or {}
                 checked_in_harness = payload.get("harness")
+                checkin_event_id = event.get("id")
                 break
 
         if not agent_name:
@@ -186,13 +190,18 @@ async def drive_one_task_mcp(
             logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
         logger.info("Worker %r checked in! Assigning task...", agent_name)
+        checkpoint_key = (
+            f"event:{checkin_event_id}:assign"
+            if checkin_event_id is not None
+            else f"assign:{agent_name}:{role}"
+        )
         await _call(
             session,
             "log_decision",
             {
                 "summary": f"Assigned task to {agent_name} for role {role}",
                 "rationale": f"Initial assignment for role {role}",
-                "key": f"assign:{agent_name}:{role}",
+                "key": checkpoint_key,
             },
         )
         assign_data = await _call(
@@ -236,13 +245,20 @@ async def drive_one_task_mcp(
             logger.info("Progress reported: %s", payload.get("note"))
         elif kind == "worker_question":
             q_task_id = payload.get("task_id")
+            q_msg_id = payload.get("message_id")
             logger.info("Worker asked question on %s: %r", q_task_id, payload.get("question"))
             await _call(
                 session,
                 "reply",
-                {"task_id": q_task_id, "text": "Approved. Proceed with the proposed design."},
+                {
+                    "task_id": q_task_id,
+                    "text": "Approved. Proceed with the proposed design.",
+                    "message_id": q_msg_id,
+                },
             )
             logger.info("Alice replied to question on %s", q_task_id)
+            if crash_at == "after_reply":
+                raise AliceCrashError("Simulated Alice crash after reply")
         elif (
             kind in ("task_completed", "task_failed")
             and payload.get("task_id") == task_id
@@ -332,6 +348,7 @@ async def drive_one_task(
             existing_task["state"],
         )
     else:
+        checkin_event_id: int | None = None
         while asyncio.get_running_loop().time() < deadline:
             if crash_at == "before_ack" and last_delivery_id:
                 raise AliceCrashError("Simulated Alice crash before ack")
@@ -360,6 +377,7 @@ async def drive_one_task(
             if matched:
                 agent_name = expected_agent
                 checked_in_harness = event.payload.get("harness")
+                checkin_event_id = event.id
                 break
 
         if not agent_name:
@@ -374,10 +392,15 @@ async def drive_one_task(
             logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
         logger.info("Worker %r checked in! Assigning task...", agent_name)
+        checkpoint_key = (
+            f"event:{checkin_event_id}:assign"
+            if checkin_event_id is not None
+            else f"assign:{agent_name}:{role}"
+        )
         store.log_decision(
             f"Assigned task to {agent_name} for role {role}",
             f"Initial assignment for role {role}",
-            key=f"assign:{agent_name}:{role}",
+            key=checkpoint_key,
         )
         # 2. Assign task
         task = store.assign_task(
@@ -418,11 +441,16 @@ async def drive_one_task(
         elif event.kind == EventKind.WORKER_QUESTION:
             q_task_id = event.payload.get("task_id")
             question = event.payload.get("question")
+            q_msg_id = event.payload.get("message_id")
             logger.info("Worker asked question on %s: %r", q_task_id, question)
-            store.reply(q_task_id, "Approved. Proceed with the proposed design.")
+            store.reply(
+                q_task_id,
+                "Approved. Proceed with the proposed design.",
+                message_id=q_msg_id,
+            )
             logger.info("Alice replied to question on %s", q_task_id)
-            if crash_at == "after_action":
-                raise AliceCrashError("Simulated Alice crash after action")
+            if crash_at in ("after_action", "after_reply"):
+                raise AliceCrashError("Simulated Alice crash after reply")
 
         elif event.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
             completed_id = event.payload.get("task_id")
@@ -495,7 +523,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=60.0, help="Hold timeout in seconds")
     parser.add_argument(
         "--crash-at",
-        choices=["delivery", "after_action", "before_ack"],
+        choices=["delivery", "after_action", "before_ack", "after_reply"],
         default=None,
         help="Simulate crash point for Alice",
     )

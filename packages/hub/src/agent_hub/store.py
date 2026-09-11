@@ -924,8 +924,6 @@ class HubStore:
 
         with database(self.path) as connection:
             task = self._require_task(connection, task_id)
-            if task.state in TERMINAL_STATES:
-                raise ConflictError(f"task {task_id} is in terminal state {task.state}")
             if task.state != TaskState.INPUT_REQUIRED:
                 return False
             if message_id is not None:

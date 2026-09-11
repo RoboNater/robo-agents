@@ -262,10 +262,12 @@ def test_state_guards_idempotency(tmp_path: Path) -> None:
     # Duplicate reply with same message_id returns False
     assert store.reply(task.id, "Duplicate answer", message_id=q_msg_id) is False
 
-    # Terminal task rejects reply with ConflictError
+    # Terminal task safely no-ops with False
     store.set_task_state(task.id, TaskState.CANCELED, "Canceled")
-    with pytest.raises(ConflictError, match="terminal state"):
-        store.reply(task.id, "Late answer on canceled task")
+    assert store.reply(task.id, "Late answer on canceled task") is False
+    task2 = store.assign_task("worker-1", "implementer", "Task 2", "Instructions")
+    store.set_task_state(task2.id, TaskState.FAILED, "Failed")
+    assert store.reply(task2.id, "Late answer on failed task") is False
 
     # 5. release_agent guard when agent is already released
     store.release_agent("worker-1")
@@ -402,16 +404,16 @@ async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
         with database(db_path) as conn:
             tasks = conn.execute("SELECT * FROM task").fetchall()
             assert len(tasks) == 1
-            decisions = conn.execute(
-                "SELECT * FROM decision WHERE key = ?", ("assign:bob:implementer",)
-            ).fetchall()
-            assert len(decisions) == 1
             check_in_event = conn.execute(
                 "SELECT * FROM event WHERE kind = ?", (EventKind.AGENT_CHECKED_IN.value,)
             ).fetchone()
             assert check_in_event is not None
             assert check_in_event["delivery_attempts"] == 2
             assert check_in_event["state"] == "acked"
+            decisions = conn.execute(
+                "SELECT * FROM decision WHERE key = ?", (f"event:{check_in_event['id']}:assign",)
+            ).fetchall()
+            assert len(decisions) == 1
 
 
 async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None:
@@ -596,5 +598,117 @@ async def test_mock_alice_crash_before_ack_and_recovery(tmp_path: Path) -> None:
             assert check_in_event is not None
             assert check_in_event["delivery_attempts"] == 2
             assert check_in_event["state"] == "acked"
+
+
+async def test_mock_alice_crash_after_reply_and_recovery(tmp_path: Path) -> None:
+    db_path = tmp_path / "hub_after_reply_crash.db"
+    initialize_database(db_path)
+
+    settings = HubSettings(
+        host="127.0.0.1",
+        port=8420,
+        public_url="http://hub.example:8420",
+        state_dir=tmp_path,
+        database_path=db_path,
+        token=TOKEN,
+        token_file=tmp_path / "token",
+        guides_dir=tmp_path / "guides",
+        default_wait_s=0.5,
+        max_wait_s=1.0,
+        lost_after_s=60.0,
+        sweep_interval_s=3600.0,
+        event_lease_s=0.2,
+    )
+    app = create_app(settings)
+
+    worker_settings = WorkerSettings(
+        hub_url=BASE_URL,
+        token=TOKEN,
+        agent_name="bob",
+        profile=AgentProfile(harness="claude-code"),
+        default_wait_s=0.5,
+        max_retries=2,
+        backoff_factor_s=0.01,
+    )
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url=BASE_URL,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        ) as http_client,
+    ):
+        store = app.state.store
+        worker = WorkerHubClient(worker_settings, http_client=http_client)
+
+        async def worker_lifecycle() -> None:
+            await worker.check_in(["python"])
+            assignment = await worker.await_assignment(timeout_s=5.0)
+            task_id = assignment["task_id"]
+            # Worker asks a question and receives reply
+            ans = await worker.ask_alice(task_id, "Should I proceed?", timeout_s=5.0)
+            assert "Approved" in ans.get("reply", "")
+            # Worker finishes work and submits result
+            await worker.submit_result(
+                task_id,
+                "completed",
+                "Work done",
+                artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
+            )
+            rel = await worker.await_assignment(timeout_s=5.0)
+            assert rel == {"release": True}
+
+        worker_task = asyncio.create_task(worker_lifecycle())
+
+        # First Alice session answers the question, then crashes before acking
+        with pytest.raises(mock_alice.AliceCrashError):
+            await mock_alice.drive_one_task(
+                store=store,
+                expected_agent="bob",
+                expected_harness="claude-code",
+                timeout_s=5.0,
+                crash_at="after_reply",
+            )
+
+        # Worker completes task while worker_question lease expires
+        await asyncio.sleep(0.25)
+
+        # Second Alice session takes over:
+        # 1. worker_question is redelivered on lease expiry (delivery_attempts == 2)
+        # 2. Task is already in terminal state (completed)
+        # 3. store.reply safely returns False (applied: False) without raising ConflictError
+        # 4. Subsequent task_completed event is received, worker released, workflow marked DONE
+        res = await mock_alice.drive_one_task(
+            store=store,
+            expected_agent="bob",
+            expected_harness="claude-code",
+            timeout_s=5.0,
+        )
+        await worker_task
+
+        assert res is not None
+        assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+
+        with database(db_path) as conn:
+            # Check question event was redelivered and eventually acked
+            q_event = conn.execute(
+                "SELECT * FROM event WHERE kind = ?", (EventKind.WORKER_QUESTION.value,)
+            ).fetchone()
+            assert q_event is not None
+            assert q_event["delivery_attempts"] == 2
+            assert q_event["state"] == "acked"
+
+            # Exactly one reply message from Alice was written (plus initial assignment message)
+            replies = conn.execute(
+                "SELECT * FROM message WHERE direction = 'from_alice' "
+                "AND parts_json LIKE '%\"hub.kind\": \"reply\"%'"
+            ).fetchall()
+            assert len(replies) == 1
+            all_from_alice = conn.execute(
+                "SELECT * FROM message WHERE direction = 'from_alice'"
+            ).fetchall()
+            assert len(all_from_alice) == 2
+
 
 
