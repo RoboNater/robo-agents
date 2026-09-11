@@ -35,8 +35,12 @@ POLL_INTERVAL_S = 10.0
 GH_TIMEOUT_S = 30.0
 _STDERR_LIMIT = 500
 
+# Each part lands in a `gh api` path, so none may be a dot segment or open
+# with a hyphen.
 PR_URL_RE = re.compile(
-    r"https://(?P<host>[A-Za-z0-9.-]+)/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)"
+    r"https://(?P<host>[A-Za-z0-9][A-Za-z0-9.-]*)"
+    r"/(?P<owner>[A-Za-z0-9][A-Za-z0-9-]*)"
+    r"/(?P<repo>(?!\.\.?/)[A-Za-z0-9_.][A-Za-z0-9_.-]*)"
     r"/pull/(?P<number>[1-9][0-9]*)/?"
 )
 
@@ -133,7 +137,7 @@ class PullRequestRef:
         )
 
     def api(self, path: str) -> list[str]:
-        return ["api", "--hostname", self.host, f"repos/{self.owner}/{self.repo}/{path}"]
+        return ["api", f"--hostname={self.host}", f"repos/{self.owner}/{self.repo}/{path}"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +252,8 @@ class MergeGate:
             ]
         )
         head = _string(view, "headRefOid").lower()
+        if not SHA_HEX_40_RE.fullmatch(head):
+            raise MergeGateError("gh pr view reported a head that is not a commit SHA")
         base_ref = _string(view, "baseRefName")
         merge_state_status = _string(view, "mergeStateStatus")
         checks = await self._checks(ref)
@@ -346,8 +352,8 @@ def _check(item: Any) -> Check:
 def _describe(args: Sequence[str]) -> str:
     """Name a call for an error: `gh pr view`, or `gh api <path>`."""
 
-    if args[:1] == ["api"] and len(args) >= 4:
-        return f"gh api {args[3]}"
+    if args[:1] == ["api"] and len(args) >= 3:
+        return f"gh api {args[2]}"
     return "gh " + " ".join(args[:2])
 
 

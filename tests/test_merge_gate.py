@@ -102,9 +102,9 @@ def _kind(args: Sequence[str]) -> str:
         return "view"
     if args[:2] == ["pr", "checks"]:
         return "checks"
-    if args[0] == "api" and args[3].endswith("/actions/workflows"):
+    if args[0] == "api" and args[2].endswith("/actions/workflows"):
         return "workflows"
-    if args[0] == "api" and "/compare/" in args[3]:
+    if args[0] == "api" and "/compare/" in args[2]:
         return "compare"
     raise AssertionError(f"unexpected gh call: {args}")
 
@@ -337,20 +337,18 @@ async def test_gh_is_called_with_the_pr_url_and_a_bounded_compare() -> None:
         "headRefOid,baseRefName,mergeable,mergeStateStatus",
     ]
     assert gh.calls[1] == ["pr", "checks", PR, "--json", "name,bucket,link"]
-    assert gh.calls[2][:4] == [
+    assert gh.calls[2][:3] == [
         "api",
-        "--hostname",
-        "github.com",
+        "--hostname=github.com",
         "repos/octo/sandbox/actions/workflows",
     ]
-    assert gh.calls[3][:4] == [
+    assert gh.calls[3][:3] == [
         "api",
-        "--hostname",
-        "github.com",
+        "--hostname=github.com",
         f"repos/octo/sandbox/compare/release/1.x...{HEAD}",
     ]
     # The compare response lists every commit and file; only three fields are read.
-    assert gh.calls[3][4] == "--jq"
+    assert gh.calls[3][3] == "--jq"
 
 
 @pytest.mark.parametrize(
@@ -362,6 +360,10 @@ async def test_gh_is_called_with_the_pr_url_and_a_bounded_compare() -> None:
         "https://github.com/octo/sandbox/pull/0",
         "http://github.com/octo/sandbox/pull/7",
         PR + "\n--flag",
+        "https://github.com/octo/../pull/7",
+        "https://github.com/octo/./pull/7",
+        "https://github.com/-octo/sandbox/pull/7",
+        "https://-github.com/octo/sandbox/pull/7",
     ],
 )
 async def test_only_a_pr_url_reaches_gh(url: str) -> None:
@@ -390,6 +392,7 @@ def test_a_pr_ref_names_its_repository() -> None:
 
     assert (ref.host, ref.owner, ref.repo) == ("ghe.example.com", "team", "repo.name")
     assert ref.number == 12
+    assert PullRequestRef.parse("https://github.com/octo/.github/pull/1").repo == ".github"
     assert ref.url == "https://ghe.example.com/team/repo.name/pull/12"
 
 
@@ -399,12 +402,13 @@ def test_a_pr_ref_names_its_repository() -> None:
         FakeGh(view=GhResult(1, "", "GraphQL: Could not resolve to a PullRequest\n")),
         FakeGh(view=GhResult(0, "not json", "")),
         FakeGh(view=GhResult(0, "{}", "")),
+        FakeGh(view=view(head="HEAD~1")),
         FakeGh(checks=GhResult(1, "", "HTTP 401: Bad credentials\n")),
         FakeGh(checks=NO_CHECKS, workflows=GhResult(1, "", "HTTP 404: Not Found\n")),
         FakeGh(compare=GhResult(0, json.dumps({"base_commit": MAIN}), "")),
     ],
-    ids=["view-fails", "view-not-json", "view-missing-fields", "checks-fail", "workflows-fail",
-         "compare-missing-behind"],
+    ids=["view-fails", "view-not-json", "view-missing-fields", "view-head-not-a-sha",
+         "checks-fail", "workflows-fail", "compare-missing-behind"],
 )
 async def test_a_gate_that_cannot_be_read_raises_rather_than_reporting(fake: FakeGh) -> None:
     merge_gate, _ = gate(fake)
