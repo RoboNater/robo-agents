@@ -143,16 +143,17 @@ async def drive_one_task_mcp(
             )
         logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
+    active_states = ("working", "submitted", "input_required", "completed", "failed")
     existing_task = None
     state_tasks = state_data.get("tasks") if isinstance(state_data, dict) else []
     for t in state_tasks or []:
-        if isinstance(t, dict) and t.get("assignee") == agent_name:
-            if t.get("state") in ("working", "submitted", "input_required"):
-                existing_task = t
-                break
-            elif t.get("state") in ("completed", "failed"):
-                existing_task = t
-                break
+        if (
+            isinstance(t, dict)
+            and t.get("assignee") == agent_name
+            and t.get("state") in active_states
+        ):
+            existing_task = t
+            break
 
     task_finished = False
     result_data: dict[str, Any] = {}
@@ -324,15 +325,12 @@ async def drive_one_task(
             )
         logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
+    active_states = ("working", "submitted", "input_required", "completed", "failed")
     existing_task = None
     for t in store.get_state()["tasks"]:
-        if t["assignee"] == agent_name:
-            if t["state"] in ("working", "submitted", "input_required"):
-                existing_task = t
-                break
-            elif t["state"] in ("completed", "failed"):
-                existing_task = t
-                break
+        if t["assignee"] == agent_name and t["state"] in active_states:
+            existing_task = t
+            break
 
     task_finished = False
     result_data: dict[str, Any] = {}
