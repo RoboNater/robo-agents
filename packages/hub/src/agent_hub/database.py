@@ -267,6 +267,7 @@ def _migrate_event_delivery(connection: sqlite3.Connection) -> None:
     if "acked_at" not in columns:
         connection.execute("ALTER TABLE event ADD COLUMN acked_at TEXT")
 
+    connection.execute("DROP INDEX IF EXISTS idx_event_inbox")
     if "consumed" in columns:
         connection.execute(
             "UPDATE event SET state = 'acked', acked_at = ts, delivery_attempts = 1 "
@@ -274,7 +275,6 @@ def _migrate_event_delivery(connection: sqlite3.Connection) -> None:
         )
         connection.execute("ALTER TABLE event DROP COLUMN consumed")
 
-    connection.execute("DROP INDEX IF EXISTS idx_event_inbox")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id)")
 

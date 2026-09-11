@@ -1,6 +1,6 @@
 import asyncio
 import importlib.util
-import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from agent_hub_common import (
     EventKind,
     EventState,
     HubSettings,
+    TaskState,
     WorkflowStatus,
 )
 from conftest import BASE_URL, TOKEN
@@ -81,12 +82,13 @@ def test_event_delivery_and_implicit_ack_store(tmp_path: Path) -> None:
 def test_event_redelivery_after_lease_expiry(tmp_path: Path) -> None:
     db_path = tmp_path / "hub.db"
     initialize_database(db_path)
-    store = HubStore(db_path)
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    store = HubStore(db_path, clock=lambda: now)
 
     store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "alice"})
 
-    # First lease with very short duration
-    first_delivery = store.lease_next_event(lease_s=0.1)
+    # First lease with 5s duration
+    first_delivery = store.lease_next_event(lease_s=5.0)
     assert first_delivery is not None
     assert first_delivery.delivery_attempts == 1
     old_delivery_id = first_delivery.delivery_id
@@ -94,8 +96,8 @@ def test_event_redelivery_after_lease_expiry(tmp_path: Path) -> None:
     # Immediate second lease returns nothing
     assert store.lease_next_event() is None
 
-    # Wait for lease to expire
-    time.sleep(0.15)
+    # Advance clock past lease expiry
+    now += timedelta(seconds=6.0)
 
     # Redelivered!
     second_delivery = store.lease_next_event(lease_s=10.0)
@@ -113,10 +115,11 @@ def test_event_redelivery_after_lease_expiry(tmp_path: Path) -> None:
 def test_ack_wrong_or_expired_delivery_id(tmp_path: Path) -> None:
     db_path = tmp_path / "hub.db"
     initialize_database(db_path)
-    store = HubStore(db_path)
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    store = HubStore(db_path, clock=lambda: now)
 
     store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"})
-    leased = store.lease_next_event(lease_s=0.1)
+    leased = store.lease_next_event(lease_s=5.0)
     assert leased is not None
     delivery_id = leased.delivery_id
 
@@ -126,8 +129,8 @@ def test_ack_wrong_or_expired_delivery_id(tmp_path: Path) -> None:
         row = conn.execute("SELECT * FROM event WHERE id = ?", (leased.id,)).fetchone()
         assert row["state"] == "delivered"
 
-    # Wait for lease to expire
-    time.sleep(0.15)
+    # Advance clock past lease expiry
+    now += timedelta(seconds=6.0)
 
     # Ack with expired delivery_id is ignored
     assert store.ack_event(delivery_id) is False
@@ -146,18 +149,19 @@ def test_ack_wrong_or_expired_delivery_id(tmp_path: Path) -> None:
 def test_fifo_ordering_expired_before_newer(tmp_path: Path) -> None:
     db_path = tmp_path / "hub.db"
     initialize_database(db_path)
-    store = HubStore(db_path)
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    store = HubStore(db_path, clock=lambda: now)
 
     # Enqueue 1 and 2
     e1 = store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"})
     e2 = store.append_event(EventKind.TASK_PROGRESS, {"note": "step 1"})
 
-    # Lease e1 with short expiry
-    l1 = store.lease_next_event(lease_s=0.1)
+    # Lease e1 with 5s expiry
+    l1 = store.lease_next_event(lease_s=5.0)
     assert l1 is not None and l1.id == e1.id
 
-    # Wait for e1 to expire
-    time.sleep(0.15)
+    # Advance clock past e1 expiry
+    now += timedelta(seconds=6.0)
 
     # Enqueue e3
     e3 = store.append_event(EventKind.TASK_PROGRESS, {"note": "step 2"})
@@ -182,17 +186,18 @@ def test_fifo_ordering_expired_before_newer(tmp_path: Path) -> None:
 def test_events_survive_hub_restart(tmp_path: Path) -> None:
     db_path = tmp_path / "hub.db"
     initialize_database(db_path)
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
     # Store 1 enqueues and leases an event
-    store1 = HubStore(db_path)
+    store1 = HubStore(db_path, clock=lambda: now)
     e1 = store1.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"})
     store1.append_event(EventKind.TASK_PROGRESS, {"note": "started"})
-    l1 = store1.lease_next_event(lease_s=0.1)
+    l1 = store1.lease_next_event(lease_s=5.0)
     assert l1 is not None and l1.id == e1.id
 
-    # Hub crashes / restarts: Store 2 opens the same db
-    time.sleep(0.15)
-    store2 = HubStore(db_path)
+    # Hub crashes / restarts: Advance time and Store 2 opens the same db
+    now += timedelta(seconds=6.0)
+    store2 = HubStore(db_path, clock=lambda: now)
 
     state = store2.get_state()
     assert state["queued_events"] == 1
@@ -241,13 +246,26 @@ def test_state_guards_idempotency(tmp_path: Path) -> None:
         store.assign_task("worker-1", "reviewer", "Task 2", "Instructions")
 
     # 4. reply guard when task not in INPUT_REQUIRED
-    # task is in WORKING state; reply should be a safe no-op
+    # task is in WORKING state; reply should return False and not write messages
     with database(db_path) as conn:
         before_count = conn.execute("SELECT COUNT(*) AS n FROM message").fetchone()["n"]
-    store.reply(task.id, "Late answer")
+    applied = store.reply(task.id, "Late answer")
+    assert applied is False
     with database(db_path) as conn:
         after_count = conn.execute("SELECT COUNT(*) AS n FROM message").fetchone()["n"]
     assert after_count == before_count
+
+    # Ask question -> task enters INPUT_REQUIRED
+    q_msg_id = store.open_question(task.id, "worker-1", "Need clarification", sent_as="msg-1")
+    # First reply applies
+    assert store.reply(task.id, "Here is the answer", message_id=q_msg_id) is True
+    # Duplicate reply with same message_id returns False
+    assert store.reply(task.id, "Duplicate answer", message_id=q_msg_id) is False
+
+    # Terminal task rejects reply with ConflictError
+    store.set_task_state(task.id, TaskState.CANCELED, "Canceled")
+    with pytest.raises(ConflictError, match="terminal state"):
+        store.reply(task.id, "Late answer on canceled task")
 
     # 5. release_agent guard when agent is already released
     store.release_agent("worker-1")
@@ -299,8 +317,6 @@ async def test_mcp_wait_for_event_and_implicit_ack(tmp_path: Path) -> None:
 async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
     db_path = tmp_path / "hub.db"
     initialize_database(db_path)
-    # Configure short event lease for fast recovery tests
-    store = HubStore(db_path, default_event_lease_s=0.2)
 
     settings = HubSettings(
         host="127.0.0.1",
@@ -337,6 +353,7 @@ async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
             headers={"Authorization": f"Bearer {TOKEN}"},
         ) as http_client,
     ):
+        store = app.state.store
         worker = WorkerHubClient(worker_settings, http_client=http_client)
 
         async def worker_lifecycle() -> None:
@@ -386,15 +403,20 @@ async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
             tasks = conn.execute("SELECT * FROM task").fetchall()
             assert len(tasks) == 1
             decisions = conn.execute(
-                "SELECT * FROM decision WHERE key = ?", (f"assign:{tasks[0]['id']}",)
+                "SELECT * FROM decision WHERE key = ?", ("assign:bob:implementer",)
             ).fetchall()
             assert len(decisions) == 1
+            check_in_event = conn.execute(
+                "SELECT * FROM event WHERE kind = ?", (EventKind.AGENT_CHECKED_IN.value,)
+            ).fetchone()
+            assert check_in_event is not None
+            assert check_in_event["delivery_attempts"] == 2
+            assert check_in_event["state"] == "acked"
 
 
 async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None:
     db_path = tmp_path / "hub_delivery_crash.db"
     initialize_database(db_path)
-    store = HubStore(db_path, default_event_lease_s=0.2)
 
     settings = HubSettings(
         host="127.0.0.1",
@@ -431,6 +453,7 @@ async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None
             headers={"Authorization": f"Bearer {TOKEN}"},
         ) as http_client,
     ):
+        store = app.state.store
         worker = WorkerHubClient(worker_settings, http_client=http_client)
 
         async def worker_lifecycle() -> None:
@@ -473,4 +496,105 @@ async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None
 
         assert res is not None
         assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+
+        with database(db_path) as conn:
+            check_in_event = conn.execute(
+                "SELECT * FROM event WHERE kind = ?", (EventKind.AGENT_CHECKED_IN.value,)
+            ).fetchone()
+            assert check_in_event is not None
+            assert check_in_event["delivery_attempts"] == 2
+            assert check_in_event["state"] == "acked"
+
+
+async def test_mock_alice_crash_before_ack_and_recovery(tmp_path: Path) -> None:
+    db_path = tmp_path / "hub_before_ack_crash.db"
+    initialize_database(db_path)
+
+    settings = HubSettings(
+        host="127.0.0.1",
+        port=8420,
+        public_url="http://hub.example:8420",
+        state_dir=tmp_path,
+        database_path=db_path,
+        token=TOKEN,
+        token_file=tmp_path / "token",
+        guides_dir=tmp_path / "guides",
+        default_wait_s=0.5,
+        max_wait_s=1.0,
+        lost_after_s=60.0,
+        sweep_interval_s=3600.0,
+        event_lease_s=0.2,
+    )
+    app = create_app(settings)
+
+    worker_settings = WorkerSettings(
+        hub_url=BASE_URL,
+        token=TOKEN,
+        agent_name="bob",
+        profile=AgentProfile(harness="claude-code"),
+        default_wait_s=0.5,
+        max_retries=2,
+        backoff_factor_s=0.01,
+    )
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url=BASE_URL,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        ) as http_client,
+    ):
+        store = app.state.store
+        worker = WorkerHubClient(worker_settings, http_client=http_client)
+
+        async def worker_lifecycle() -> None:
+            await worker.check_in(["python"])
+            assignment = await worker.await_assignment(timeout_s=5.0)
+            task_id = assignment["task_id"]
+            await worker.report_progress(task_id, "Working...")
+            await worker.submit_result(
+                task_id,
+                "completed",
+                "Work done",
+                artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
+            )
+            rel = await worker.await_assignment(timeout_s=5.0)
+            assert rel == {"release": True}
+
+        worker_task = asyncio.create_task(worker_lifecycle())
+
+        # First Alice session crashes before acknowledging the event
+        with pytest.raises(mock_alice.AliceCrashError):
+            await mock_alice.drive_one_task(
+                store=store,
+                expected_agent="bob",
+                expected_harness="claude-code",
+                timeout_s=5.0,
+                crash_at="before_ack",
+            )
+
+        # Wait for the check-in event lease to expire
+        await asyncio.sleep(0.25)
+
+        # Second Alice session takes over, receives redelivery, and completes
+        res = await mock_alice.drive_one_task(
+            store=store,
+            expected_agent="bob",
+            expected_harness="claude-code",
+            timeout_s=5.0,
+        )
+        await worker_task
+
+        assert res is not None
+        assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+
+        with database(db_path) as conn:
+            check_in_event = conn.execute(
+                "SELECT * FROM event WHERE kind = ?", (EventKind.AGENT_CHECKED_IN.value,)
+            ).fetchone()
+            assert check_in_event is not None
+            assert check_in_event["delivery_attempts"] == 2
+            assert check_in_event["state"] == "acked"
+
 

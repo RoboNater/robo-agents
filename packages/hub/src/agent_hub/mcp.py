@@ -48,10 +48,12 @@ def create_mcp(store: HubStore) -> FastMCP:
         return asdict(store.assign_task(agent, role, title, instructions, lease_min))
 
     @server.tool()
-    async def reply(task_id: str, text: str) -> dict[str, bool]:
+    async def reply(
+        task_id: str, text: str, message_id: int | None = None
+    ) -> dict[str, bool]:
         """Answer a worker question and return its task to working."""
-        store.reply(task_id, text)
-        return {"ok": True}
+        applied = store.reply(task_id, text, message_id=message_id)
+        return {"ok": True, "applied": applied}
 
     @server.tool()
     async def set_task_state(

@@ -69,16 +69,17 @@ nonzero so detached launches cannot silently appear healthy.
 
 Alice gets `get_state`, `wait_for_event`, `assign_task`, `reply`,
 `set_task_state`, `release_agent`, `set_workflow_status`, and `log_decision`.
-`wait_for_event` consumes the oldest queued event, waits up to 120 seconds
+`wait_for_event` leases the oldest eligible event, waits up to 120 seconds
 (default 120), and returns `{"event": null}` on timeout; call again.
 Zero seconds performs a nonblocking check. If your runtime uses a shorter tool
 timeout, request a shorter hold or configure the client timeout above 120 seconds.
-Consumption happens before transport delivery, as specified in §4.2: an event
-consumed for a call whose client has stopped waiting because of cancellation,
-timeout, or a crash is not redelivered. On reconnect, use `get_state` to
-reconcile durable workflow/task/agent state. Acknowledged delivery and replay
-remain hardening work, not a guarantee of this queue. Assignment leases default
-to 30 minutes and accept positive finite values up to one year.
+Delivery leases default to 10 minutes (`HUB_EVENT_LEASE_S=600`). Pass the
+prior `delivery_id` as `ack` to acknowledge the event you just processed.
+If Alice crashes before acking or if the lease expires, the hub redelivers
+the event in strict FIFO order (`id ASC`). Mutating tools include state guards
+to ensure retrying actions upon redelivery is idempotent. On reconnect, use
+`get_state` to reconcile durable workflow, agent, and task state. Assignment
+leases default to 30 minutes and accept positive finite values up to one year.
 
 `get_state` returns a null workflow before one is created, plus agents and task
 summaries including results but excluding instructions and transcripts.

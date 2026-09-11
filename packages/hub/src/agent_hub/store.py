@@ -20,6 +20,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from agent_hub_common import (
+    DEFAULT_EVENT_LEASE_S,
     UNKNOWN,
     AgentProfile,
     AgentStatus,
@@ -41,7 +42,6 @@ from agent_hub_common import (
 from .database import database
 from .signals import EVENT_KEY, Signals, context_key, task_key
 
-DEFAULT_EVENT_LEASE_S = 600.0
 DEFAULT_GOAL = "Drive the assigned GitHub issue to a merged pull request."
 DEFAULT_LEASE_MIN = 30.0
 DEFAULT_MAX_TASK_LEASE_MIN = 120.0
@@ -266,18 +266,17 @@ def _message(row: Row) -> MessageRecord:
 
 
 def _event(row: Row) -> EventRecord:
-    keys = row.keys()
     return EventRecord(
         id=row["id"],
         kind=EventKind(row["kind"]),
         payload=_json_object(row["payload_json"]) or {},
         ts=row["ts"],
-        state=EventState(row["state"]) if "state" in keys else EventState.QUEUED,
-        delivery_id=row["delivery_id"] if "delivery_id" in keys else None,
-        delivery_attempts=row["delivery_attempts"] if "delivery_attempts" in keys else 0,
-        delivered_at=row["delivered_at"] if "delivered_at" in keys else None,
-        delivery_expires=row["delivery_expires"] if "delivery_expires" in keys else None,
-        acked_at=row["acked_at"] if "acked_at" in keys else None,
+        state=EventState(row["state"]),
+        delivery_id=row["delivery_id"],
+        delivery_attempts=row["delivery_attempts"],
+        delivered_at=row["delivered_at"],
+        delivery_expires=row["delivery_expires"],
+        acked_at=row["acked_at"],
     )
 
 
@@ -370,10 +369,6 @@ class HubStore:
             "tasks": tasks,
             "queued_events": queued_count,
             "unacked_delivered": unacked_delivered,
-            "events": {
-                "queued": queued_count,
-                "delivered": unacked_delivered,
-            },
         }
 
     def set_workflow_status(self, status: WorkflowStatus, summary: str) -> None:
@@ -921,13 +916,32 @@ class HubStore:
                     return int(row["id"])
         return None
 
-    def reply(self, task_id: str, text: str) -> None:
-        """Answer a worker question and put the task back to `working`."""
+    def reply(self, task_id: str, text: str, message_id: int | None = None) -> bool:
+        """Answer a worker question and put the task back to `working`.
+
+        Returns True if the reply was applied, or False if skipped due to state guards.
+        """
 
         with database(self.path) as connection:
             task = self._require_task(connection, task_id)
+            if task.state in TERMINAL_STATES:
+                raise ConflictError(f"task {task_id} is in terminal state {task.state}")
             if task.state != TaskState.INPUT_REQUIRED:
-                return
+                return False
+            if message_id is not None:
+                prior = connection.execute(
+                    """
+                    SELECT id FROM message
+                     WHERE task_id = ?
+                       AND id > ?
+                       AND direction = 'from_alice'
+                     ORDER BY id LIMIT 1
+                    """,
+                    (task.id, message_id),
+                ).fetchone()
+                if prior is not None:
+                    return False
+
             context_id = self._task_context_id(connection, task)
             self._add_message(
                 connection,
@@ -939,6 +953,7 @@ class HubStore:
             )
             self._set_state(connection, task.id, TaskState.WORKING)
         self.signals.notify(task_key(task_id))
+        return True
 
     def pending_reply(self, task_id: str, after_message_id: int) -> MessageRecord | None:
         """Return Alice's first reply on this task after the given message."""
@@ -1312,7 +1327,25 @@ class HubStore:
 
     # -- waits --------------------------------------------------------------
 
-    async def _wait_for(self, key: str, poll: Callable[[], T | None], timeout_s: float) -> T | None:
+    def _earliest_delivery_expires_s(self) -> float | None:
+        now_moment = self._now()
+        with database(self.path) as connection:
+            row = connection.execute(
+                "SELECT MIN(delivery_expires) AS min_exp FROM event WHERE state = 'delivered'"
+            ).fetchone()
+            if row is None or row["min_exp"] is None:
+                return None
+            min_exp = _parse_timestamp(row["min_exp"])
+            delta = (min_exp - now_moment).total_seconds()
+            return max(0.01, delta)
+
+    async def _wait_for(
+        self,
+        key: str,
+        poll: Callable[[], T | None],
+        timeout_s: float,
+        next_timeout: Callable[[], float | None] | None = None,
+    ) -> T | None:
         """Poll under a subscription until `poll` yields or the deadline passes."""
 
         deadline = monotonic() + timeout_s
@@ -1327,7 +1360,11 @@ class HubStore:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     return None
-                wait_step = min(remaining, 0.2)
+                wait_step = remaining
+                if next_timeout is not None:
+                    dynamic_timeout = next_timeout()
+                    if dynamic_timeout is not None:
+                        wait_step = min(remaining, dynamic_timeout)
                 with suppress(TimeoutError):
                     await asyncio.wait_for(woken.wait(), wait_step)
 
@@ -1380,7 +1417,12 @@ class HubStore:
 
         if ack is not None:
             self.ack_event(ack)
-        return await self._wait_for(EVENT_KEY, lambda: self.lease_next_event(lease_s), timeout_s)
+        return await self._wait_for(
+            EVENT_KEY,
+            lambda: self.lease_next_event(lease_s),
+            timeout_s,
+            next_timeout=self._earliest_delivery_expires_s,
+        )
 
     # -- sweeper ------------------------------------------------------------
 

@@ -125,9 +125,10 @@ def _legacy_database(path: Path, version: int) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0,
+                consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0, 1)),
                 ts TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_event_inbox ON event(consumed, id);
             CREATE TABLE decision (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL,

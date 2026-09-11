@@ -27,7 +27,14 @@ from typing import Any
 
 from agent_hub.database import initialize_database
 from agent_hub.store import HubStore
-from agent_hub_common import AgentStatus, ConfigurationError, EventKind, HubSettings, WorkflowStatus
+from agent_hub_common import (
+    AgentStatus,
+    ConfigurationError,
+    EventKind,
+    HubSettings,
+    TaskState,
+    WorkflowStatus,
+)
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -89,67 +96,20 @@ async def drive_one_task_mcp(
     checked_in_harness: str | None = None
     last_delivery_id: str | None = None
 
-    while asyncio.get_running_loop().time() < deadline:
-        # Check if agent already checked in before or between events
-        state_data = await _call(session, "get_state", {})
-        agents = state_data.get("agents") if isinstance(state_data, dict) else []
-        for ag in agents or []:
-            if (
-                isinstance(ag, dict)
-                and ag.get("name") == expected_agent
-                and ag.get("status") != AgentStatus.RELEASED.value
-            ):
-                agent_name = expected_agent
-                checked_in_harness = ag.get("harness")
-                break
-        if agent_name:
-            break
-
-        if crash_at == "before_ack" and last_delivery_id:
-            raise AliceCrashError("Simulated Alice crash before ack")
-
-        wait_args: dict[str, Any] = {
-            "timeout_s": max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
-        }
-        if last_delivery_id:
-            wait_args["ack"] = last_delivery_id
-        data = await _call(session, "wait_for_event", wait_args)
-        event = data.get("event") if isinstance(data, dict) else None
-        if event is None:
-            continue
-
-        last_delivery_id = event.get("delivery_id")
-        if crash_at == "delivery":
-            raise AliceCrashError("Simulated Alice crash at delivery")
-
-        if (
-            isinstance(event, dict)
-            and event.get("kind") == "agent_checked_in"
-            and (event.get("payload") or {}).get("agent") == expected_agent
-        ):
-            agent_name = expected_agent
-            payload = event.get("payload") or {}
-            checked_in_harness = payload.get("harness")
-            break
-
-    if not agent_name:
-        raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
-
-    if expected_harness is not None:
-        if checked_in_harness != expected_harness:
-            raise ValueError(
-                f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
-                f"expected {expected_harness!r}"
-            )
-        logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
-
-    active_states = ("working", "submitted", "input_required", "completed", "failed")
+    active_states = (
+        TaskState.WORKING.value,
+        TaskState.SUBMITTED.value,
+        TaskState.INPUT_REQUIRED.value,
+        TaskState.COMPLETED.value,
+        TaskState.FAILED.value,
+    )
     existing_task = None
+    state_data = await _call(session, "get_state", {})
     state_tasks = state_data.get("tasks") if isinstance(state_data, dict) else []
     for t in state_tasks or []:
         if (
             isinstance(t, dict)
-            and t.get("assignee") == agent_name
+            and t.get("assignee") == expected_agent
             and t.get("state") in active_states
         ):
             existing_task = t
@@ -159,6 +119,7 @@ async def drive_one_task_mcp(
     result_data: dict[str, Any] = {}
 
     if existing_task:
+        agent_name = expected_agent
         task_id = existing_task.get("id") or ""
         logger.info(
             "Worker %r already has task %s (state=%s), resuming...",
@@ -166,11 +127,74 @@ async def drive_one_task_mcp(
             task_id,
             existing_task.get("state"),
         )
-        if existing_task.get("state") in ("completed", "failed"):
-            task_finished = True
-            result_data = existing_task.get("result") or {}
     else:
+        while asyncio.get_running_loop().time() < deadline:
+            if crash_at == "before_ack" and last_delivery_id:
+                raise AliceCrashError("Simulated Alice crash before ack")
+
+            state_data = await _call(session, "get_state", {})
+            known_ag = next(
+                (
+                    ag
+                    for ag in (state_data.get("agents") or [])
+                    if isinstance(ag, dict)
+                    and ag.get("name") == expected_agent
+                    and ag.get("status") != AgentStatus.RELEASED.value
+                ),
+                None,
+            )
+            timeout_to_use = (
+                0.05
+                if known_ag is not None
+                else max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
+            )
+            wait_args: dict[str, Any] = {"timeout_s": timeout_to_use}
+            if last_delivery_id:
+                wait_args["ack"] = last_delivery_id
+            data = await _call(session, "wait_for_event", wait_args)
+            event = data.get("event") if isinstance(data, dict) else None
+            if event is None:
+                if known_ag is not None:
+                    agent_name = expected_agent
+                    checked_in_harness = known_ag.get("harness")
+                    break
+                continue
+
+            last_delivery_id = event.get("delivery_id")
+            if crash_at == "delivery":
+                raise AliceCrashError("Simulated Alice crash at delivery")
+
+            if (
+                isinstance(event, dict)
+                and event.get("kind") == "agent_checked_in"
+                and (event.get("payload") or {}).get("agent") == expected_agent
+            ):
+                agent_name = expected_agent
+                payload = event.get("payload") or {}
+                checked_in_harness = payload.get("harness")
+                break
+
+        if not agent_name:
+            raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
+
+        if expected_harness is not None:
+            if checked_in_harness != expected_harness:
+                raise ValueError(
+                    f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
+                    f"expected {expected_harness!r}"
+                )
+            logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
+
         logger.info("Worker %r checked in! Assigning task...", agent_name)
+        await _call(
+            session,
+            "log_decision",
+            {
+                "summary": f"Assigned task to {agent_name} for role {role}",
+                "rationale": f"Initial assignment for role {role}",
+                "key": f"assign:{agent_name}:{role}",
+            },
+        )
         assign_data = await _call(
             session,
             "assign_task",
@@ -178,16 +202,6 @@ async def drive_one_task_mcp(
         )
         task_id = assign_data.get("id") if isinstance(assign_data, dict) else ""
         logger.info("Task assigned: id=%s title=%r", task_id, title)
-
-        await _call(
-            session,
-            "log_decision",
-            {
-                "summary": f"Assigned task {task_id} to {agent_name}",
-                "rationale": f"Initial assignment for role {role}",
-                "key": f"assign:{task_id}",
-            },
-        )
 
         if crash_at == "after_action":
             raise AliceCrashError("Simulated Alice crash after action")
@@ -202,6 +216,10 @@ async def drive_one_task_mcp(
         data = await _call(session, "wait_for_event", wait_args)
         event = data.get("event") if isinstance(data, dict) else None
         if not event or not isinstance(event, dict):
+            if existing_task and existing_task.get("state") in ("completed", "failed"):
+                task_finished = True
+                result_data = existing_task.get("result") or {}
+                break
             continue
 
         last_delivery_id = event.get("delivery_id")
@@ -286,49 +304,16 @@ async def drive_one_task(
     checked_in_harness: str | None = None
     last_delivery_id: str | None = None
 
-    while asyncio.get_running_loop().time() < deadline:
-        # Check if agent already checked in before or between events
-        agent = store.agent_by_name(expected_agent)
-        if agent is not None and agent.status != AgentStatus.RELEASED:
-            agent_name = agent.name
-            checked_in_harness = agent.harness
-            break
-
-        if crash_at == "before_ack" and last_delivery_id:
-            raise AliceCrashError("Simulated Alice crash before ack")
-
-        remaining = max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
-        event = await store.wait_for_event(timeout_s=remaining, ack=last_delivery_id)
-        if event is None:
-            continue
-        last_delivery_id = event.delivery_id
-        if crash_at == "delivery":
-            raise AliceCrashError("Simulated Alice crash at delivery")
-
-        matched = (
-            event.kind == EventKind.AGENT_CHECKED_IN
-            and event.payload.get("agent") == expected_agent
-        )
-        if matched:
-            agent_name = expected_agent
-            checked_in_harness = event.payload.get("harness")
-            break
-
-    if not agent_name:
-        raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
-
-    if expected_harness is not None:
-        if checked_in_harness != expected_harness:
-            raise ValueError(
-                f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
-                f"expected {expected_harness!r}"
-            )
-        logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
-
-    active_states = ("working", "submitted", "input_required", "completed", "failed")
+    active_states = (
+        TaskState.WORKING.value,
+        TaskState.SUBMITTED.value,
+        TaskState.INPUT_REQUIRED.value,
+        TaskState.COMPLETED.value,
+        TaskState.FAILED.value,
+    )
     existing_task = None
     for t in store.get_state()["tasks"]:
-        if t["assignee"] == agent_name and t["state"] in active_states:
+        if t["assignee"] == expected_agent and t["state"] in active_states:
             existing_task = t
             break
 
@@ -336,6 +321,7 @@ async def drive_one_task(
     result_data: dict[str, Any] = {}
 
     if existing_task:
+        agent_name = expected_agent
         task_record = store.get_task(existing_task["id"])
         assert task_record is not None
         task = task_record
@@ -345,11 +331,54 @@ async def drive_one_task(
             task.id,
             existing_task["state"],
         )
-        if existing_task["state"] in ("completed", "failed"):
-            task_finished = True
-            result_data = existing_task.get("result") or {}
     else:
+        while asyncio.get_running_loop().time() < deadline:
+            if crash_at == "before_ack" and last_delivery_id:
+                raise AliceCrashError("Simulated Alice crash before ack")
+
+            known_agent = store.agent_by_name(expected_agent)
+            timeout_to_use = (
+                0.05
+                if known_agent is not None and known_agent.status != AgentStatus.RELEASED
+                else max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
+            )
+            event = await store.wait_for_event(timeout_s=timeout_to_use, ack=last_delivery_id)
+            if event is None:
+                if known_agent is not None and known_agent.status != AgentStatus.RELEASED:
+                    agent_name = known_agent.name
+                    checked_in_harness = known_agent.harness
+                    break
+                continue
+            last_delivery_id = event.delivery_id
+            if crash_at == "delivery":
+                raise AliceCrashError("Simulated Alice crash at delivery")
+
+            matched = (
+                event.kind == EventKind.AGENT_CHECKED_IN
+                and event.payload.get("agent") == expected_agent
+            )
+            if matched:
+                agent_name = expected_agent
+                checked_in_harness = event.payload.get("harness")
+                break
+
+        if not agent_name:
+            raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
+
+        if expected_harness is not None:
+            if checked_in_harness != expected_harness:
+                raise ValueError(
+                    f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
+                    f"expected {expected_harness!r}"
+                )
+            logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
+
         logger.info("Worker %r checked in! Assigning task...", agent_name)
+        store.log_decision(
+            f"Assigned task to {agent_name} for role {role}",
+            f"Initial assignment for role {role}",
+            key=f"assign:{agent_name}:{role}",
+        )
         # 2. Assign task
         task = store.assign_task(
             agent=agent_name,
@@ -359,11 +388,6 @@ async def drive_one_task(
             lease_min=30,
         )
         logger.info("Task assigned: id=%s title=%r", task.id, title)
-        store.log_decision(
-            f"Assigned task {task.id} to {agent_name}",
-            f"Initial assignment for role {role}",
-            key=f"assign:{task.id}",
-        )
 
         if crash_at == "after_action":
             raise AliceCrashError("Simulated Alice crash after action")
@@ -375,6 +399,10 @@ async def drive_one_task(
 
         event = await store.wait_for_event(timeout_s=5.0, ack=last_delivery_id)
         if event is None:
+            if existing_task and existing_task.get("state") in ("completed", "failed"):
+                task_finished = True
+                result_data = existing_task.get("result") or {}
+                break
             continue
         last_delivery_id = event.delivery_id
         if crash_at == "delivery":
