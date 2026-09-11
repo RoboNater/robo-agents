@@ -18,4 +18,19 @@ Before using a template:
    - **Windows**: Use a Windows absolute path, either with forward slashes (e.g., `C:/work/robo-agents`) or escaped backslashes (e.g., `C:\work\robo-agents`).
 2. Replace `http://alice-host:8420` with your hub's public address (e.g., `http://127.0.0.1:8420` for local runs).
 3. Replace `HUB_TOKEN` with the shared bearer token (from `$HUB_STATE_DIR/token` or `.env`).
-4. Ensure `AGENT_NAME` and `AGENT_RUNTIME` match the assigned worker and its runtime.
+4. Ensure `AGENT_NAME` names the assigned worker.
+5. Fill in the identity profile (spec §3), which Alice's role policy pairs workers on:
+
+   | Variable | Meaning | Template value |
+   |---|---|---|
+   | `HUB_HARNESS` | Agent harness running the worker | `claude-code` / `codex` / `gemini` |
+   | `HUB_HARNESS_VERSION` | Harness version, e.g. from `claude --version` | empty |
+   | `HUB_PROVIDER` | Model provider | `anthropic` / `openai` / `google` |
+   | `HUB_MODEL` | Exact model ID, when the launcher pins one | empty |
+   | `HUB_CAPABILITIES` | Comma-separated capabilities matched against `implementer_capabilities` / `reviewer_capabilities` | empty |
+
+   An empty or unset variable is reported as `unknown` (capabilities as none), never guessed.
+   Change the provider if the harness is pointed elsewhere (e.g. Claude Code on Bedrock).
+   When `HUB_MODEL` is empty the agent may declare its own model through `check_in(model=...)`,
+   recorded with `model_source: declared`; a value set here wins and is recorded as `env`.
+   `AGENT_RUNTIME`, the Step 4 name for `HUB_HARNESS`, is still honoured when `HUB_HARNESS` is unset.

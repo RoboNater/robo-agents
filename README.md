@@ -115,7 +115,8 @@ curl -s -X POST http://127.0.0.1:8420/a2a \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{
         "messageId":"m1","role":"user","parts":[{"kind":"text","text":"READY"}],
-        "metadata":{"agent":"bob","capabilities":["python"],"runtime":"claude-code"}}}}'
+        "metadata":{"hub.agent":"bob","hub.capabilities":["python"],
+                    "hub.harness":"claude-code","hub.provider":"anthropic"}}}}'
 ```
 
 Then poll for work with `NEXT` on `message/stream`. The hub holds the response
