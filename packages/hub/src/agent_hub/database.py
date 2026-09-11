@@ -17,7 +17,9 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-SCHEMA_VERSION = 4
+# v5 and v6 are reserved for #24 and #25 (roadmap issue #2, Reservations);
+# v7 is #27/#41's `task.pr_head_sha`.
+SCHEMA_VERSION = 7
 
 
 class DatabaseVersionError(RuntimeError):
@@ -74,6 +76,7 @@ CREATE TABLE IF NOT EXISTS task (
     result_json TEXT,
     created TEXT NOT NULL,
     updated TEXT NOT NULL,
+    pr_head_sha TEXT,
     FOREIGN KEY (workflow_id) REFERENCES workflow(id) ON DELETE CASCADE,
     FOREIGN KEY (assignee) REFERENCES agent(name) ON DELETE SET NULL
 );
@@ -150,9 +153,10 @@ def initialize_database(path: Path) -> None:
             )
         # Each step inspects the table rather than trusting the version number,
         # so it is safe to re-run and migrations compose across schema versions
-        # (v1/v2 -> v4, and mainline v3 -> v4).
+        # (v1/v2/v3/v4 -> v7).
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
+        _migrate_task_pr_head_sha(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -192,6 +196,17 @@ def _migrate_operation_table(connection: sqlite3.Connection) -> None:
     columns = _columns(connection, "operation")
     if "created" not in columns:
         connection.execute("ALTER TABLE operation ADD COLUMN created TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_task_pr_head_sha(connection: sqlite3.Connection) -> None:
+    """Add the head SHA a review or rebase assignment is bound to (#27, #41).
+
+    Tasks assigned before the column existed were bound to nothing, so NULL is
+    the truthful value for them.
+    """
+
+    if "pr_head_sha" not in _columns(connection, "task"):
+        connection.execute("ALTER TABLE task ADD COLUMN pr_head_sha TEXT")
 
 
 @contextmanager

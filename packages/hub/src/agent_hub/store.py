@@ -20,6 +20,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from agent_hub_common import (
+    SHA_HEX_40_RE,
     UNKNOWN,
     AgentProfile,
     AgentStatus,
@@ -28,6 +29,7 @@ from agent_hub_common import (
     ImplementerResult,
     MetaKeys,
     ModelSource,
+    RebaseResult,
     ReviewerResult,
     ReviewerVerdict,
     TaskResult,
@@ -98,6 +100,8 @@ class TaskRecord:
     result: dict[str, Any] | None
     created: str
     updated: str
+    # The PR head a review or rebase is bound to (#27, #41); None when unbound.
+    pr_head_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +182,7 @@ def _task(row: Row) -> TaskRecord:
         result=_json_object(row["result_json"]),
         created=row["created"],
         updated=row["updated"],
+        pr_head_sha=row["pr_head_sha"],
     )
 
 
@@ -533,9 +538,24 @@ class HubStore:
         title: str,
         instructions: str,
         lease_min: float = DEFAULT_LEASE_MIN,
+        pr_head_sha: str | None = None,
     ) -> TaskRecord:
-        """Create a task for an idle agent and unblock its pending wait."""
+        """Create a task for an idle agent and unblock its pending wait.
 
+        `pr_head_sha` binds a review or rebase to the PR head it was given, so
+        the verdict can be checked against what the PR holds at merge time.
+        """
+
+        if pr_head_sha is not None and not SHA_HEX_40_RE.fullmatch(pr_head_sha):
+            raise ValueError("pr_head_sha must be a 40-character hex commit SHA")
+        head = None if pr_head_sha is None else pr_head_sha.lower()
+        assignment_metadata: dict[str, Any] = {
+            MetaKeys.KIND: "assignment",
+            MetaKeys.ROLE: role,
+            MetaKeys.TITLE: title,
+        }
+        if head is not None:
+            assignment_metadata[MetaKeys.PR_HEAD_SHA] = head
         now = utcnow_iso()
         with database(self.path) as connection:
             record = self._require_agent(connection, agent)
@@ -554,7 +574,8 @@ class HubStore:
             task_id = uuid4().hex
             connection.execute(
                 "INSERT INTO task (id, workflow_id, assignee, role, title, instructions, state,"
-                " lease_expires, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " lease_expires, created, updated, pr_head_sha)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     workflow_id,
@@ -566,6 +587,7 @@ class HubStore:
                     to_iso(utcnow() + timedelta(minutes=lease_min)),
                     now,
                     now,
+                    head,
                 ),
             )
             connection.execute(
@@ -578,16 +600,7 @@ class HubStore:
                 context_id=record.context_id,
                 sender="alice",
                 direction="from_alice",
-                parts=[
-                    text_part(
-                        instructions,
-                        metadata={
-                            MetaKeys.KIND: "assignment",
-                            MetaKeys.ROLE: role,
-                            MetaKeys.TITLE: title,
-                        },
-                    )
-                ],
+                parts=[text_part(instructions, metadata=assignment_metadata)],
             )
             task = self._require_task(connection, task_id)
         self.signals.notify(context_key(record.context_id))
@@ -832,7 +845,7 @@ class HubStore:
         if actual_result is None:
             raise ConflictError("submit_result requires result or status")
 
-        if isinstance(actual_result, ImplementerResult):
+        if isinstance(actual_result, (ImplementerResult, RebaseResult)):
             terminal_status = (
                 TaskState.COMPLETED
                 if actual_result.outcome == ImplementerOutcome.COMPLETED

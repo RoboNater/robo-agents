@@ -18,6 +18,7 @@ from agent_hub_common import (
     ImplementerResult,
     MetaKeys,
     ModelSource,
+    RebaseResult,
     ReviewerResult,
 )
 
@@ -426,11 +427,15 @@ class WorkerHubClient:
             ):
                 instructions += part["root"]["text"]
 
-        return {
+        assignment = {
             "task_id": str(task_id) if task_id else "",
             "role": str(role),
             "instructions": instructions,
         }
+        pr_head_sha = metadata.get(MetaKeys.PR_HEAD_SHA)
+        if isinstance(pr_head_sha, str) and pr_head_sha:
+            assignment["pr_head_sha"] = pr_head_sha
+        return assignment
 
     async def report_progress(
         self,
@@ -559,7 +564,7 @@ class WorkerHubClient:
     async def submit_result(
         self,
         task_id: str,
-        result: ImplementerResult | ReviewerResult | dict[str, Any] | str,
+        result: ImplementerResult | ReviewerResult | RebaseResult | dict[str, Any] | str,
         summary: str | None = None,
         artifacts: list[Any] | None = None,
         operation_id: str | None = None,
@@ -570,7 +575,7 @@ class WorkerHubClient:
 
         self._pending_questions.pop(task_id, None)
 
-        if isinstance(result, (ImplementerResult, ReviewerResult)):
+        if isinstance(result, (ImplementerResult, ReviewerResult, RebaseResult)):
             result_dict = result.model_dump(mode="json")
             summary_text = result.summary
         elif isinstance(result, dict):
@@ -592,7 +597,7 @@ class WorkerHubClient:
                         result_dict["head_sha"] = "0" * 40
         else:
             raise TypeError(
-                "result must be ImplementerResult, ReviewerResult, dict, or str, "
+                "result must be ImplementerResult, ReviewerResult, RebaseResult, dict, or str, "
                 f"got {type(result)}"
             )
 

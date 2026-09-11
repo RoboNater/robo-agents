@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from agent_hub_common import ImplementerResult, ReviewerResult
+from agent_hub_common import ImplementerResult, RebaseResult, ReviewerResult
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
@@ -46,6 +46,7 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         """Poll the hub for the next task assignment.
 
         Returns {task_id, role, instructions}, {release: true}, or {timeout: true}.
+        A review or rebase assignment also carries pr_head_sha, the head it is bound to.
         On timeout, call again.
         timeout_s: Optional wait timeout in seconds (defaults to HUB_DEFAULT_WAIT_S if omitted).
         """
@@ -71,7 +72,9 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
     @server.tool()
     async def submit_result(
         task_id: str,
-        result: ImplementerResult | ReviewerResult,
+        # RebaseResult last: a body that fits several models validates as the
+        # first, and the hub re-validates against the task's role either way.
+        result: ImplementerResult | ReviewerResult | RebaseResult,
     ) -> dict[str, Any]:
         """Submit the final result for a task, validated against the role's schema."""
         return await client.submit_result(task_id, result)

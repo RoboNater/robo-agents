@@ -48,16 +48,28 @@ def test_initialization_rejects_unknown_schema_version(tmp_path: Path) -> None:
 
 
 def _legacy_database(path: Path, version: int) -> None:
-    """Write a Step 1 (v1), Step 4 (v2, with runtime), or main (v3, with profile) schema."""
+    """Write a Step 1 (v1), Step 4 (v2, with runtime), main (v3, with profile) or
+    main (v4, with the operation ledger) schema."""
 
+    operation_table = ""
     if version == 1:
         extra_columns = ""
     elif version == 2:
         extra_columns = ",\n                runtime TEXT"
-    elif version == 3:
+    elif version in (3, 4):
         extra_columns = "".join(
             f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
         )
+        if version == 4:
+            operation_table = """
+            CREATE TABLE operation (
+                actor TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created TEXT NOT NULL,
+                PRIMARY KEY (actor, operation_id)
+            );"""
     else:
         raise ValueError(f"unsupported legacy version {version}")
 
@@ -112,15 +124,19 @@ def _legacy_database(path: Path, version: int) -> None:
                 ts TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 rationale TEXT NOT NULL
-            );
+            );{operation_table}
             PRAGMA user_version = {version};
         """)
 
 
-def _agent_columns(path: Path) -> dict[str, tuple[str, int, str | None]]:
+def _columns(path: Path, table: str) -> dict[str, tuple[str, int, str | None]]:
     with database(path) as connection:
-        rows = connection.execute("PRAGMA table_info(agent)").fetchall()
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     return {row["name"]: (row["type"], row["notnull"], row["dflt_value"]) for row in rows}
+
+
+def _agent_columns(path: Path) -> dict[str, tuple[str, int, str | None]]:
+    return _columns(path, "agent")
 
 
 def test_migration_from_v1_adds_an_unknown_profile(tmp_path: Path) -> None:
@@ -254,8 +270,8 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     assert row["created"] == "2026-09-07T00:00:00Z"
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
-def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_migrated_tables_match_fresh_ones(tmp_path: Path, version: int) -> None:
     fresh = tmp_path / "fresh.db"
     migrated = tmp_path / f"v{version}.db"
     initialize_database(fresh)
@@ -263,7 +279,36 @@ def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) 
 
     initialize_database(migrated)
 
-    assert _agent_columns(migrated) == _agent_columns(fresh)
+    for table in ("agent", "task", "operation"):
+        assert _columns(migrated, table) == _columns(fresh, table), table
+
+
+def test_migration_from_v4_leaves_existing_tasks_unbound(tmp_path: Path) -> None:
+    path = tmp_path / "v4_hub.db"
+    _legacy_database(path, version=4)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO workflow (id, goal, status, created)"
+            " VALUES ('wf', 'goal', 'active', '2026-09-10T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO task (id, workflow_id, role, title, instructions, state, created, updated)"
+            " VALUES ('t1', 'wf', 'reviewer', 'Review', 'Look', 'completed',"
+            " '2026-09-10T00:00:00Z', '2026-09-10T00:00:00Z')"
+        )
+
+    initialize_database(path)
+    initialize_database(path)
+
+    store = HubStore(path)
+    old = store.get_task("t1")
+    assert old is not None and old.pr_head_sha is None
+    store.check_in("bob")
+    head = "ABCDEF0123456789abcdef0123456789abcdef01"
+    new = store.assign_task("bob", "reviewer", "Review", "Look again", pr_head_sha=head)
+    assert new.pr_head_sha == head.lower()
+    with database(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_model_source_is_constrained_to_its_enum(tmp_path: Path) -> None:
@@ -304,10 +349,10 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
             ),
         )
 
-    # Migrate from v3 to v4
+    # Migrate from v3 to the current version
     initialize_database(path)
 
-    # 1. Verify version advanced to 4
+    # 1. Verify the version advanced
     with database(path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
@@ -318,7 +363,7 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
             row["name"] for row in connection.execute("PRAGMA table_info(operation)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION  # 4
+    assert version == SCHEMA_VERSION
     assert "operation" in tables
     assert {"actor", "operation_id", "payload_hash", "response_json", "created"} <= op_columns
 

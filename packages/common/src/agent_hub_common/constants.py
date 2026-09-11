@@ -25,6 +25,7 @@ class MetaKeys(StrEnum):
     TITLE = "hub.title"
     ASSIGNEE = "hub.assignee"
     LEASE_EXPIRES = "hub.lease_expires"
+    PR_HEAD_SHA = "hub.pr_head_sha"
     ARTIFACTS = "hub.artifacts"
     STATE = "hub.state"
     SENDER = "hub.sender"

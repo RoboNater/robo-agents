@@ -10,6 +10,7 @@ from agent_hub_common import (
     ImplementerOutcome,
     ImplementerResult,
     ModelSource,
+    RebaseResult,
     ReviewerResult,
     ReviewerVerdict,
     TaskState,
@@ -404,6 +405,38 @@ async def test_worker_submit_typed_reviewer_result(
     assert stored_task.result.get("reviewed_head_sha") == (
         "0123456789abcdef0123456789abcdef01234567"
     )
+
+
+async def test_worker_rebase_assignment_and_result(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    head = "0123456789abcdef0123456789abcdef01234567"
+    rebased = "abcdef0123456789abcdef0123456789abcdef01"
+    worker = WorkerHubClient(worker_settings, http_client=client)
+    await worker.check_in()
+    hub_store.assign_task("bob", "rebase", "Rebase #7", "Bring it up to date", pr_head_sha=head)
+
+    assignment = await worker.await_assignment(timeout_s=1.0)
+    res = await worker.submit_result(
+        assignment["task_id"],
+        RebaseResult(
+            outcome=ImplementerOutcome.COMPLETED,
+            head_sha=rebased,
+            conflict_files=["README.md"],
+            resolution_summary="Kept both paragraphs.",
+            summary="Rebased onto main",
+        ),
+    )
+
+    assert assignment["role"] == "rebase"
+    assert assignment["pr_head_sha"] == head
+    assert res["status"] == "completed"
+    stored = hub_store.get_task(assignment["task_id"])
+    assert stored is not None and stored.result is not None
+    assert stored.result["head_sha"] == rebased
+    assert stored.result["conflict_files"] == ["README.md"]
 
 
 async def test_worker_submit_result_validation_failure_leaves_task_working(
