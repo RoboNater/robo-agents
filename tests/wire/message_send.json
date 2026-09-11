@@ -13,7 +13,11 @@
           "hub.capabilities": [
             "python"
           ],
-          "hub.runtime": "claude-code"
+          "hub.harness": "claude-code",
+          "hub.harness_version": "2.1.268",
+          "hub.model": "claude-opus-5",
+          "hub.model_source": "env",
+          "hub.provider": "anthropic"
         },
         "parts": [
           {

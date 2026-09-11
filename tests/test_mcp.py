@@ -14,7 +14,7 @@ import pytest
 from agent_hub.database import database, initialize_database
 from agent_hub.mcp import CancellableStdout, create_mcp
 from agent_hub.store import HubStore
-from agent_hub_common import MetaKeys
+from agent_hub_common import AgentProfile, MetaKeys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -43,7 +43,7 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
 
     assert {t.name for t in await server.list_tools()} == TOOLS
     assert (await call("get_state"))["workflow"] is None
-    bob = store.check_in("bob", ["python"])
+    bob = store.check_in("bob", AgentProfile(capabilities=("python",)))
     pending = asyncio.create_task(store.await_assignment(bob.context_id, 1))
     await asyncio.sleep(0)
     task = await call(
