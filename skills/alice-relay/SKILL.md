@@ -34,9 +34,12 @@ The `State` line exists so the human can resume after days away. Keep it current
 
 Use these templates nearly verbatim; they are the house style and the workers are used to them. Substitute only the bracketed parts.
 
+Before emitting **KICKOFF**, inspect the issue and roadmap text the human has supplied for shared, monotonic counters the issue may touch (for example, a database schema version, migration number, wire `schema_version`, or event kind). If the available text does not establish whether a counter is involved, ask the human to confirm. For every counter involved, verify that the roadmap reserves a value unique among in-flight issues. If one is missing, give the human a proposed roadmap comment in the form `Reservation: [counter] [value] = #[issue]` and wait for confirmation that it was posted. Append the reserved value to Bob's kickoff prompt only when the issue text does not already name it.
+
 **KICKOFF** — start of the issue. Awaiting Bob.
 ```
 Please address issue #[n]. Work on your own branch, commit as you go, and open a PR when you are done. Identify yourself in your PR comments as "Implementation agent Bob on behalf of [account]".
+[Only when the issue text omits it: Use the reserved [counter] [value].]
 ```
 
 **REVIEW** — Bob reports a PR is open. Awaiting Charlie.
@@ -61,12 +64,12 @@ The developer responded on the PR without new commits. Please review their respo
 
 **NON-BLOCKING** — Charlie says ready-to-merge but lists non-blocking items. Awaiting Bob. Give Bob the choice; don't make it for him.
 ```
-The reviewer responded to your most recent commit [sha] and stated the PR is ready to merge, with non-blocking comments. You may address them now (then we will review again) or decline and the reviewer will file an issue. If no changes are needed, close out any remaining open PR threads and merge, then update the roadmap in issue #[roadmap] with current status.
+The reviewer responded to your most recent commit [sha] and stated the PR is ready to merge, with non-blocking comments. You may address them now (then we will review again) or decline and the reviewer will file an issue. If no changes are needed, close out any remaining open PR threads and merge, then update the roadmap in issue #[roadmap] with current status, including any reservation line.
 ```
 
 **CLOSE-OUT** — Charlie approved or said ready-to-merge with nothing outstanding. Awaiting Bob.
 ```
-The reviewer responded to your most recent commit [sha] and stated the PR is ready to merge. Please close out any remaining open PR threads and merge, then update the roadmap in issue #[roadmap] with current status.
+The reviewer responded to your most recent commit [sha] and stated the PR is ready to merge. Please close out any remaining open PR threads and merge, then update the roadmap in issue #[roadmap] with current status, including any reservation line.
 ```
 
 **DONE** — Bob confirms the merge and roadmap update. No prompt. Tell the human the issue is closed and, if you know the agreed order, name the next issue.
