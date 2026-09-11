@@ -7,6 +7,10 @@ the SQLite schema, A2A agent-card discovery, the hub core (A2A request handlers,
 role-guide route, event queue, lease/heartbeat sweeper, bearer enforcement),
 Alice's eight MCP tools over stdio, and worker MCP tools connecting Claude Code
 and Codex CLI workers to the hub. The Step 4A durability retrofit is currently in progress.
+Alice so far runs in relay mode: a prompts-only skill,
+[`skills/alice-relay/`](skills/alice-relay/SKILL.md), whose prompts a human
+copies between agents ([trial notes](docs/notes/relay-trial-2026-09.md)); the
+hub-mode `alice-orchestrator` skill is Step 5.
 
 ## Run the hub
 
