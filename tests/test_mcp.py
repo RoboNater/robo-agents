@@ -27,6 +27,7 @@ TOOLS = {
     "release_agent",
     "set_workflow_status",
     "log_decision",
+    "check_merge_gate",
 }
 
 
