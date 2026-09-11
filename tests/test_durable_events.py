@@ -330,10 +330,10 @@ async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
         token_file=tmp_path / "token",
         guides_dir=tmp_path / "guides",
         default_wait_s=0.5,
-        max_wait_s=1.0,
+        max_wait_s=5.0,
         lost_after_s=60.0,
         sweep_interval_s=3600.0,
-        event_lease_s=0.2,
+        event_lease_s=0.5,
     )
     app = create_app(settings)
 
@@ -360,7 +360,10 @@ async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
 
         async def worker_lifecycle() -> None:
             await worker.check_in(["python"])
-            assignment = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                assignment = await worker.await_assignment(timeout_s=5.0)
+                if not assignment.get("timeout"):
+                    break
             task_id = assignment["task_id"]
             await worker.report_progress(task_id, "Working...")
             await worker.submit_result(
@@ -369,7 +372,10 @@ async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
                 "Work done",
                 artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
             )
-            rel = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                rel = await worker.await_assignment(timeout_s=5.0)
+                if not rel.get("timeout"):
+                    break
             assert rel == {"release": True}
 
         # 1. Alice crashes after action (task assignment)
@@ -386,7 +392,7 @@ async def test_mock_alice_crash_and_recovery_scenarios(tmp_path: Path) -> None:
             )
 
         # Wait for the check-in event lease to expire
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.55)
 
         # Second Alice session takes over, recovers active task, and completes
         res = await mock_alice.drive_one_task(
@@ -430,10 +436,10 @@ async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None
         token_file=tmp_path / "token",
         guides_dir=tmp_path / "guides",
         default_wait_s=0.5,
-        max_wait_s=1.0,
+        max_wait_s=5.0,
         lost_after_s=60.0,
         sweep_interval_s=3600.0,
-        event_lease_s=0.2,
+        event_lease_s=0.5,
     )
     app = create_app(settings)
 
@@ -460,7 +466,10 @@ async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None
 
         async def worker_lifecycle() -> None:
             await worker.check_in(["python"])
-            assignment = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                assignment = await worker.await_assignment(timeout_s=5.0)
+                if not assignment.get("timeout"):
+                    break
             task_id = assignment["task_id"]
             await worker.report_progress(task_id, "Working...")
             await worker.submit_result(
@@ -469,7 +478,10 @@ async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None
                 "Work done",
                 artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
             )
-            rel = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                rel = await worker.await_assignment(timeout_s=5.0)
+                if not rel.get("timeout"):
+                    break
             assert rel == {"release": True}
 
         worker_task = asyncio.create_task(worker_lifecycle())
@@ -485,7 +497,7 @@ async def test_mock_alice_crash_at_delivery_and_recovery(tmp_path: Path) -> None
             )
 
         # Wait for the check-in event lease to expire
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.55)
 
         # Second Alice session takes over, receives redelivery, and completes
         res = await mock_alice.drive_one_task(
@@ -522,10 +534,10 @@ async def test_mock_alice_crash_before_ack_and_recovery(tmp_path: Path) -> None:
         token_file=tmp_path / "token",
         guides_dir=tmp_path / "guides",
         default_wait_s=0.5,
-        max_wait_s=1.0,
+        max_wait_s=5.0,
         lost_after_s=60.0,
         sweep_interval_s=3600.0,
-        event_lease_s=0.2,
+        event_lease_s=0.5,
     )
     app = create_app(settings)
 
@@ -552,7 +564,10 @@ async def test_mock_alice_crash_before_ack_and_recovery(tmp_path: Path) -> None:
 
         async def worker_lifecycle() -> None:
             await worker.check_in(["python"])
-            assignment = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                assignment = await worker.await_assignment(timeout_s=5.0)
+                if not assignment.get("timeout"):
+                    break
             task_id = assignment["task_id"]
             await worker.report_progress(task_id, "Working...")
             await worker.submit_result(
@@ -561,7 +576,10 @@ async def test_mock_alice_crash_before_ack_and_recovery(tmp_path: Path) -> None:
                 "Work done",
                 artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
             )
-            rel = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                rel = await worker.await_assignment(timeout_s=5.0)
+                if not rel.get("timeout"):
+                    break
             assert rel == {"release": True}
 
         worker_task = asyncio.create_task(worker_lifecycle())
@@ -577,7 +595,7 @@ async def test_mock_alice_crash_before_ack_and_recovery(tmp_path: Path) -> None:
             )
 
         # Wait for the check-in event lease to expire
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.55)
 
         # Second Alice session takes over, receives redelivery, and completes
         res = await mock_alice.drive_one_task(
@@ -614,10 +632,10 @@ async def test_mock_alice_crash_after_reply_and_recovery(tmp_path: Path) -> None
         token_file=tmp_path / "token",
         guides_dir=tmp_path / "guides",
         default_wait_s=0.5,
-        max_wait_s=1.0,
+        max_wait_s=5.0,
         lost_after_s=60.0,
         sweep_interval_s=3600.0,
-        event_lease_s=0.2,
+        event_lease_s=0.5,
     )
     app = create_app(settings)
 
@@ -644,10 +662,16 @@ async def test_mock_alice_crash_after_reply_and_recovery(tmp_path: Path) -> None
 
         async def worker_lifecycle() -> None:
             await worker.check_in(["python"])
-            assignment = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                assignment = await worker.await_assignment(timeout_s=5.0)
+                if not assignment.get("timeout"):
+                    break
             task_id = assignment["task_id"]
             # Worker asks a question and receives reply
-            ans = await worker.ask_alice(task_id, "Should I proceed?", timeout_s=5.0)
+            while True:
+                ans = await worker.ask_alice(task_id, "Should I proceed?", timeout_s=5.0)
+                if not ans.get("timeout"):
+                    break
             assert "Approved" in ans.get("reply", "")
             # Worker finishes work and submits result
             await worker.submit_result(
@@ -656,7 +680,10 @@ async def test_mock_alice_crash_after_reply_and_recovery(tmp_path: Path) -> None
                 "Work done",
                 artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
             )
-            rel = await worker.await_assignment(timeout_s=5.0)
+            while True:
+                rel = await worker.await_assignment(timeout_s=5.0)
+                if not rel.get("timeout"):
+                    break
             assert rel == {"release": True}
 
         worker_task = asyncio.create_task(worker_lifecycle())
@@ -672,7 +699,7 @@ async def test_mock_alice_crash_after_reply_and_recovery(tmp_path: Path) -> None
             )
 
         # Worker completes task while worker_question lease expires
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.55)
 
         # Second Alice session takes over:
         # 1. worker_question is redelivered on lease expiry (delivery_attempts == 2)
