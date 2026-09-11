@@ -9,6 +9,7 @@ deadline passes. `tasks/get` and `tasks/cancel` are there for debugging.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator, Mapping
@@ -44,7 +45,16 @@ from a2a.types import (
 )
 from a2a.types import Message as A2AMessage
 from a2a.types import TaskState as A2ATaskState
-from agent_hub_common import UNKNOWN, AgentProfile, HubSettings, MetaKeys, ModelSource, TaskState
+from agent_hub_common import (
+    UNKNOWN,
+    AgentProfile,
+    HubSettings,
+    ImplementerResult,
+    MetaKeys,
+    ModelSource,
+    ReviewerResult,
+    TaskState,
+)
 from fastapi import Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -53,6 +63,7 @@ from .store import (
     AgentRecord,
     ConflictError,
     HubStore,
+    IdempotencyConflictError,
     MessageRecord,
     NotFoundError,
     Released,
@@ -92,16 +103,78 @@ class ProtocolError(Exception):
         self.error = error
 
 
+class MissingRequiredFieldError(ProtocolError):
+    """Raised when a required mutation field is missing."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(InvalidParamsError(message=message))
+
+
+class ResultValidationError(ProtocolError):
+    """Raised when a typed task result fails validation."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(InvalidParamsError(message=message))
+
+
+class UnsupportedSchemaVersionError(ProtocolError):
+    """Raised when an unsupported hub.schema_version is encountered."""
+
+    def __init__(self, version: Any) -> None:
+        super().__init__(InvalidParamsError(message=f"unsupported schema_version: {version!r}"))
+
+
 def _invalid(message: str) -> ProtocolError:
     return ProtocolError(InvalidParamsError(message=message))
 
 
-def _error_response(request_id: RequestId, error: A2AErrorModel) -> JSONResponse:
+def _check_schema_version(metadata: Mapping[str, Any]) -> None:
+    if MetaKeys.SCHEMA_VERSION in metadata:
+        version = metadata[MetaKeys.SCHEMA_VERSION]
+        if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+            raise UnsupportedSchemaVersionError(version)
+
+
+def _require_schema_version(metadata: Mapping[str, Any]) -> None:
+    if MetaKeys.SCHEMA_VERSION not in metadata:
+        raise UnsupportedSchemaVersionError("metadata.hub.schema_version is required")
+    version = metadata[MetaKeys.SCHEMA_VERSION]
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+        raise UnsupportedSchemaVersionError(version)
+
+
+def _require_operation_id(metadata: Mapping[str, Any]) -> str:
+    if MetaKeys.OPERATION_ID not in metadata:
+        raise MissingRequiredFieldError(f"metadata.{MetaKeys.OPERATION_ID} is required")
+    operation_id = metadata[MetaKeys.OPERATION_ID]
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise MissingRequiredFieldError(
+            f"metadata.{MetaKeys.OPERATION_ID} must be a non-empty string"
+        )
+    return operation_id.strip()
+
+
+def _require_result(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    if MetaKeys.RESULT not in metadata or metadata[MetaKeys.RESULT] is None:
+        raise ResultValidationError(f"metadata.{MetaKeys.RESULT} is required")
+    raw_result = metadata[MetaKeys.RESULT]
+    if not isinstance(raw_result, dict):
+        raise ResultValidationError(f"metadata.{MetaKeys.RESULT} must be an object")
+    return dict(raw_result)
+
+
+def _hash_payload(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _error_response(
+    request_id: RequestId,
+    error: A2AErrorModel,
+    status_code: int = 200,
+) -> JSONResponse:
     body = JSONRPCErrorResponse(id=request_id, error=error)
-    # JSON-RPC transports protocol failures in the body; the HTTP status stays
-    # 200 so a client reads one error shape. Authentication is the exception
-    # and is refused with 401 before dispatch ever runs.
-    return JSONResponse(body.model_dump(mode="json", exclude_none=True))
+    return JSONResponse(body.model_dump(mode="json", exclude_none=True), status_code=status_code)
 
 
 def parse_error_response() -> JSONResponse:
@@ -219,21 +292,30 @@ def _artifacts(record: TaskRecord) -> list[Artifact] | None:
     """Expose a worker's reported artifacts — PR URL, SHAs — on the task."""
 
     result = record.result or {}
-    reported = result.get("artifacts")
-    if not isinstance(reported, list) or not reported:
-        return None
     artifacts = []
-    for item in reported:
-        payload = item if isinstance(item, dict) else {"value": item}
-        name = payload.get("name")
-        artifacts.append(
-            Artifact(
-                artifact_id=uuid4().hex,
-                name=str(name) if isinstance(name, str) else None,
-                parts=[Part(root=TextPart(text=json.dumps(payload, sort_keys=True)))],
+    reported = result.get("artifacts")
+    if isinstance(reported, list):
+        for item in reported:
+            payload = item if isinstance(item, dict) else {"value": item}
+            name = payload.get("name")
+            artifacts.append(
+                Artifact(
+                    artifact_id=uuid4().hex,
+                    name=str(name) if isinstance(name, str) else None,
+                    parts=[Part(root=TextPart(text=json.dumps(payload, sort_keys=True)))],
+                )
             )
-        )
-    return artifacts
+    for field in ("pr_url", "head_sha", "reviewed_head_sha", "review_url"):
+        val = result.get(field)
+        if isinstance(val, str) and val:
+            artifacts.append(
+                Artifact(
+                    artifact_id=uuid4().hex,
+                    name=field,
+                    parts=[Part(root=TextPart(text=val))],
+                )
+            )
+    return artifacts or None
 
 
 def _task_object(
@@ -297,6 +379,16 @@ class A2AProtocol:
 
         try:
             return await self._dispatch(method, payload, request_id)
+        except (
+            ResultValidationError,
+            UnsupportedSchemaVersionError,
+            MissingRequiredFieldError,
+        ) as exc:
+            return _error_response(request_id, exc.error, status_code=400)
+        except IdempotencyConflictError as exc:
+            return _error_response(
+                request_id, InvalidRequestError(message=str(exc)), status_code=409
+            )
         except ProtocolError as exc:
             return _error_response(request_id, exc.error)
         except NotFoundError as exc:
@@ -334,31 +426,74 @@ class A2AProtocol:
         if kind == "result":
             return self._result(task, agent, _text(message), metadata)
         if kind == "progress":
-            self.store.record_progress(task.id, agent.name, _text(message))
-            return _agent_message(
+            _require_schema_version(metadata)
+            operation_id = _require_operation_id(metadata)
+            note = _text(message)
+            payload_hash = _hash_payload({
+                "intent": "progress",
+                "task_id": task.id,
+                "note": note,
+            })
+            resp_ack = _agent_message(
                 "noted",
                 context_id=agent.context_id,
                 task_id=task.id,
                 metadata={MetaKeys.KIND: "progress_ack"},
             )
+            resp_json, _ = self.store.record_progress(
+                task.id,
+                agent.name,
+                note,
+                operation_id=operation_id,
+                payload_hash=payload_hash,
+                response_builder=lambda: json.dumps(
+                    resp_ack.model_dump(mode="json", exclude_none=True)
+                ),
+            )
+            return A2AMessage.model_validate(json.loads(resp_json))
         raise _invalid(f"metadata.{MetaKeys.KIND} {kind!r} is not a message/send intent on a task")
 
     def _check_in(self, message: A2AMessage, metadata: dict[str, Any]) -> A2AMessage:
         if _text(message).upper() != CHECK_IN_TEXT:
             raise _invalid(f"a message with no taskId must be the {CHECK_IN_TEXT} check-in")
+        _require_schema_version(metadata)
+        operation_id = _require_operation_id(metadata)
         name = metadata.get(MetaKeys.AGENT)
         if not isinstance(name, str) or not name.strip():
             raise _invalid(f"check-in requires metadata.{MetaKeys.AGENT}")
-        agent = self.store.check_in(name.strip(), _profile(metadata))
-        return _agent_message(
-            "REGISTERED",
-            context_id=agent.context_id,
-            metadata={
-                MetaKeys.KIND: "check_in_ack",
-                MetaKeys.AGENT: agent.name,
-                MetaKeys.STATUS: agent.status.value,
-            },
+        agent_name = name.strip()
+        profile = _profile(metadata)
+
+        payload_hash = _hash_payload({
+            "intent": "check_in",
+            "agent": agent_name,
+            "capabilities": sorted(profile.capabilities),
+            "harness": profile.harness,
+            "harness_version": profile.harness_version,
+            "provider": profile.provider,
+            "model": profile.model,
+            "model_source": profile.model_source.value,
+            "workspace_id": profile.workspace_id,
+        })
+
+        resp_json, _ = self.store.check_in(
+            agent_name,
+            profile,
+            operation_id=operation_id,
+            payload_hash=payload_hash,
+            response_builder=lambda agent: json.dumps(
+                _agent_message(
+                    "REGISTERED",
+                    context_id=agent.context_id,
+                    metadata={
+                        MetaKeys.KIND: "check_in_ack",
+                        MetaKeys.AGENT: agent.name,
+                        MetaKeys.STATUS: agent.status.value,
+                    },
+                ).model_dump(mode="json", exclude_none=True)
+            ),
         )
+        return A2AMessage.model_validate(json.loads(resp_json))
 
     def _result(
         self,
@@ -367,22 +502,52 @@ class A2AProtocol:
         summary: str,
         metadata: dict[str, Any],
     ) -> Task:
-        raw_status = metadata.get(MetaKeys.STATUS)
+        _require_schema_version(metadata)
+        operation_id = _require_operation_id(metadata)
+        result_dict = _require_result(metadata)
+
+        if not result_dict.get("summary") and summary:
+            result_dict["summary"] = summary
+
+        typed_result: ImplementerResult | ReviewerResult
         try:
-            status = TaskState(str(raw_status))
+            if task.role == "implementer":
+                typed_result = ImplementerResult.model_validate(result_dict)
+            elif task.role == "reviewer":
+                typed_result = ReviewerResult.model_validate(result_dict)
+            elif "outcome" in result_dict:
+                typed_result = ImplementerResult.model_validate(result_dict)
+            elif "verdict" in result_dict:
+                typed_result = ReviewerResult.model_validate(result_dict)
+            else:
+                raise ValueError("result must specify 'outcome' or 'verdict'")
+        except ValidationError as exc:
+            first_err = exc.errors()[0]
+            msg = first_err.get("msg", str(exc))
+            loc = ".".join(str(part) for part in first_err.get("loc", []))
+            raise ResultValidationError(f"{loc}: {msg}" if loc else msg) from exc
         except ValueError as exc:
-            raise _invalid(f"metadata.{MetaKeys.STATUS} must be 'completed' or 'failed'") from exc
-        artifacts = metadata.get(MetaKeys.ARTIFACTS) or []
-        if not isinstance(artifacts, list):
-            raise _invalid(f"metadata.{MetaKeys.ARTIFACTS} must be a list")
-        finished = self.store.submit_result(
+            raise ResultValidationError(str(exc)) from exc
+
+        payload_hash = _hash_payload({
+            "intent": "result",
+            "task_id": task.id,
+            "result": typed_result.model_dump(mode="json"),
+        })
+
+        resp_json, _ = self.store.submit_result(
             task.id,
             agent.name,
-            status,
-            summary,
-            [item if isinstance(item, dict) else {"value": item} for item in artifacts],
+            typed_result,
+            operation_id=operation_id,
+            payload_hash=payload_hash,
+            response_builder=lambda finished: json.dumps(
+                _task_object(finished, agent.context_id).model_dump(
+                    mode="json", exclude_none=True
+                )
+            ),
         )
-        return _task_object(finished, agent.context_id)
+        return Task.model_validate(json.loads(resp_json))
 
     # -- message/stream -----------------------------------------------------
 

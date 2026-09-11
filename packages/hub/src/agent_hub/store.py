@@ -24,8 +24,13 @@ from agent_hub_common import (
     AgentProfile,
     AgentStatus,
     EventKind,
+    ImplementerOutcome,
+    ImplementerResult,
     MetaKeys,
     ModelSource,
+    ReviewerResult,
+    ReviewerVerdict,
+    TaskResult,
     TaskState,
     WorkflowStatus,
     to_iso,
@@ -57,6 +62,10 @@ class NotFoundError(StoreError):
 
 class ConflictError(StoreError):
     """Raised when an operation contradicts the current state."""
+
+
+class IdempotencyConflictError(ConflictError):
+    """Raised when an operation is retried with a conflicting payload."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,7 +360,15 @@ class HubStore:
 
     # -- agents -------------------------------------------------------------
 
-    def check_in(self, name: str, profile: AgentProfile = DEFAULT_PROFILE) -> AgentRecord:
+    def check_in(
+        self,
+        name: str,
+        profile: AgentProfile = DEFAULT_PROFILE,
+        *,
+        operation_id: str | None = None,
+        payload_hash: str | None = None,
+        response_builder: Callable[[AgentRecord], str] | None = None,
+    ) -> Any:
         """Register a worker, or re-admit a returning one on its own context.
 
         The profile replaces whatever was recorded before, field by field: a
@@ -370,6 +387,20 @@ class HubStore:
             profile.workspace_id,
         )
         with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if operation_id is not None and payload_hash is not None:
+                row = connection.execute(
+                    "SELECT payload_hash, response_json FROM operation "
+                    "WHERE actor = ? AND operation_id = ?",
+                    (name, operation_id),
+                ).fetchone()
+                if row is not None:
+                    if row["payload_hash"] != payload_hash:
+                        raise IdempotencyConflictError(
+                            f"operation {operation_id!r} already executed with different payload"
+                        )
+                    return (row["response_json"], False)
+
             row = connection.execute("SELECT * FROM agent WHERE name = ?", (name,)).fetchone()
             if row is None:
                 context_id = uuid4().hex
@@ -417,8 +448,27 @@ class HubStore:
                 {"agent": name} | profile_payload | {"context_id": context_id},
             )
             agent = self._require_agent(connection, name)
+            res: tuple[Any, bool]
+            if (
+                operation_id is not None
+                and payload_hash is not None
+                and response_builder is not None
+            ):
+                resp_json = response_builder(agent)
+                connection.execute(
+                    "INSERT INTO operation ("
+                    "actor, operation_id, payload_hash, response_json, created"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (name, operation_id, payload_hash, resp_json, utcnow_iso()),
+                )
+                res = (resp_json, True)
+            else:
+                res = (agent, True)
+
         self.signals.notify(EVENT_KEY)
-        return agent
+        if operation_id is None:
+            return agent
+        return res
 
     def _open_task_id(self, connection: Connection, task_id: str | None) -> str | None:
         """Return `task_id` only while that task is still open."""
@@ -571,10 +621,33 @@ class HubStore:
             history = history[-limit:] if limit else []
         return history
 
-    def record_progress(self, task_id: str, agent: str, note: str) -> None:
+    def record_progress(
+        self,
+        task_id: str,
+        agent: str,
+        note: str,
+        *,
+        operation_id: str | None = None,
+        payload_hash: str | None = None,
+        response_builder: Callable[[], str] | None = None,
+    ) -> Any:
         """Record a fire-and-forget progress note and queue it for Alice."""
 
         with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if operation_id is not None and payload_hash is not None:
+                row = connection.execute(
+                    "SELECT payload_hash, response_json FROM operation "
+                    "WHERE actor = ? AND operation_id = ?",
+                    (agent, operation_id),
+                ).fetchone()
+                if row is not None:
+                    if row["payload_hash"] != payload_hash:
+                        raise IdempotencyConflictError(
+                            f"operation {operation_id!r} already executed with different payload"
+                        )
+                    return (row["response_json"], False)
+
             task = self._require_open_task(connection, task_id)
             record = self._require_agent(connection, agent)
             self._add_message(
@@ -591,7 +664,27 @@ class HubStore:
                 {"task_id": task.id, "agent": agent, "note": note},
             )
             self._touch(connection, agent)
+            res: tuple[Any, bool]
+            if (
+                operation_id is not None
+                and payload_hash is not None
+                and response_builder is not None
+            ):
+                resp_json = response_builder()
+                connection.execute(
+                    "INSERT INTO operation ("
+                    "actor, operation_id, payload_hash, response_json, created"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (agent, operation_id, payload_hash, resp_json, utcnow_iso()),
+                )
+                res = (resp_json, True)
+            else:
+                res = (None, True)
+
         self.signals.notify(EVENT_KEY)
+        if operation_id is None:
+            return None
+        return res
 
     def open_question(self, task_id: str, agent: str, question: str, sent_as: str) -> int:
         """Park a task on `input-required` and return the question's row id.
@@ -692,24 +785,127 @@ class HubStore:
             ).fetchone()
         return None if row is None else _message(row)
 
+    def get_operation(self, actor: str, operation_id: str) -> Row | None:
+        """Look up an existing operation by actor and operation_id."""
+        with database(self.path) as connection:
+            row: Row | None = connection.execute(
+                "SELECT * FROM operation WHERE actor = ? AND operation_id = ?",
+                (actor, operation_id),
+            ).fetchone()
+            return row
+
+    def record_operation(
+        self,
+        actor: str,
+        operation_id: str,
+        payload_hash: str,
+        response_json: str,
+    ) -> None:
+        """Record an operation result for idempotency deduplication."""
+        with database(self.path) as connection:
+            connection.execute(
+                "INSERT INTO operation (actor, operation_id, payload_hash, response_json, created)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (actor, operation_id, payload_hash, response_json, utcnow_iso()),
+            )
+
     def submit_result(
         self,
         task_id: str,
         agent: str,
-        status: TaskState,
-        summary: str,
+        result: TaskResult | Mapping[str, Any] | TaskState | None = None,
+        summary: str = "",
         artifacts: Sequence[Mapping[str, Any]] = (),
-    ) -> TaskRecord:
+        *,
+        status: TaskState | None = None,
+        operation_id: str | None = None,
+        payload_hash: str | None = None,
+        response_builder: Callable[[TaskRecord], str] | None = None,
+    ) -> Any:
         """Drive a task to a terminal state and free its worker."""
 
-        if status not in (TaskState.COMPLETED, TaskState.FAILED):
-            raise ConflictError(f"a result must be completed or failed, got {status.value}")
-        payload: dict[str, Any] = {
-            "status": status.value,
-            "summary": summary,
-            "artifacts": [dict(artifact) for artifact in artifacts],
-        }
+        payload: dict[str, Any]
+        result_summary: str
+        terminal_status: TaskState
+
+        actual_result = result if result is not None else status
+        if actual_result is None:
+            raise ConflictError("submit_result requires result or status")
+
+        if isinstance(actual_result, ImplementerResult):
+            terminal_status = (
+                TaskState.COMPLETED
+                if actual_result.outcome == ImplementerOutcome.COMPLETED
+                else TaskState.FAILED
+            )
+            payload = actual_result.model_dump(mode="json")
+            result_summary = actual_result.summary
+        elif isinstance(actual_result, ReviewerResult):
+            approved_or_changes = (
+                ReviewerVerdict.APPROVED,
+                ReviewerVerdict.CHANGES_REQUESTED,
+            )
+            terminal_status = (
+                TaskState.COMPLETED
+                if actual_result.verdict in approved_or_changes
+                else TaskState.FAILED
+            )
+            payload = actual_result.model_dump(mode="json")
+            result_summary = actual_result.summary
+        elif isinstance(actual_result, Mapping):
+            if "outcome" in actual_result:
+                parsed_impl = ImplementerResult.model_validate(actual_result)
+                terminal_status = (
+                    TaskState.COMPLETED
+                    if parsed_impl.outcome == ImplementerOutcome.COMPLETED
+                    else TaskState.FAILED
+                )
+                payload = parsed_impl.model_dump(mode="json")
+                result_summary = parsed_impl.summary
+            elif "verdict" in actual_result:
+                parsed_rev = ReviewerResult.model_validate(actual_result)
+                approved_or_changes = (
+                    ReviewerVerdict.APPROVED,
+                    ReviewerVerdict.CHANGES_REQUESTED,
+                )
+                terminal_status = (
+                    TaskState.COMPLETED
+                    if parsed_rev.verdict in approved_or_changes
+                    else TaskState.FAILED
+                )
+                payload = parsed_rev.model_dump(mode="json")
+                result_summary = parsed_rev.summary
+            else:
+                raise ConflictError("result mapping must contain 'outcome' or 'verdict'")
+        elif isinstance(actual_result, TaskState):
+            if actual_result not in (TaskState.COMPLETED, TaskState.FAILED):
+                msg = f"a result must be completed or failed, got {actual_result.value}"
+                raise ConflictError(msg)
+            terminal_status = actual_result
+            result_summary = summary
+            payload = {
+                "status": terminal_status.value,
+                "summary": summary,
+                "artifacts": [dict(artifact) for artifact in artifacts],
+            }
+        else:
+            raise ConflictError(f"unsupported result type: {type(actual_result)}")
+
         with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if operation_id is not None and payload_hash is not None:
+                row = connection.execute(
+                    "SELECT payload_hash, response_json FROM operation "
+                    "WHERE actor = ? AND operation_id = ?",
+                    (agent, operation_id),
+                ).fetchone()
+                if row is not None:
+                    if row["payload_hash"] != payload_hash:
+                        raise IdempotencyConflictError(
+                            f"operation {operation_id!r} already executed with different payload"
+                        )
+                    return (row["response_json"], False)
+
             task = self._require_open_task(connection, task_id)
             record = self._require_agent(connection, agent)
             self._add_message(
@@ -720,26 +916,52 @@ class HubStore:
                 direction="to_alice",
                 parts=[
                     text_part(
-                        summary,
+                        result_summary,
                         metadata={
                             MetaKeys.KIND: "result",
-                            MetaKeys.STATUS: status.value,
+                            MetaKeys.STATUS: terminal_status.value,
                         },
                     )
                 ],
             )
-            self._finish(connection, task.id, status, payload)
+            self._finish(connection, task.id, terminal_status, payload)
+            event_payload: dict[str, Any] = {
+                "task_id": task.id,
+                "agent": agent,
+                "summary": result_summary,
+            }
+            event_payload.update(payload)
+            event_payload["result"] = payload
             self._add_event(
                 connection,
                 EventKind.TASK_COMPLETED
-                if status is TaskState.COMPLETED
+                if terminal_status is TaskState.COMPLETED
                 else EventKind.TASK_FAILED,
-                {"task_id": task.id, "agent": agent} | payload,
+                event_payload,
             )
             self._touch(connection, agent)
             finished = self._require_task(connection, task.id)
+            res: tuple[Any, bool]
+            if (
+                operation_id is not None
+                and payload_hash is not None
+                and response_builder is not None
+            ):
+                resp_json = response_builder(finished)
+                connection.execute(
+                    "INSERT INTO operation ("
+                    "actor, operation_id, payload_hash, response_json, created"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (agent, operation_id, payload_hash, resp_json, utcnow_iso()),
+                )
+                res = (resp_json, True)
+            else:
+                res = (finished, True)
+
         self.signals.notify(EVENT_KEY)
-        return finished
+        if operation_id is None:
+            return finished
+        return res
 
     def cancel_task(self, task_id: str) -> TaskRecord:
         """Cancel an open task and release whoever was holding it."""

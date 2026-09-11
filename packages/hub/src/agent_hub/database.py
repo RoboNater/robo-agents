@@ -17,7 +17,7 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class DatabaseVersionError(RuntimeError):
@@ -104,6 +104,15 @@ CREATE TABLE IF NOT EXISTS decision (
     rationale TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS operation (
+    actor TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created TEXT NOT NULL,
+    PRIMARY KEY (actor, operation_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_task_workflow_state ON task(workflow_id, state);
 CREATE INDEX IF NOT EXISTS idx_task_assignee ON task(assignee);
 CREATE INDEX IF NOT EXISTS idx_message_context_ts ON message(context_id, ts);
@@ -140,9 +149,10 @@ def initialize_database(path: Path) -> None:
                 f"expected version {SCHEMA_VERSION}"
             )
         # Each step inspects the table rather than trusting the version number,
-        # so it is safe to re-run and the Step 4A changes compose into the one
-        # migration §7 calls for.
+        # so it is safe to re-run and migrations compose across schema versions
+        # (v1/v2 -> v4, and mainline v3 -> v4).
         _migrate_agent_profile(connection)
+        _migrate_operation_table(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -166,6 +176,22 @@ def _migrate_agent_profile(connection: sqlite3.Connection) -> None:
             "UPDATE agent SET harness = trim(runtime) WHERE trim(coalesce(runtime, '')) != ''"
         )
         connection.execute("ALTER TABLE agent DROP COLUMN runtime")
+
+
+def _migrate_operation_table(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS operation (
+            actor TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created TEXT NOT NULL,
+            PRIMARY KEY (actor, operation_id)
+        )
+    """)
+    columns = _columns(connection, "operation")
+    if "created" not in columns:
+        connection.execute("ALTER TABLE operation ADD COLUMN created TEXT NOT NULL DEFAULT ''")
 
 
 @contextmanager

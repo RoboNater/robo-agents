@@ -67,8 +67,11 @@ async def test_worker_mcp_tools_list_and_dispatch() -> None:
         await call(
             "submit_result",
             task_id="t1",
-            status="completed",
-            summary="Done",
-            artifacts=[{"name": "pr", "url": "https://pr"}],
+            result={
+                "outcome": "completed",
+                "summary": "Done",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "head_sha": "0123456789abcdef0123456789abcdef01234567",
+            },
         )
     ) == {"status": "completed", "task_id": "t1"}

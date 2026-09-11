@@ -14,7 +14,7 @@ import pytest
 from agent_hub.database import database, initialize_database
 from agent_hub.mcp import CancellableStdout, create_mcp
 from agent_hub.store import HubStore
-from agent_hub_common import AgentProfile, MetaKeys
+from agent_hub_common import SCHEMA_VERSION, AgentProfile, MetaKeys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -137,7 +137,12 @@ async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
                             "messageId": "ready",
                             "role": "user",
                             "parts": [{"kind": "text", "text": "READY"}],
-                            "metadata": {MetaKeys.AGENT: "bob", MetaKeys.CAPABILITIES: ["python"]},
+                            "metadata": {
+                                MetaKeys.AGENT: "bob",
+                                MetaKeys.CAPABILITIES: ["python"],
+                                MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                                MetaKeys.OPERATION_ID: "op-mcp-1",
+                            },
                         }
                     },
                 },
@@ -240,7 +245,12 @@ def test_wire_cancellation_stops_event_consumption(tmp_path: Path) -> None:
                             "messageId": "ready",
                             "role": "user",
                             "parts": [{"kind": "text", "text": "READY"}],
-                            "metadata": {MetaKeys.AGENT: "bob", MetaKeys.CAPABILITIES: []},
+                            "metadata": {
+                                MetaKeys.AGENT: "bob",
+                                MetaKeys.CAPABILITIES: [],
+                                MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                                MetaKeys.OPERATION_ID: "op-mcp-2",
+                            },
                         }
                     },
                 }

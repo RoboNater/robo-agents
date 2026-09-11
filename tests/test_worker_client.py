@@ -4,7 +4,16 @@ from dataclasses import replace
 import httpx
 import pytest
 from agent_hub.store import HubStore
-from agent_hub_common import AgentProfile, HubSettings, ModelSource, TaskState
+from agent_hub_common import (
+    AgentProfile,
+    HubSettings,
+    ImplementerOutcome,
+    ImplementerResult,
+    ModelSource,
+    ReviewerResult,
+    ReviewerVerdict,
+    TaskState,
+)
 from conftest import BASE_URL, TOKEN
 from worker_mcp.client import WorkerHubClient, WorkerProtocolError
 from worker_mcp.config import WorkerSettings
@@ -339,3 +348,135 @@ async def test_retry_on_503(
         resp = await worker._request_with_retry("GET", "/healthz")
         assert resp.status_code == 200
         assert attempts == 2
+
+
+async def test_worker_submit_typed_implementer_result(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    worker = WorkerHubClient(worker_settings, http_client=client)
+    await worker.check_in()
+    task = hub_store.assign_task("bob", "implementer", "Task 1", "Do it")
+
+    res = await worker.submit_result(
+        task.id,
+        ImplementerResult(
+            outcome=ImplementerOutcome.COMPLETED,
+            summary="All tests pass",
+            pr_url="https://github.com/org/repo/pull/1",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+        ),
+    )
+    assert res["status"] == "completed"
+    assert res["task_id"] == task.id
+    assert res["result"]["pr_url"] == "https://github.com/org/repo/pull/1"
+
+    stored_task = hub_store.get_task(task.id)
+    assert stored_task is not None and stored_task.state == TaskState.COMPLETED
+    assert stored_task.result is not None
+    assert stored_task.result.get("pr_url") == "https://github.com/org/repo/pull/1"
+
+
+async def test_worker_submit_typed_reviewer_result(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    worker = WorkerHubClient(worker_settings, http_client=client)
+    await worker.check_in()
+    task = hub_store.assign_task("bob", "reviewer", "Review PR", "Review it")
+
+    res = await worker.submit_result(
+        task.id,
+        ReviewerResult(
+            verdict=ReviewerVerdict.APPROVED,
+            summary="Looks great!",
+            reviewed_head_sha="0123456789abcdef0123456789abcdef01234567",
+        ),
+    )
+    assert res["status"] == "completed"
+    assert res["result"]["verdict"] == "approved"
+
+    stored_task = hub_store.get_task(task.id)
+    assert stored_task is not None and stored_task.state == TaskState.COMPLETED
+    assert stored_task.result is not None
+    assert stored_task.result.get("reviewed_head_sha") == (
+        "0123456789abcdef0123456789abcdef01234567"
+    )
+
+
+async def test_worker_submit_result_validation_failure_leaves_task_working(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    worker = WorkerHubClient(worker_settings, http_client=client)
+    await worker.check_in()
+    task = hub_store.assign_task("bob", "implementer", "Task 1", "Do it")
+    assignment = await worker.await_assignment()
+    assert assignment["task_id"] == task.id
+
+    # Invalid result: outcome=completed but missing pr_url and head_sha
+    invalid_payload = {
+        "outcome": "completed",
+        "summary": "Finished without PR",
+    }
+
+    with pytest.raises(WorkerProtocolError) as exc_info:
+        await worker.submit_result(task.id, invalid_payload)
+
+    assert "requires pr_url" in exc_info.value.message
+    # Task remains in working state
+    stored_task = hub_store.get_task(task.id)
+    assert stored_task is not None and stored_task.state == TaskState.WORKING
+
+    # Correct and retry: should succeed
+    valid_payload = {
+        "outcome": "completed",
+        "summary": "Finished with PR",
+        "pr_url": "https://github.com/org/repo/pull/42",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    }
+    res = await worker.submit_result(task.id, valid_payload)
+    assert res["status"] == "completed"
+
+    stored_task = hub_store.get_task(task.id)
+    assert stored_task is not None and stored_task.state == TaskState.COMPLETED
+
+
+async def test_worker_idempotent_submit_result_and_conflict(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    worker = WorkerHubClient(worker_settings, http_client=client)
+    await worker.check_in()
+    task = hub_store.assign_task("bob", "implementer", "Task 1", "Do it")
+
+    result = {
+        "outcome": "completed",
+        "summary": "First try",
+        "pr_url": "https://github.com/org/repo/pull/10",
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    }
+
+    # First submission
+    res1 = await worker.submit_result(task.id, result)
+    assert res1["status"] == "completed"
+
+    # Replay identical submission: should reuse operation_id and return cleanly
+    res2 = await worker.submit_result(task.id, result)
+    assert res2["status"] == "completed"
+
+    # Conflicting submission with same operation_id explicitly passed
+    pending_op_id = worker._pending_results[task.id][1]
+    with pytest.raises(WorkerProtocolError) as exc_info:
+        await worker.submit_result(
+            task.id,
+            {"outcome": "failed", "summary": "Changed my mind"},
+            operation_id=pending_op_id,
+        )
+    assert exc_info.value.code == -32600
+    msg = exc_info.value.message.lower()
+    assert "conflict" in msg or "already executed" in msg
