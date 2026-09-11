@@ -37,7 +37,7 @@ def settings(tmp_path: Path) -> HubSettings:
         guides_dir=tmp_path / "guides",
         default_wait_s=TEST_WAIT_S,
         max_wait_s=TEST_MAX_WAIT_S,
-        heartbeat_timeout_s=60.0,
+        lost_after_s=60.0,
         sweep_interval_s=3600.0,
     )
 
@@ -97,8 +97,11 @@ def message(
         body["contextId"] = context_id
     if task_id is not None:
         body["taskId"] = task_id
-    if metadata is not None:
-        body["metadata"] = metadata
+    resolved_metadata = dict(metadata or {})
+    if context_id is not None or text.upper() == "READY":
+        resolved_metadata.setdefault(MetaKeys.WORKER_INSTANCE_ID, "test-worker-instance")
+    if resolved_metadata:
+        body["metadata"] = resolved_metadata
     return {"message": body}
 
 
@@ -113,7 +116,10 @@ def sse_results(response: httpx.Response) -> list[Any]:
 
 
 async def check_in(
-    client: httpx.AsyncClient, name: str, capabilities: list[str] | None = None
+    client: httpx.AsyncClient,
+    name: str,
+    capabilities: list[str] | None = None,
+    worker_instance_id: str = "test-worker-instance",
 ) -> str:
     """Register a worker and return the context id it must use from then on."""
 
@@ -129,6 +135,7 @@ async def check_in(
                     MetaKeys.HARNESS: "claude-code",
                     MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
                     MetaKeys.OPERATION_ID: uuid4().hex,
+                    MetaKeys.WORKER_INSTANCE_ID: worker_instance_id,
                 },
             ),
         ),

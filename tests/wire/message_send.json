@@ -19,7 +19,8 @@
           "hub.model_source": "env",
           "hub.provider": "anthropic",
           "hub.operation_id": "op-checkin-101",
-          "hub.schema_version": 1
+          "hub.schema_version": 1,
+          "hub.worker_instance_id": "worker-101"
         },
         "parts": [
           {
@@ -41,7 +42,8 @@
       "metadata": {
         "hub.agent": "bob",
         "hub.kind": "check_in_ack",
-        "hub.status": "idle"
+        "hub.status": "idle",
+        "hub.worker_instance_id": "worker-101"
       },
       "parts": [
         {

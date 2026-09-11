@@ -17,7 +17,7 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class DatabaseVersionError(RuntimeError):
@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS agent (
     status TEXT NOT NULL CHECK (status IN ({_sql_values(AgentStatus)})),
     context_id TEXT UNIQUE,
     last_seen TEXT NOT NULL,
+    worker_instance_id TEXT NOT NULL DEFAULT '',
+    last_heartbeat TEXT NOT NULL DEFAULT '',
+    last_progress_at TEXT,
     current_task_id TEXT,{_PROFILE_SQL}
     FOREIGN KEY (current_task_id) REFERENCES task(id) ON DELETE SET NULL
 );
@@ -71,6 +74,7 @@ CREATE TABLE IF NOT EXISTS task (
     instructions TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ({_sql_values(TaskState)})),
     lease_expires TEXT,
+    lease_duration_s REAL NOT NULL DEFAULT 1800,
     result_json TEXT,
     created TEXT NOT NULL,
     updated TEXT NOT NULL,
@@ -153,6 +157,7 @@ def initialize_database(path: Path) -> None:
         # (v1/v2 -> v4, and mainline v3 -> v4).
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
+        _migrate_worker_heartbeat(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -192,6 +197,41 @@ def _migrate_operation_table(connection: sqlite3.Connection) -> None:
     columns = _columns(connection, "operation")
     if "created" not in columns:
         connection.execute("ALTER TABLE operation ADD COLUMN created TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_worker_heartbeat(connection: sqlite3.Connection) -> None:
+    """Add timer-driven liveness and instance identity fields for schema v5."""
+
+    agent_columns = _columns(connection, "agent")
+    if "worker_instance_id" not in agent_columns:
+        connection.execute(
+            "ALTER TABLE agent ADD COLUMN worker_instance_id TEXT NOT NULL DEFAULT ''"
+        )
+    if "last_heartbeat" not in agent_columns:
+        connection.execute(
+            "ALTER TABLE agent ADD COLUMN last_heartbeat TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute("UPDATE agent SET last_heartbeat = last_seen")
+    if "last_progress_at" not in agent_columns:
+        connection.execute("ALTER TABLE agent ADD COLUMN last_progress_at TEXT")
+
+    task_columns = _columns(connection, "task")
+    if "lease_duration_s" not in task_columns:
+        connection.execute(
+            "ALTER TABLE task ADD COLUMN lease_duration_s REAL NOT NULL DEFAULT 1800"
+        )
+        # Existing leases retain their original window where SQLite can derive
+        # it; terminal tasks and malformed legacy timestamps keep the default.
+        connection.execute("""
+            UPDATE task
+            SET lease_duration_s = max(
+                0,
+                (julianday(lease_expires) - julianday(created)) * 86400
+            )
+            WHERE lease_expires IS NOT NULL
+              AND julianday(lease_expires) IS NOT NULL
+              AND julianday(created) IS NOT NULL
+        """)
 
 
 @contextmanager

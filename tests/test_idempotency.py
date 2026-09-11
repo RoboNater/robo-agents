@@ -26,6 +26,11 @@ def _rpc(
     params: dict[str, Any],
     req_id: str | None = None,
 ) -> dict[str, Any]:
+    message = params.get("message")
+    if isinstance(message, dict):
+        metadata = message.setdefault("metadata", {})
+        if isinstance(metadata, dict):
+            metadata.setdefault(MetaKeys.WORKER_INSTANCE_ID, "test-worker-instance")
     return {
         "jsonrpc": "2.0",
         "id": req_id or uuid4().hex,
@@ -112,7 +117,11 @@ async def test_progress_idempotency_and_conflict(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
     # Check in bob
-    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
+    hub_store.check_in(
+        "bob",
+        AgentProfile(harness="claude-code", capabilities=("python",)),
+        worker_instance_id="test-worker-instance",
+    )
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "Task 1", "Instructions")
@@ -187,7 +196,11 @@ async def test_progress_idempotency_and_conflict(
 async def test_result_idempotency_and_conflict(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
-    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
+    hub_store.check_in(
+        "bob",
+        AgentProfile(harness="claude-code", capabilities=("python",)),
+        worker_instance_id="test-worker-instance",
+    )
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "Task 1", "Instructions")
@@ -275,7 +288,11 @@ async def test_validation_failure_leaves_task_working(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
     # 1. Reviewer validation failures
-    hub_store.check_in("charlie", AgentProfile(harness="codex", capabilities=("python",)))
+    hub_store.check_in(
+        "charlie",
+        AgentProfile(harness="codex", capabilities=("python",)),
+        worker_instance_id="test-worker-instance",
+    )
     agent = hub_store.agent_by_name("charlie")
     assert agent is not None
     rev_task = hub_store.assign_task("charlie", "reviewer", "Review PR", "Review instructions")
@@ -353,7 +370,11 @@ async def test_validation_failure_leaves_task_working(
     assert "blocking_findings to be empty" in resp.json()["error"]["message"]
 
     # 2. Implementer validation failure
-    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
+    hub_store.check_in(
+        "bob",
+        AgentProfile(harness="claude-code", capabilities=("python",)),
+        worker_instance_id="test-worker-instance",
+    )
     bob_agent = hub_store.agent_by_name("bob")
     assert bob_agent is not None
     imp_task = hub_store.assign_task("bob", "implementer", "Fix bug", "Fix instructions")
@@ -431,9 +452,7 @@ async def test_validation_failure_leaves_task_working(
         None,
     ],
 )
-async def test_schema_version_rejections(
-    client: httpx.AsyncClient, bad_version: Any
-) -> None:
+async def test_schema_version_rejections(client: httpx.AsyncClient, bad_version: Any) -> None:
     # Check that invalid schema_version (when provided) is rejected with 400
     if bad_version is None:
         # None or omitted is valid for backwards compatibility
@@ -465,7 +484,11 @@ async def test_schema_version_rejections(
 async def test_typed_result_roundtrip_a2a_to_get_state(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
-    hub_store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))
+    hub_store.check_in(
+        "bob",
+        AgentProfile(harness="claude-code", capabilities=("python",)),
+        worker_instance_id="test-worker-instance",
+    )
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "Task Implementer", "Inst")
@@ -524,7 +547,11 @@ async def test_typed_result_roundtrip_a2a_to_get_state(
     assert matching[0]["result"]["resolved_finding_ids"] == ["r1-1", "r1-2"]
 
     # 3. Test ReviewerResult with findings
-    hub_store.check_in("charlie", AgentProfile(harness="codex", capabilities=("python",)))
+    hub_store.check_in(
+        "charlie",
+        AgentProfile(harness="codex", capabilities=("python",)),
+        worker_instance_id="test-worker-instance",
+    )
     charlie_agent = hub_store.agent_by_name("charlie")
     assert charlie_agent is not None
     rev_task = hub_store.assign_task("charlie", "reviewer", "Task Review", "Inst")
@@ -629,7 +656,9 @@ async def test_missing_schema_version_and_operation_id_rejected_with_400(
     assert "operation_id is required" in resp.json()["error"]["message"]
 
     # Now valid check-in
-    hub_store.check_in("bob", AgentProfile(capabilities=("python",)))
+    hub_store.check_in(
+        "bob", AgentProfile(capabilities=("python",)), worker_instance_id="test-worker-instance"
+    )
     agent = hub_store.agent_by_name("bob")
     assert agent is not None
     task = hub_store.assign_task("bob", "implementer", "T1", "Inst")
@@ -764,12 +793,11 @@ async def test_missing_schema_version_and_operation_id_rejected_with_400(
     assert "result is required" in resp.json()["error"]["message"]
 
 
-async def test_atomic_rollback_on_failure(
-    client: httpx.AsyncClient, hub_store: HubStore
-) -> None:
+async def test_atomic_rollback_on_failure(client: httpx.AsyncClient, hub_store: HubStore) -> None:
     # Check-in failure rollback: response_builder throws exception
     op_id = "op-rollback-checkin-1"
     payload_hash = "hash-rollback-1"
+
     def fail_builder(*args: Any) -> Any:
         raise RuntimeError("Simulated builder failure")
 
@@ -786,8 +814,7 @@ async def test_atomic_rollback_on_failure(
     assert hub_store.agent_by_name("dave") is None
     with database(hub_store.path) as conn:
         assert (
-            conn.execute("SELECT count(*) as c FROM agent WHERE name = 'dave'").fetchone()["c"]
-            == 0
+            conn.execute("SELECT count(*) as c FROM agent WHERE name = 'dave'").fetchone()["c"] == 0
         )
         assert (
             conn.execute("SELECT count(*) as c FROM message WHERE sender = 'dave'").fetchone()["c"]
@@ -1019,7 +1046,7 @@ async def test_worker_client_clears_pending_ids_after_success(
     assert worker._pending_progress.get(task.id) is None
 
     # 4. Re-admission test: simulate heartbeat timeout marking worker LOST
-    hub_store.sweep(heartbeat_timeout_s=-1)
+    hub_store.sweep(lost_after_s=-1)
     agent_lost = hub_store.agent_by_name("alice-worker")
     assert agent_lost is not None and agent_lost.status == AgentStatus.LOST
 

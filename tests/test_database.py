@@ -54,7 +54,7 @@ def _legacy_database(path: Path, version: int) -> None:
         extra_columns = ""
     elif version == 2:
         extra_columns = ",\n                runtime TEXT"
-    elif version == 3:
+    elif version in (3, 4):
         extra_columns = "".join(
             f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
         )
@@ -62,6 +62,16 @@ def _legacy_database(path: Path, version: int) -> None:
         raise ValueError(f"unsupported legacy version {version}")
 
     with sqlite3.connect(path) as connection:
+        operation_table = """
+            CREATE TABLE operation (
+                actor TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created TEXT NOT NULL,
+                PRIMARY KEY (actor, operation_id)
+            );
+        """ if version == 4 else ""
         connection.executescript(f"""
             CREATE TABLE workflow (
                 id TEXT PRIMARY KEY,
@@ -113,6 +123,7 @@ def _legacy_database(path: Path, version: int) -> None:
                 summary TEXT NOT NULL,
                 rationale TEXT NOT NULL
             );
+            {operation_table}
             PRAGMA user_version = {version};
         """)
 
@@ -254,7 +265,7 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     assert row["created"] == "2026-09-07T00:00:00Z"
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) -> None:
     fresh = tmp_path / "fresh.db"
     migrated = tmp_path / f"v{version}.db"
@@ -304,10 +315,10 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
             ),
         )
 
-    # Migrate from v3 to v4
+    # Migrate from v3 through the composed migrations to v5.
     initialize_database(path)
 
-    # 1. Verify version advanced to 4
+    # 1. Verify version advanced to the current schema.
     with database(path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
@@ -318,7 +329,7 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
             row["name"] for row in connection.execute("PRAGMA table_info(operation)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION  # 4
+    assert version == SCHEMA_VERSION  # 5
     assert "operation" in tables
     assert {"actor", "operation_id", "payload_hash", "response_json", "created"} <= op_columns
 
@@ -335,6 +346,8 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
     assert bob.model == "claude-3-7-sonnet"
     assert bob.model_source == ModelSource.ENV
     assert bob.workspace_id == "ws-bob-main"
+    assert bob.last_heartbeat == "2026-09-10T20:00:00Z"
+    assert bob.worker_instance_id == ""
 
     # 3. Verify an idempotent wire check-in succeeds on the migrated database
     guides_dir = tmp_path / "guides"
@@ -350,7 +363,7 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
         guides_dir=guides_dir,
         default_wait_s=0.2,
         max_wait_s=1.0,
-        heartbeat_timeout_s=60.0,
+        lost_after_s=60.0,
         sweep_interval_s=3600.0,
     )
     app = create_app(settings)
@@ -375,6 +388,7 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
                     MetaKeys.WORKSPACE_ID: "ws-bob-main",
                     MetaKeys.SCHEMA_VERSION: 1,
                     MetaKeys.OPERATION_ID: op_id,
+                    MetaKeys.WORKER_INSTANCE_ID: "worker-v3-migration",
                 },
             }
         },

@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from sqlite3 import Connection
 
@@ -9,6 +10,7 @@ from agent_hub import store as store_module
 from agent_hub.database import database, initialize_database
 from agent_hub.store import (
     ConflictError,
+    DuplicateAgentError,
     HubStore,
     NotFoundError,
     Released,
@@ -32,6 +34,17 @@ CLAUDE = AgentProfile(
     model_source=ModelSource.ENV,
     capabilities=("python",),
 )
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 9, 11, 12, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs: float) -> None:
+        self.now += timedelta(**kwargs)
 
 
 def assign(store: HubStore, agent: str = "bob", role: str = "implementer") -> str:
@@ -69,7 +82,7 @@ def test_state_uses_one_read_snapshot(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_check_in_registers_an_agent_and_queues_the_event(store: HubStore) -> None:
-    agent = store.check_in("bob", CLAUDE)
+    agent = store.check_in("bob", CLAUDE, worker_instance_id="bob-1")
 
     event = store.next_event()
 
@@ -88,6 +101,7 @@ def test_check_in_registers_an_agent_and_queues_the_event(store: HubStore) -> No
         "capabilities": ["python"],
         "workspace_id": None,
         "context_id": agent.context_id,
+        "worker_instance_id": "bob-1",
     }
 
 
@@ -96,12 +110,22 @@ def test_get_state_shows_each_workers_profile(store: HubStore) -> None:
     store.check_in("charlie", AgentProfile(harness="codex"))
 
     agents = {agent["name"]: agent for agent in store.get_state()["agents"]}
+    assert agents["bob"].pop("heartbeat_age_s") >= 0
+    assert agents["bob"].pop("progress_age_s") is None
 
-    assert agents["bob"] | {"context_id": "", "last_seen": ""} == {
+    assert agents["bob"] | {
+        "context_id": "",
+        "last_seen": "",
+        "last_heartbeat": "",
+        "worker_instance_id": "",
+    } == {
         "name": "bob",
         "status": "idle",
         "context_id": "",
         "last_seen": "",
+        "worker_instance_id": "",
+        "last_heartbeat": "",
+        "last_progress_at": None,
         "current_task_id": None,
         "harness": "claude-code",
         "harness_version": "2.1.268",
@@ -119,34 +143,26 @@ def test_get_state_shows_each_workers_profile(store: HubStore) -> None:
     assert charlie["capabilities"] == []
 
 
-def test_returning_worker_keeps_its_context_and_drops_a_finished_task(store: HubStore) -> None:
-    first = store.check_in("bob", CLAUDE)
+def test_a_second_live_instance_cannot_claim_an_idle_agent_name(store: HubStore) -> None:
+    first = store.check_in("bob", CLAUDE, worker_instance_id="bob-1")
     task_id = assign(store)
     store.submit_result(task_id, "bob", TaskState.COMPLETED, "done")
 
-    second = store.check_in("bob", AgentProfile(capabilities=("python", "docs")))
+    with pytest.raises(DuplicateAgentError, match="live worker instance"):
+        store.check_in("bob", worker_instance_id="bob-2")
 
-    assert second.context_id == first.context_id
-    assert second.status is AgentStatus.IDLE
-    assert second.current_task_id is None
-    assert second.capabilities == ["python", "docs"]
-    # The new profile replaces the old one outright: a worker back under the
-    # same name may be a different harness, and a stale one would mislead.
-    assert (second.harness, second.model, second.model_source) == (
-        "unknown",
-        "unknown",
-        ModelSource.UNKNOWN,
-    )
+    assert store.agent_by_name("bob") == first
 
 
-def test_returning_worker_stays_busy_while_its_task_is_open(store: HubStore) -> None:
-    store.check_in("bob")
+def test_a_second_live_instance_cannot_take_over_an_open_task(store: HubStore) -> None:
+    store.check_in("bob", worker_instance_id="bob-1")
     task_id = assign(store)
 
-    returned = store.check_in("bob")
+    with pytest.raises(DuplicateAgentError, match="live worker instance"):
+        store.check_in("bob", worker_instance_id="bob-2")
 
-    assert returned.status is AgentStatus.BUSY
-    assert returned.current_task_id == task_id
+    current = store.agent_by_name("bob")
+    assert current is not None and current.current_task_id == task_id
 
 
 def test_assignment_marks_the_agent_busy_and_records_the_instructions(store: HubStore) -> None:
@@ -408,8 +424,8 @@ def test_an_overdue_lease_is_reported_exactly_once(store: HubStore) -> None:
     store.check_in("bob")
     task_id = store.assign_task("bob", "implementer", "Fix #1", "Open a PR", lease_min=-1).id
 
-    first = store.sweep(heartbeat_timeout_s=3600)
-    second = store.sweep(heartbeat_timeout_s=3600)
+    first = store.sweep(lost_after_s=3600)
+    second = store.sweep(lost_after_s=3600)
 
     assert [event.kind for event in first] == [EventKind.LEASE_EXPIRED]
     assert first[0].payload["task_id"] == task_id
@@ -422,14 +438,14 @@ def test_an_overdue_lease_is_reported_exactly_once(store: HubStore) -> None:
 def test_a_silent_worker_is_lost_and_its_task_fails(store: HubStore) -> None:
     store.check_in("bob")
     task_id = assign(store)
-    store.sweep(heartbeat_timeout_s=-1)
+    store.sweep(lost_after_s=-1)
 
     agent = store.agent_by_name("bob")
     task = store.get_task(task_id)
     assert agent is not None and agent.status is AgentStatus.LOST
     assert task is not None and task.state is TaskState.FAILED
-    assert task.result is not None and task.result["reason"] == "lost"
-    assert store.sweep(heartbeat_timeout_s=-1) == []
+    assert task.result is not None and task.result["reason"] == "worker_lost"
+    assert store.sweep(lost_after_s=-1) == []
 
 
 def test_a_release_survives_the_worker_restarting(store: HubStore) -> None:
@@ -446,7 +462,7 @@ def test_a_release_survives_the_worker_restarting(store: HubStore) -> None:
 
 def test_checking_in_readmits_a_lost_worker(store: HubStore) -> None:
     store.check_in("bob")
-    store.sweep(heartbeat_timeout_s=-1)
+    store.sweep(lost_after_s=-1)
 
     returned = store.check_in("bob")
 
@@ -455,7 +471,7 @@ def test_checking_in_readmits_a_lost_worker(store: HubStore) -> None:
 
 def test_a_lost_worker_is_given_no_work_until_it_checks_in_again(store: HubStore) -> None:
     store.check_in("bob")
-    store.sweep(heartbeat_timeout_s=-1)
+    store.sweep(lost_after_s=-1)
 
     with pytest.raises(ConflictError, match="not idle"):
         assign(store)
@@ -468,14 +484,130 @@ def test_a_released_worker_is_never_declared_lost(store: HubStore) -> None:
     store.check_in("bob")
     store.release_agent("bob")
 
-    assert store.sweep(heartbeat_timeout_s=-1) == []
+    assert store.sweep(lost_after_s=-1) == []
 
 
-def test_a_worker_that_keeps_calling_stays_live(store: HubStore) -> None:
-    store.check_in("bob")
-    store.touch("bob")
+def test_a_worker_that_keeps_heartbeating_stays_live(store: HubStore) -> None:
+    worker = store.check_in("bob")
+    assert store.heartbeat("bob", worker.worker_instance_id, None, 120)
 
-    assert store.sweep(heartbeat_timeout_s=60) == []
+    assert store.sweep(lost_after_s=60) == []
+
+
+def test_heartbeats_keep_a_worker_alive_during_twenty_minutes_without_llm_calls(
+    store: HubStore,
+) -> None:
+    clock = FakeClock()
+    store.clock = clock
+    worker = store.check_in("bob", worker_instance_id="bob-1")
+    task = store.assign_task("bob", "implementer", "Long tests", "Run them", lease_min=5)
+
+    for _ in range(20):
+        clock.advance(minutes=1)
+        assert store.heartbeat("bob", "bob-1", task.id, max_task_lease_min=30)
+        assert store.sweep(lost_after_s=180) == []
+
+    current = store.agent_by_name("bob")
+    active_task = store.get_task(task.id)
+    assert current is not None and current.status is AgentStatus.BUSY
+    assert active_task is not None and active_task.state is TaskState.SUBMITTED
+    assert current.worker_instance_id == worker.worker_instance_id
+
+
+def test_stopped_worker_is_lost_once_and_restart_supersedes_the_instance(
+    store: HubStore,
+) -> None:
+    clock = FakeClock()
+    store.clock = clock
+    first = store.check_in("bob", worker_instance_id="bob-1")
+    task = store.assign_task("bob", "implementer", "Task", "Work")
+    while store.next_event():
+        pass
+
+    clock.advance(seconds=181)
+    first_sweep = store.sweep(lost_after_s=180)
+    assert [event.kind for event in first_sweep] == [EventKind.AGENT_LOST]
+    assert store.sweep(lost_after_s=180) == []
+    failed = store.get_task(task.id)
+    assert failed is not None and failed.result is not None
+    assert failed.result["reason"] == "worker_lost"
+
+    restarted = store.check_in("bob", worker_instance_id="bob-2")
+    assert restarted.context_id == first.context_id
+    assert restarted.worker_instance_id == "bob-2"
+    assert restarted.status is AgentStatus.IDLE
+    assert not store.heartbeat("bob", "bob-1", None, max_task_lease_min=120)
+    assert [event.kind for event in iter(store.next_event, None)] == [
+        EventKind.AGENT_LOST,
+        EventKind.AGENT_CHECKED_IN,
+    ]
+
+
+def test_superseded_heartbeat_does_not_renew_or_revive(store: HubStore) -> None:
+    clock = FakeClock()
+    store.clock = clock
+    store.check_in("bob", worker_instance_id="bob-1")
+    clock.advance(seconds=181)
+    store.sweep(lost_after_s=180)
+    store.check_in("bob", worker_instance_id="bob-2")
+    task = store.assign_task("bob", "implementer", "Task", "Work", lease_min=5)
+    before = store.agent_by_name("bob")
+    original_expiry = task.lease_expires
+
+    clock.advance(minutes=1)
+    assert not store.heartbeat("bob", "bob-1", task.id, max_task_lease_min=30)
+
+    after = store.agent_by_name("bob")
+    unchanged_task = store.get_task(task.id)
+    assert before is not None and after is not None
+    assert after.status is AgentStatus.BUSY
+    assert after.last_heartbeat == before.last_heartbeat
+    assert unchanged_task is not None and unchanged_task.lease_expires == original_expiry
+
+
+def test_heartbeat_lease_renewal_stops_at_cap_and_expires_once(store: HubStore) -> None:
+    clock = FakeClock()
+    store.clock = clock
+    store.ensure_workflow(policy={"max_task_lease_min": 10})
+    store.check_in("bob", worker_instance_id="bob-1")
+    task = store.assign_task("bob", "implementer", "Task", "Work", lease_min=3)
+    while store.next_event():
+        pass
+
+    for _ in range(4):
+        clock.advance(minutes=2)
+        assert store.heartbeat("bob", "bob-1", task.id)
+
+    renewed = store.get_task(task.id)
+    assert renewed is not None
+    assert renewed.lease_expires == to_iso(datetime(2026, 9, 11, 12, 10, tzinfo=UTC))
+
+    clock.advance(minutes=2)
+    assert store.heartbeat("bob", "bob-1", task.id)
+    first = store.sweep(lost_after_s=180)
+    second = store.sweep(lost_after_s=180)
+    assert [event.kind for event in first] == [EventKind.LEASE_EXPIRED]
+    assert second == []
+
+
+def test_state_reports_heartbeat_and_progress_ages_separately(store: HubStore) -> None:
+    clock = FakeClock()
+    store.clock = clock
+    worker = store.check_in("bob", worker_instance_id="bob-1")
+    task_id = assign(store)
+    initial_heartbeat = worker.last_heartbeat
+
+    clock.advance(seconds=30)
+    store.record_progress(task_id, "bob", "tests started")
+    progressed = store.agent_by_name("bob")
+    assert progressed is not None and progressed.last_heartbeat == initial_heartbeat
+    clock.advance(seconds=20)
+    store.heartbeat("bob", "bob-1", task_id, max_task_lease_min=120)
+    clock.advance(seconds=10)
+
+    [agent] = store.get_state()["agents"]
+    assert agent["heartbeat_age_s"] == 10
+    assert agent["progress_age_s"] == 30
 
 
 def test_the_single_workflow_is_created_once(store: HubStore) -> None:

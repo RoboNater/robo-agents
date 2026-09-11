@@ -142,6 +142,7 @@ async def test_stdio_and_http_share_events(tmp_path: Path) -> None:
                                 MetaKeys.CAPABILITIES: ["python"],
                                 MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
                                 MetaKeys.OPERATION_ID: "op-mcp-1",
+                                MetaKeys.WORKER_INSTANCE_ID: "test-worker-instance",
                             },
                         }
                     },
@@ -250,6 +251,7 @@ def test_wire_cancellation_stops_event_consumption(tmp_path: Path) -> None:
                                 MetaKeys.CAPABILITIES: [],
                                 MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
                                 MetaKeys.OPERATION_ID: "op-mcp-2",
+                                MetaKeys.WORKER_INSTANCE_ID: "test-worker-instance",
                             },
                         }
                     },

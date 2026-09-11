@@ -48,7 +48,7 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
             logger.info("Bearer token ready at %s", resolved.token_file)
         else:
             logger.info("Bearer token loaded from HUB_TOKEN")
-        sweeper = start_sweeper(store, resolved.sweep_interval_s, resolved.heartbeat_timeout_s)
+        sweeper = start_sweeper(store, resolved.sweep_interval_s, resolved.lost_after_s)
         try:
             yield
         finally:
