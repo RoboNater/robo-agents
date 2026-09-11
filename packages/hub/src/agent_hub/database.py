@@ -17,7 +17,7 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class DatabaseVersionError(RuntimeError):
@@ -149,8 +149,8 @@ def initialize_database(path: Path) -> None:
                 f"expected version {SCHEMA_VERSION}"
             )
         # Each step inspects the table rather than trusting the version number,
-        # so it is safe to re-run and the Step 4A changes compose into the one
-        # migration §7 calls for.
+        # so it is safe to re-run and migrations compose across schema versions
+        # (v1/v2 -> v4, and mainline v3 -> v4).
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -189,6 +189,9 @@ def _migrate_operation_table(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (actor, operation_id)
         )
     """)
+    columns = _columns(connection, "operation")
+    if "created" not in columns:
+        connection.execute("ALTER TABLE operation ADD COLUMN created TEXT NOT NULL DEFAULT ''")
 
 
 @contextmanager
