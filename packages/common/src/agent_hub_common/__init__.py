@@ -1,7 +1,7 @@
 """Shared building blocks for the hub and worker MCP processes."""
 
 from .clock import iso_after, to_iso, utcnow, utcnow_iso
-from .config import ConfigurationError, HubSettings, profile_from_env
+from .config import DEFAULT_EVENT_LEASE_S, ConfigurationError, HubSettings, profile_from_env
 from .constants import MetaKeys
 from .models import (
     IMPLEMENTER_RESULT_SCHEMA,
@@ -13,6 +13,7 @@ from .models import (
     AgentProfile,
     AgentStatus,
     EventKind,
+    EventState,
     Finding,
     ImplementerOutcome,
     ImplementerResult,
@@ -39,7 +40,9 @@ __all__ = [
     "AgentProfile",
     "AgentStatus",
     "ConfigurationError",
+    "DEFAULT_EVENT_LEASE_S",
     "EventKind",
+    "EventState",
     "Finding",
     "HubSettings",
     "ImplementerOutcome",

@@ -12,13 +12,13 @@ from agent_hub_common import (
     UNKNOWN,
     AgentStatus,
     EventKind,
+    EventState,
     ModelSource,
     TaskState,
     WorkflowStatus,
 )
 
-# v5 and v6 are reserved for #24 and #25 (roadmap issue #2, Reservations);
-# v7 is #27/#41's `task.pr_head_sha`.
+# v7 is #27/#41's `task.pr_head_sha`, after #24's v5 and #25's v6.
 SCHEMA_VERSION = 7
 
 
@@ -60,6 +60,9 @@ CREATE TABLE IF NOT EXISTS agent (
     status TEXT NOT NULL CHECK (status IN ({_sql_values(AgentStatus)})),
     context_id TEXT UNIQUE,
     last_seen TEXT NOT NULL,
+    worker_instance_id TEXT NOT NULL DEFAULT '',
+    last_heartbeat TEXT NOT NULL DEFAULT '',
+    last_progress_at TEXT,
     current_task_id TEXT,{_PROFILE_SQL}
     FOREIGN KEY (current_task_id) REFERENCES task(id) ON DELETE SET NULL
 );
@@ -73,6 +76,7 @@ CREATE TABLE IF NOT EXISTS task (
     instructions TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ({_sql_values(TaskState)})),
     lease_expires TEXT,
+    lease_duration_s REAL NOT NULL DEFAULT 1800,
     result_json TEXT,
     created TEXT NOT NULL,
     updated TEXT NOT NULL,
@@ -96,7 +100,12 @@ CREATE TABLE IF NOT EXISTS event (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK (kind IN ({_sql_values(EventKind)})),
     payload_json TEXT NOT NULL,
-    consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0, 1)),
+    state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ({_sql_values(EventState)})),
+    delivery_id TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at TEXT,
+    delivery_expires TEXT,
+    acked_at TEXT,
     ts TEXT NOT NULL
 );
 
@@ -104,7 +113,8 @@ CREATE TABLE IF NOT EXISTS decision (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
     summary TEXT NOT NULL,
-    rationale TEXT NOT NULL
+    rationale TEXT NOT NULL,
+    key TEXT UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS operation (
@@ -119,7 +129,9 @@ CREATE TABLE IF NOT EXISTS operation (
 CREATE INDEX IF NOT EXISTS idx_task_workflow_state ON task(workflow_id, state);
 CREATE INDEX IF NOT EXISTS idx_task_assignee ON task(assignee);
 CREATE INDEX IF NOT EXISTS idx_message_context_ts ON message(context_id, ts);
-CREATE INDEX IF NOT EXISTS idx_event_inbox ON event(consumed, id);
+CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id);
+CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_key ON decision(key) WHERE key IS NOT NULL;
 """
 
 
@@ -153,9 +165,12 @@ def initialize_database(path: Path) -> None:
             )
         # Each step inspects the table rather than trusting the version number,
         # so it is safe to re-run and migrations compose across schema versions
-        # (v1/v2/v3/v4 -> v7).
+        # (any of v1-v6 -> v7).
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
+        _migrate_worker_heartbeat(connection)
+        _migrate_event_delivery(connection)
+        _migrate_decision_key(connection)
         _migrate_task_pr_head_sha(connection)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -196,6 +211,86 @@ def _migrate_operation_table(connection: sqlite3.Connection) -> None:
     columns = _columns(connection, "operation")
     if "created" not in columns:
         connection.execute("ALTER TABLE operation ADD COLUMN created TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_worker_heartbeat(connection: sqlite3.Connection) -> None:
+    """Add timer-driven liveness and instance identity fields for schema v5."""
+
+    agent_columns = _columns(connection, "agent")
+    if "worker_instance_id" not in agent_columns:
+        connection.execute(
+            "ALTER TABLE agent ADD COLUMN worker_instance_id TEXT NOT NULL DEFAULT ''"
+        )
+    if "last_heartbeat" not in agent_columns:
+        connection.execute(
+            "ALTER TABLE agent ADD COLUMN last_heartbeat TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute("UPDATE agent SET last_heartbeat = last_seen")
+    if "last_progress_at" not in agent_columns:
+        connection.execute("ALTER TABLE agent ADD COLUMN last_progress_at TEXT")
+
+    task_columns = _columns(connection, "task")
+    if "lease_duration_s" not in task_columns:
+        connection.execute(
+            "ALTER TABLE task ADD COLUMN lease_duration_s REAL NOT NULL DEFAULT 1800"
+        )
+        # Existing leases retain their original window where SQLite can derive
+        # it; terminal tasks and malformed legacy timestamps keep the default.
+        connection.execute("""
+            UPDATE task
+            SET lease_duration_s = max(
+                0,
+                (julianday(lease_expires) - julianday(created)) * 86400
+            )
+            WHERE lease_expires IS NOT NULL
+              AND julianday(lease_expires) IS NOT NULL
+              AND julianday(created) IS NOT NULL
+        """)
+
+
+def _migrate_event_delivery(connection: sqlite3.Connection) -> None:
+    """Migrate event table from consumed flag (v1-v5) to durable delivery leasing (v6)."""
+
+    columns = _columns(connection, "event")
+    if "state" not in columns:
+        connection.execute(
+            f"ALTER TABLE event ADD COLUMN state TEXT NOT NULL DEFAULT 'queued'"
+            f" CHECK (state IN ({_sql_values(EventState)}))"
+        )
+    if "delivery_id" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN delivery_id TEXT")
+    if "delivery_attempts" not in columns:
+        connection.execute(
+            "ALTER TABLE event ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    if "delivered_at" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN delivered_at TEXT")
+    if "delivery_expires" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN delivery_expires TEXT")
+    if "acked_at" not in columns:
+        connection.execute("ALTER TABLE event ADD COLUMN acked_at TEXT")
+
+    connection.execute("DROP INDEX IF EXISTS idx_event_inbox")
+    if "consumed" in columns:
+        connection.execute(
+            "UPDATE event SET state = 'acked', acked_at = ts, delivery_attempts = 1 "
+            "WHERE consumed = 1"
+        )
+        connection.execute("ALTER TABLE event DROP COLUMN consumed")
+
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id)")
+
+
+def _migrate_decision_key(connection: sqlite3.Connection) -> None:
+    """Add decision deduplication key column for schema v6."""
+
+    columns = _columns(connection, "decision")
+    if "key" not in columns:
+        connection.execute("ALTER TABLE decision ADD COLUMN key TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_key ON decision(key) WHERE key IS NOT NULL"
+    )
 
 
 def _migrate_task_pr_head_sha(connection: sqlite3.Connection) -> None:

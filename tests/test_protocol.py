@@ -55,6 +55,74 @@ async def test_check_in_returns_the_context_the_worker_must_use(
     assert agent is not None and result["contextId"] == agent.context_id
 
 
+async def test_a_second_live_worker_with_the_same_name_gets_conflict(
+    client: httpx.AsyncClient,
+) -> None:
+    await check_in(client, "bob", worker_instance_id="bob-1")
+
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "READY",
+            metadata={
+                MetaKeys.AGENT: "bob",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-duplicate-bob",
+                MetaKeys.WORKER_INSTANCE_ID: "bob-2",
+            },
+        ),
+        status_code=409,
+    )
+
+    assert body["error"]["code"] == -32600
+    assert "live worker instance" in body["error"]["message"]
+
+
+async def test_heartbeat_is_an_immediate_message_send_intent(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    context_id = await check_in(client, "bob", worker_instance_id="bob-1")
+    before = hub_store.agent_by_name("bob")
+    assert before is not None
+
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "HEARTBEAT",
+            context_id=context_id,
+            metadata={
+                MetaKeys.KIND: "heartbeat",
+                MetaKeys.AGENT: "bob",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.WORKER_INSTANCE_ID: "bob-1",
+            },
+        ),
+    )
+
+    after = hub_store.agent_by_name("bob")
+    assert body["result"]["metadata"] == {
+        MetaKeys.KIND: "heartbeat_ack",
+        MetaKeys.AGENT: "bob",
+        MetaKeys.ACCEPTED: True,
+    }
+    assert after is not None and after.last_heartbeat >= before.last_heartbeat
+
+
+async def test_worker_calls_require_the_current_instance_id(
+    client: httpx.AsyncClient,
+) -> None:
+    context_id = await check_in(client, "bob", worker_instance_id="bob-1")
+    params = message("NEXT", context_id=context_id)
+    params["message"]["metadata"].pop(MetaKeys.WORKER_INSTANCE_ID)
+
+    body = await post(client, "message/stream", params, status_code=400)
+
+    assert body["error"]["code"] == -32602
+    assert "worker_instance_id" in body["error"]["message"]
+
+
 async def test_a_message_with_no_task_must_be_the_check_in(client: httpx.AsyncClient) -> None:
     body = await post(
         client, "message/send", message("hello", metadata={MetaKeys.AGENT: "bob"})

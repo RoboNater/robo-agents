@@ -10,7 +10,8 @@
         "kind": "message",
         "messageId": "msg-102",
         "metadata": {
-          "hub.timeout_s": 60.0
+          "hub.timeout_s": 60.0,
+          "hub.worker_instance_id": "worker-101"
         },
         "parts": [
           {

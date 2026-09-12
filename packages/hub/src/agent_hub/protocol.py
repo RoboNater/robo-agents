@@ -65,6 +65,7 @@ from pydantic import ValidationError
 from .store import (
     AgentRecord,
     ConflictError,
+    DuplicateAgentError,
     HubStore,
     IdempotencyConflictError,
     MessageRecord,
@@ -163,6 +164,15 @@ def _require_operation_id(metadata: Mapping[str, Any]) -> str:
             f"metadata.{MetaKeys.OPERATION_ID} must be a non-empty string"
         )
     return operation_id.strip()
+
+
+def _require_worker_instance_id(metadata: Mapping[str, Any]) -> str:
+    value = metadata.get(MetaKeys.WORKER_INSTANCE_ID)
+    if not isinstance(value, str) or not value.strip():
+        raise MissingRequiredFieldError(
+            f"metadata.{MetaKeys.WORKER_INSTANCE_ID} must be a non-empty string"
+        )
+    return value.strip()
 
 
 def _require_result(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -401,7 +411,7 @@ class A2AProtocol:
             MissingRequiredFieldError,
         ) as exc:
             return _error_response(request_id, exc.error, status_code=400)
-        except IdempotencyConflictError as exc:
+        except (DuplicateAgentError, IdempotencyConflictError) as exc:
             return _error_response(
                 request_id, InvalidRequestError(message=str(exc)), status_code=409
             )
@@ -434,6 +444,8 @@ class A2AProtocol:
         message = params.message
         metadata = _metadata(message)
         if message.task_id is None:
+            if metadata.get(MetaKeys.KIND) == "heartbeat":
+                return self._heartbeat(message, metadata)
             return self._check_in(message, metadata)
 
         agent = self._resolve_agent(message, metadata)
@@ -474,6 +486,7 @@ class A2AProtocol:
             raise _invalid(f"a message with no taskId must be the {CHECK_IN_TEXT} check-in")
         _require_schema_version(metadata)
         operation_id = _require_operation_id(metadata)
+        worker_instance_id = _require_worker_instance_id(metadata)
         name = metadata.get(MetaKeys.AGENT)
         if not isinstance(name, str) or not name.strip():
             raise _invalid(f"check-in requires metadata.{MetaKeys.AGENT}")
@@ -483,6 +496,7 @@ class A2AProtocol:
         payload_hash = _hash_payload({
             "intent": "check_in",
             "agent": agent_name,
+            "worker_instance_id": worker_instance_id,
             "capabilities": sorted(profile.capabilities),
             "harness": profile.harness,
             "harness_version": profile.harness_version,
@@ -495,6 +509,7 @@ class A2AProtocol:
         resp_json, _ = self.store.check_in(
             agent_name,
             profile,
+            worker_instance_id=worker_instance_id,
             operation_id=operation_id,
             payload_hash=payload_hash,
             response_builder=lambda agent: json.dumps(
@@ -505,11 +520,44 @@ class A2AProtocol:
                         MetaKeys.KIND: "check_in_ack",
                         MetaKeys.AGENT: agent.name,
                         MetaKeys.STATUS: agent.status.value,
+                        MetaKeys.WORKER_INSTANCE_ID: agent.worker_instance_id,
                     },
                 ).model_dump(mode="json", exclude_none=True)
             ),
         )
         return A2AMessage.model_validate(json.loads(resp_json))
+
+    def _heartbeat(
+        self, message: A2AMessage, metadata: dict[str, Any]
+    ) -> A2AMessage:
+        _require_schema_version(metadata)
+        name = metadata.get(MetaKeys.AGENT)
+        if not isinstance(name, str) or not name.strip():
+            raise _invalid(f"heartbeat requires metadata.{MetaKeys.AGENT}")
+        instance_id = _require_worker_instance_id(metadata)
+        current_task_id = metadata.get(MetaKeys.CURRENT_TASK_ID)
+        if current_task_id is not None and (
+            not isinstance(current_task_id, str) or not current_task_id.strip()
+        ):
+            raise _invalid(
+                f"metadata.{MetaKeys.CURRENT_TASK_ID} must be a non-empty string when present"
+            )
+        agent_name = name.strip()
+        accepted = self.store.heartbeat(
+            agent_name,
+            instance_id,
+            None if current_task_id is None else current_task_id.strip(),
+        )
+        agent = self.store.agent_by_name(agent_name)
+        return _agent_message(
+            "HEARTBEAT",
+            context_id=None if agent is None else agent.context_id,
+            metadata={
+                MetaKeys.KIND: "heartbeat_ack",
+                MetaKeys.AGENT: agent_name,
+                MetaKeys.ACCEPTED: accepted,
+            },
+        )
 
     def _result(
         self,
@@ -721,14 +769,24 @@ class A2AProtocol:
             agent = self.store.agent_by_context(message.context_id)
             if agent is None:
                 raise _invalid(f"unknown contextId {message.context_id!r}; check in first")
-            return agent
+            return self._require_current_instance(agent, metadata)
         name = metadata.get(MetaKeys.AGENT)
         if isinstance(name, str) and name.strip():
             agent = self.store.agent_by_name(name.strip())
             if agent is None:
                 raise _invalid(f"unknown agent {name!r}; check in first")
-            return agent
+            return self._require_current_instance(agent, metadata)
         raise _invalid(f"the message needs a contextId or metadata.{MetaKeys.AGENT}")
+
+    def _require_current_instance(
+        self, agent: AgentRecord, metadata: Mapping[str, Any]
+    ) -> AgentRecord:
+        instance_id = _require_worker_instance_id(metadata)
+        if instance_id != agent.worker_instance_id:
+            raise _invalid(f"worker instance for agent {agent.name} has been superseded")
+        if agent.status.value == "lost":
+            raise _invalid(f"agent {agent.name} is lost; check in with a new worker instance")
+        return agent
 
     def _owned_task(self, task_id: str, agent: AgentRecord) -> TaskRecord:
         task = self.store.get_task(task_id)

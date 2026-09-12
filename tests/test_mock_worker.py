@@ -35,7 +35,7 @@ async def test_mock_worker_implements_task_end_to_end(tmp_path: Path) -> None:
         guides_dir=guides_dir,
         default_wait_s=0.5,
         max_wait_s=1.0,
-        heartbeat_timeout_s=60.0,
+        lost_after_s=60.0,
         sweep_interval_s=3600.0,
     )
     app = create_app(settings)
@@ -114,7 +114,7 @@ async def test_mock_worker_reviewer_task(tmp_path: Path) -> None:
         guides_dir=guides_dir,
         default_wait_s=0.5,
         max_wait_s=1.0,
-        heartbeat_timeout_s=60.0,
+        lost_after_s=60.0,
         sweep_interval_s=3600.0,
     )
     app = create_app(settings)

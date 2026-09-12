@@ -45,6 +45,45 @@ async def test_worker_check_in_and_state(
     assert hub_store.agent_by_name("bob") is not None
 
 
+def test_worker_instance_id_is_generated_once_per_client_startup(
+    worker_settings: WorkerSettings,
+) -> None:
+    first = WorkerHubClient(worker_settings)
+    second = WorkerHubClient(worker_settings)
+
+    assert first.worker_instance_id
+    assert second.worker_instance_id
+    assert first.worker_instance_id != second.worker_instance_id
+
+
+async def test_background_heartbeat_runs_without_llm_tool_calls(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+) -> None:
+    configured = replace(worker_settings, heartbeat_s=0.01)
+    async with WorkerHubClient(configured, http_client=client) as worker:
+        await worker.check_in()
+        task = hub_store.assign_task("bob", "implementer", "Long tests", "Run them")
+        assignment = await worker.await_assignment(timeout_s=0.2)
+        assert assignment["task_id"] == task.id
+        before = hub_store.agent_by_name("bob")
+        assert before is not None
+
+        await asyncio.sleep(0.04)
+
+        after = hub_store.agent_by_name("bob")
+        assert after is not None and after.last_heartbeat > before.last_heartbeat
+        assert worker.current_task_id == task.id
+        assert f"worker-heartbeat-{configured.agent_name}" in {
+            running.get_name() for running in asyncio.all_tasks()
+        }
+
+    assert f"worker-heartbeat-{configured.agent_name}" not in {
+        running.get_name() for running in asyncio.all_tasks()
+    }
+
+
 async def test_check_in_reports_the_launcher_profile_to_get_state(
     client: httpx.AsyncClient, worker_settings: WorkerSettings, hub_store: HubStore
 ) -> None:

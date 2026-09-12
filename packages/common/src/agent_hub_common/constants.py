@@ -32,3 +32,6 @@ class MetaKeys(StrEnum):
     TS = "hub.ts"
     SCHEMA_VERSION = "hub.schema_version"
     OPERATION_ID = "hub.operation_id"
+    WORKER_INSTANCE_ID = "hub.worker_instance_id"
+    CURRENT_TASK_ID = "hub.current_task_id"
+    ACCEPTED = "hub.accepted"

@@ -25,6 +25,7 @@ def test_settings_have_local_defaults(tmp_path: Path) -> None:
     # Guides are checkout content, not state: the default is the repository's
     # own top-level guides/ directory (§6).
     assert settings.guides_dir == Path(__file__).resolve().parents[1] / "guides"
+    assert settings.event_lease_s == 600.0
 
 
 def test_state_paths_ignore_the_working_directory(
@@ -156,23 +157,20 @@ def test_settings_reject_invalid_overrides(name: str, value: str) -> None:
         HubSettings.from_env({name: value})
 
 
-def test_wait_bounds_and_liveness_scale_with_the_default_hold() -> None:
+def test_wait_bounds_and_timer_liveness_have_independent_defaults() -> None:
     settings = HubSettings.from_env({})
 
     assert settings.default_wait_s == 120
     assert settings.max_wait_s == 300
-    # Spec §4.3: an agent is lost after three times the timeout with no contact,
-    # which has to outlast the longest hold the hub will grant.
-    assert settings.heartbeat_timeout_s == 360
-    assert settings.heartbeat_timeout_s > settings.max_wait_s
+    assert settings.lost_after_s == 180
     assert settings.sweep_interval_s == 10
 
 
-def test_lowering_the_default_hold_keeps_the_bounds_consistent() -> None:
+def test_lowering_the_default_hold_does_not_change_timer_liveness() -> None:
     settings = HubSettings.from_env({"HUB_DEFAULT_WAIT_S": "20"})
 
     assert settings.max_wait_s == 50
-    assert settings.heartbeat_timeout_s == 60
+    assert settings.lost_after_s == 180
 
 
 def test_a_requested_wait_is_clamped_to_the_ceiling() -> None:
@@ -193,9 +191,7 @@ def test_a_requested_wait_is_clamped_to_the_ceiling() -> None:
         pytest.param(
             {"HUB_DEFAULT_WAIT_S": "120", "HUB_MAX_WAIT_S": "60"}, id="ceiling-below-default"
         ),
-        pytest.param(
-            {"HUB_MAX_WAIT_S": "300", "HUB_HEARTBEAT_TIMEOUT_S": "120"}, id="lost-mid-hold"
-        ),
+        pytest.param({"HUB_LOST_AFTER_S": "0"}, id="zero-lost-after"),
     ],
 )
 def test_settings_reject_inconsistent_timings(env: dict[str, str]) -> None:
@@ -262,3 +258,11 @@ def test_profile_accepts_the_step_4_runtime_name_for_the_harness() -> None:
 
 def test_a_model_named_unknown_has_no_source() -> None:
     assert profile_from_env({"HUB_MODEL": UNKNOWN}).model_source is ModelSource.UNKNOWN
+
+
+def test_custom_event_lease_seconds(tmp_path: Path) -> None:
+    settings = HubSettings.from_env({
+        "XDG_STATE_HOME": str(tmp_path),
+        "HUB_EVENT_LEASE_S": "300",
+    })
+    assert settings.event_lease_s == 300.0

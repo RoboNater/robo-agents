@@ -27,7 +27,11 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
 
     resolved = settings or HubSettings.from_env()
     card = build_agent_card(resolved.public_url)
-    store = HubStore(path=resolved.database_path, signals=Signals())
+    store = HubStore(
+        path=resolved.database_path,
+        signals=Signals(),
+        default_event_lease_s=resolved.event_lease_s,
+    )
     protocol = A2AProtocol(store=store, settings=resolved)
 
     @asynccontextmanager
@@ -48,7 +52,7 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
             logger.info("Bearer token ready at %s", resolved.token_file)
         else:
             logger.info("Bearer token loaded from HUB_TOKEN")
-        sweeper = start_sweeper(store, resolved.sweep_interval_s, resolved.heartbeat_timeout_s)
+        sweeper = start_sweeper(store, resolved.sweep_interval_s, resolved.lost_after_s)
         try:
             yield
         finally:

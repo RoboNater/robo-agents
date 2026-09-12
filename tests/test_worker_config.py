@@ -16,6 +16,7 @@ def test_worker_settings_parses_valid_env() -> None:
     # Nothing the launcher left unset is guessed, not even the harness.
     assert settings.profile == AgentProfile()
     assert settings.default_wait_s == 120.0
+    assert settings.heartbeat_s == 30.0
     assert settings.max_retries == 3
     assert settings.backoff_factor_s == 0.5
 
@@ -31,6 +32,7 @@ def test_worker_settings_custom_overrides() -> None:
         "HUB_MODEL": "example-codex-model",
         "HUB_CAPABILITIES": "python, gh,,python",
         "HUB_DEFAULT_WAIT_S": "45.5",
+        "HUB_HEARTBEAT_S": "12.5",
         "HUB_MAX_RETRIES": "5",
         "HUB_BACKOFF_FACTOR_S": "1.5",
     }
@@ -46,6 +48,7 @@ def test_worker_settings_custom_overrides() -> None:
         capabilities=("python", "gh"),
     )
     assert settings.default_wait_s == 45.5
+    assert settings.heartbeat_s == 12.5
     assert settings.max_retries == 5
     assert settings.backoff_factor_s == 1.5
 
@@ -77,6 +80,15 @@ def test_worker_settings_custom_overrides() -> None:
                 "HUB_DEFAULT_WAIT_S": "abc",
             },
             "must be a number of seconds",
+        ),
+        (
+            {
+                "HUB_URL": "http://hub",
+                "HUB_TOKEN": "tok",
+                "AGENT_NAME": "bob",
+                "HUB_HEARTBEAT_S": "0",
+            },
+            "must be greater than zero",
         ),
         (
             {

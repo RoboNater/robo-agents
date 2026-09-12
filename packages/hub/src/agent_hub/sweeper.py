@@ -16,13 +16,13 @@ from .store import HubStore
 logger = logging.getLogger(__name__)
 
 
-async def run_sweeper(store: HubStore, interval_s: float, heartbeat_timeout_s: float) -> None:
+async def run_sweeper(store: HubStore, interval_s: float, lost_after_s: float) -> None:
     """Sweep on a fixed interval until cancelled."""
 
     while True:
         await asyncio.sleep(interval_s)
         try:
-            events = store.sweep(heartbeat_timeout_s)
+            events = store.sweep(lost_after_s)
         except Exception:
             # A sweep failure must not take the loop down with it; the next
             # pass sees the same overdue rows and reports them then.
@@ -33,12 +33,12 @@ async def run_sweeper(store: HubStore, interval_s: float, heartbeat_timeout_s: f
 
 
 def start_sweeper(
-    store: HubStore, interval_s: float, heartbeat_timeout_s: float
+    store: HubStore, interval_s: float, lost_after_s: float
 ) -> asyncio.Task[None]:
     """Start the sweep loop as a background task."""
 
     return asyncio.create_task(
-        run_sweeper(store, interval_s, heartbeat_timeout_s), name="hub-sweeper"
+        run_sweeper(store, interval_s, lost_after_s), name="hub-sweeper"
     )
 
 

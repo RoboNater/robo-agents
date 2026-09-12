@@ -12,7 +12,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from sqlite3 import Connection, Row
 from time import monotonic
@@ -20,11 +20,13 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from agent_hub_common import (
+    DEFAULT_EVENT_LEASE_S,
     SHA_HEX_40_RE,
     UNKNOWN,
     AgentProfile,
     AgentStatus,
     EventKind,
+    EventState,
     ImplementerOutcome,
     ImplementerResult,
     MetaKeys,
@@ -37,7 +39,6 @@ from agent_hub_common import (
     WorkflowStatus,
     to_iso,
     utcnow,
-    utcnow_iso,
 )
 
 from .database import database
@@ -45,8 +46,9 @@ from .signals import EVENT_KEY, Signals, context_key, task_key
 
 DEFAULT_GOAL = "Drive the assigned GitHub issue to a merged pull request."
 DEFAULT_LEASE_MIN = 30.0
+DEFAULT_MAX_TASK_LEASE_MIN = 120.0
 DEFAULT_PROFILE = AgentProfile()
-LOST_REASON = "lost"
+LOST_REASON = "worker_lost"
 
 TERMINAL_STATES = (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED)
 OPEN_STATES = (TaskState.SUBMITTED, TaskState.WORKING, TaskState.INPUT_REQUIRED)
@@ -70,6 +72,10 @@ class IdempotencyConflictError(ConflictError):
     """Raised when an operation is retried with a conflicting payload."""
 
 
+class DuplicateAgentError(ConflictError):
+    """Raised when a second live worker claims an existing agent name."""
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRecord:
     name: str
@@ -77,6 +83,9 @@ class AgentRecord:
     status: AgentStatus
     context_id: str
     last_seen: str
+    worker_instance_id: str
+    last_heartbeat: str
+    last_progress_at: str | None
     current_task_id: str | None
     # The identity profile (§3), flat so `get_state` shows it per agent.
     harness: str = UNKNOWN
@@ -97,6 +106,7 @@ class TaskRecord:
     instructions: str
     state: TaskState
     lease_expires: str | None
+    lease_duration_s: float
     result: dict[str, Any] | None
     created: str
     updated: str
@@ -121,6 +131,12 @@ class EventRecord:
     kind: EventKind
     payload: dict[str, Any]
     ts: str
+    state: EventState = EventState.QUEUED
+    delivery_id: str | None = None
+    delivery_attempts: int = 0
+    delivered_at: str | None = None
+    delivery_expires: str | None = None
+    acked_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +161,9 @@ def _agent(row: Row) -> AgentRecord:
         status=AgentStatus(row["status"]),
         context_id=row["context_id"],
         last_seen=row["last_seen"],
+        worker_instance_id=row["worker_instance_id"],
+        last_heartbeat=row["last_heartbeat"],
+        last_progress_at=row["last_progress_at"],
         current_task_id=row["current_task_id"],
         harness=row["harness"],
         harness_version=row["harness_version"],
@@ -179,6 +198,7 @@ def _task(row: Row) -> TaskRecord:
         instructions=row["instructions"],
         state=TaskState(row["state"]),
         lease_expires=row["lease_expires"],
+        lease_duration_s=float(row["lease_duration_s"]),
         result=_json_object(row["result_json"]),
         created=row["created"],
         updated=row["updated"],
@@ -205,6 +225,8 @@ _LEGACY_KEY_MAP: dict[str, str] = {
     "state": MetaKeys.STATE.value,
     "sender": MetaKeys.SENDER.value,
     "ts": MetaKeys.TS.value,
+    "worker_instance_id": MetaKeys.WORKER_INSTANCE_ID.value,
+    "current_task_id": MetaKeys.CURRENT_TASK_ID.value,
 }
 
 
@@ -254,6 +276,12 @@ def _event(row: Row) -> EventRecord:
         kind=EventKind(row["kind"]),
         payload=_json_object(row["payload_json"]) or {},
         ts=row["ts"],
+        state=EventState(row["state"]),
+        delivery_id=row["delivery_id"],
+        delivery_attempts=row["delivery_attempts"],
+        delivered_at=row["delivered_at"],
+        delivery_expires=row["delivery_expires"],
+        acked_at=row["acked_at"],
     )
 
 
@@ -272,6 +300,14 @@ class HubStore:
 
     path: Path
     signals: Signals = field(default_factory=Signals)
+    clock: Callable[[], datetime] = utcnow
+    default_event_lease_s: float = DEFAULT_EVENT_LEASE_S
+
+    def _now(self) -> datetime:
+        return self.clock()
+
+    def _now_iso(self) -> str:
+        return to_iso(self._now())
 
     # -- workflow -----------------------------------------------------------
 
@@ -297,13 +333,14 @@ class HubStore:
                 goal,
                 WorkflowStatus.ACTIVE.value,
                 json.dumps(dict(policy or {})),
-                utcnow_iso(),
+                self._now_iso(),
             ),
         )
         return workflow_id
 
     def get_state(self) -> dict[str, Any]:
         """Return compact state without task instructions or transcripts."""
+        now = self._now()
         with database(self.path) as connection:
             # SELECT alone does not start a transaction in sqlite3's legacy mode.
             connection.execute("BEGIN")
@@ -316,29 +353,59 @@ class HubStore:
                 summary = asdict(_task(row))
                 summary.pop("instructions")
                 tasks.append(summary)
-            agents = [
-                asdict(_agent(row))
-                for row in connection.execute("SELECT * FROM agent ORDER BY name").fetchall()
-            ]
-        return {"workflow": workflow, "agents": agents, "tasks": tasks}
+            agents = []
+            for row in connection.execute("SELECT * FROM agent ORDER BY name").fetchall():
+                summary = asdict(_agent(row))
+                summary["heartbeat_age_s"] = _age_seconds(summary["last_heartbeat"], now)
+                summary["progress_age_s"] = _age_seconds(summary["last_progress_at"], now)
+                agents.append(summary)
+            queued_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS n FROM event WHERE state = 'queued'"
+                ).fetchone()["n"]
+            )
+            unacked_rows = connection.execute(
+                "SELECT * FROM event WHERE state = 'delivered' ORDER BY id ASC"
+            ).fetchall()
+            unacked_delivered = [asdict(_event(r)) for r in unacked_rows]
+        return {
+            "workflow": workflow,
+            "agents": agents,
+            "tasks": tasks,
+            "queued_events": queued_count,
+            "unacked_delivered": unacked_delivered,
+        }
 
     def set_workflow_status(self, status: WorkflowStatus, summary: str) -> None:
         """Persist status and its explanation atomically in the audit log."""
         with database(self.path) as connection:
             workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            row = connection.execute(
+                "SELECT status FROM workflow WHERE id = ?", (workflow_id,)
+            ).fetchone()
+            if row is not None and row["status"] == status.value:
+                return
             connection.execute(
                 "UPDATE workflow SET status = ? WHERE id = ?", (status.value, workflow_id)
             )
             connection.execute(
                 "INSERT INTO decision (ts, summary, rationale) VALUES (?, ?, ?)",
-                (utcnow_iso(), summary, f"Workflow status set to {status.value}"),
+                (self._now_iso(), summary, f"Workflow status set to {status.value}"),
             )
 
-    def log_decision(self, summary: str, rationale: str) -> int:
+    def log_decision(
+        self, summary: str, rationale: str, key: str | None = None
+    ) -> int:
         with database(self.path) as connection:
+            if key is not None:
+                row = connection.execute(
+                    "SELECT id FROM decision WHERE key = ?", (key,)
+                ).fetchone()
+                if row is not None:
+                    return int(row["id"])
             cursor = connection.execute(
-                "INSERT INTO decision (ts, summary, rationale) VALUES (?, ?, ?)",
-                (utcnow_iso(), summary, rationale),
+                "INSERT INTO decision (ts, summary, rationale, key) VALUES (?, ?, ?, ?)",
+                (self._now_iso(), summary, rationale, key),
             )
             return int(cursor.lastrowid or 0)
 
@@ -370,6 +437,7 @@ class HubStore:
         name: str,
         profile: AgentProfile = DEFAULT_PROFILE,
         *,
+        worker_instance_id: str | None = None,
         operation_id: str | None = None,
         payload_hash: str | None = None,
         response_builder: Callable[[AgentRecord], str] | None = None,
@@ -381,7 +449,8 @@ class HubStore:
         name, and a stale value would mislead role selection.
         """
 
-        now = utcnow_iso()
+        now = self._now_iso()
+        instance_id = worker_instance_id or uuid4().hex
         profile_values = (
             json.dumps(list(profile.capabilities)),
             profile.harness,
@@ -410,23 +479,45 @@ class HubStore:
             if row is None:
                 context_id = uuid4().hex
                 connection.execute(
-                    "INSERT INTO agent (name, status, context_id, last_seen, capabilities_json,"
+                    "INSERT INTO agent (name, status, context_id, last_seen, worker_instance_id,"
+                    " last_heartbeat, capabilities_json,"
                     " harness, harness_version, provider, model, model_source, workspace_id)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (name, AgentStatus.IDLE.value, context_id, now, *profile_values),
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        name,
+                        AgentStatus.IDLE.value,
+                        context_id,
+                        now,
+                        instance_id,
+                        now,
+                        *profile_values,
+                    ),
                 )
             else:
+                previous = AgentStatus(row["status"])
+                previous_instance = str(row["worker_instance_id"])
+                if (
+                    previous in (AgentStatus.IDLE, AgentStatus.BUSY)
+                    and previous_instance
+                ):
+                    raise DuplicateAgentError(
+                        f"agent {name} already has a live worker instance"
+                    )
                 # A returning worker keeps its context id so Alice reads one
                 # unbroken thread per agent across restarts.
                 context_id = row["context_id"]
                 current = self._open_task_id(connection, row["current_task_id"])
                 connection.execute(
-                    "UPDATE agent SET status = ?, last_seen = ?, current_task_id = ?,"
+                    "UPDATE agent SET status = ?, last_seen = ?, worker_instance_id = ?,"
+                    " last_heartbeat = ?, last_progress_at = ?, current_task_id = ?,"
                     " capabilities_json = ?, harness = ?, harness_version = ?, provider = ?,"
                     " model = ?, model_source = ?, workspace_id = ? WHERE name = ?",
                     (
-                        _readmitted(AgentStatus(row["status"]), current).value,
+                        _readmitted(previous, current).value,
                         now,
+                        instance_id,
+                        now,
+                        None if previous is AgentStatus.LOST else row["last_progress_at"],
                         current,
                         *profile_values,
                         name,
@@ -450,7 +541,9 @@ class HubStore:
             self._add_event(
                 connection,
                 EventKind.AGENT_CHECKED_IN,
-                {"agent": name} | profile_payload | {"context_id": context_id},
+                {"agent": name}
+                | profile_payload
+                | {"context_id": context_id, "worker_instance_id": instance_id},
             )
             agent = self._require_agent(connection, name)
             res: tuple[Any, bool]
@@ -464,7 +557,7 @@ class HubStore:
                     "INSERT INTO operation ("
                     "actor, operation_id, payload_hash, response_json, created"
                     ") VALUES (?, ?, ?, ?, ?)",
-                    (name, operation_id, payload_hash, resp_json, utcnow_iso()),
+                    (name, operation_id, payload_hash, resp_json, self._now_iso()),
                 )
                 res = (resp_json, True)
             else:
@@ -502,22 +595,85 @@ class HubStore:
             rows = connection.execute("SELECT * FROM agent ORDER BY name").fetchall()
         return [_agent(row) for row in rows]
 
-    def touch(self, name: str) -> None:
-        """Record contact from a worker; every call is its own heartbeat."""
+    def heartbeat(
+        self,
+        name: str,
+        worker_instance_id: str,
+        current_task_id: str | None,
+        max_task_lease_min: float | None = None,
+    ) -> bool:
+        """Record a timer heartbeat and renew the matching task's bounded lease.
 
+        A stale process is deliberately given a successful no-op path: it must
+        not revive an agent or lease after a newer instance supersedes it.
+        """
+
+        now = self._now()
+        now_iso = to_iso(now)
         with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            agent = self._require_agent(connection, name)
+            if (
+                agent.worker_instance_id != worker_instance_id
+                or agent.status is AgentStatus.LOST
+            ):
+                return False
             connection.execute(
-                "UPDATE agent SET last_seen = ? WHERE name = ?", (utcnow_iso(), name)
+                "UPDATE agent SET last_heartbeat = ?, last_seen = ? WHERE name = ?",
+                (now_iso, now_iso, name),
             )
+            if not current_task_id or agent.current_task_id != current_task_id:
+                return True
+            task = self._require_task(connection, current_task_id)
+            if task.assignee != name or task.state in TERMINAL_STATES or task.lease_expires is None:
+                return True
+            current_expiry = _parse_timestamp(task.lease_expires)
+            cap_minutes = max_task_lease_min or self._max_task_lease_min(
+                connection, task.workflow_id
+            )
+            cap = _parse_timestamp(task.created) + timedelta(minutes=cap_minutes)
+            # An already-expired lease stays expired even if the sweeper has not
+            # observed it yet. The next pass will emit its one durable event.
+            if current_expiry <= now:
+                return True
+            if cap <= now:
+                connection.execute(
+                    "UPDATE task SET lease_expires = ?, updated = ? WHERE id = ?",
+                    (to_iso(cap), now_iso, task.id),
+                )
+                return True
+            renewed = min(now + timedelta(seconds=task.lease_duration_s), cap)
+            if renewed != current_expiry:
+                connection.execute(
+                    "UPDATE task SET lease_expires = ?, updated = ? WHERE id = ?",
+                    (to_iso(renewed), now_iso, task.id),
+                )
+        return True
+
+    def _max_task_lease_min(self, connection: Connection, workflow_id: str) -> float:
+        """Read the workflow rail that bounds heartbeat lease renewal."""
+
+        row = connection.execute(
+            "SELECT policy_json FROM workflow WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if row is None:
+            return DEFAULT_MAX_TASK_LEASE_MIN
+        policy = _json_object(row["policy_json"]) or {}
+        value = policy.get("max_task_lease_min", DEFAULT_MAX_TASK_LEASE_MIN)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+            return float(value)
+        return DEFAULT_MAX_TASK_LEASE_MIN
 
     def release_agent(self, name: str) -> AgentRecord:
         """Mark an agent released so its next assignment wait returns release."""
 
         with database(self.path) as connection:
             agent = self._require_agent(connection, name)
+            if agent.status == AgentStatus.RELEASED:
+                return agent
             connection.execute(
-                "UPDATE agent SET status = ?, last_seen = ? WHERE name = ?",
-                (AgentStatus.RELEASED.value, utcnow_iso(), name),
+                "UPDATE agent SET status = ? WHERE name = ?",
+                (AgentStatus.RELEASED.value, name),
             )
             released = self._require_agent(connection, name)
         self.signals.notify(context_key(agent.context_id))
@@ -556,7 +712,8 @@ class HubStore:
         }
         if head is not None:
             assignment_metadata[MetaKeys.PR_HEAD_SHA] = head
-        now = utcnow_iso()
+        now_moment = self._now()
+        now = to_iso(now_moment)
         with database(self.path) as connection:
             record = self._require_agent(connection, agent)
             if record.status is not AgentStatus.IDLE:
@@ -571,11 +728,13 @@ class HubStore:
                     "it must check in again before it can be given work"
                 )
             workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            lease_cap_min = self._max_task_lease_min(connection, workflow_id)
+            effective_lease_min = min(lease_min, lease_cap_min)
             task_id = uuid4().hex
             connection.execute(
                 "INSERT INTO task (id, workflow_id, assignee, role, title, instructions, state,"
-                " lease_expires, created, updated, pr_head_sha)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " lease_expires, lease_duration_s, created, updated, pr_head_sha)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     workflow_id,
@@ -584,7 +743,8 @@ class HubStore:
                     title,
                     instructions,
                     TaskState.SUBMITTED.value,
-                    to_iso(utcnow() + timedelta(minutes=lease_min)),
+                    to_iso(now_moment + timedelta(minutes=effective_lease_min)),
+                    lease_min * 60,
                     now,
                     now,
                     head,
@@ -676,7 +836,7 @@ class HubStore:
                 EventKind.TASK_PROGRESS,
                 {"task_id": task.id, "agent": agent, "note": note},
             )
-            self._touch(connection, agent)
+            self._record_progress_at(connection, agent)
             res: tuple[Any, bool]
             if (
                 operation_id is not None
@@ -688,7 +848,7 @@ class HubStore:
                     "INSERT INTO operation ("
                     "actor, operation_id, payload_hash, response_json, created"
                     ") VALUES (?, ?, ?, ?, ?)",
-                    (agent, operation_id, payload_hash, resp_json, utcnow_iso()),
+                    (agent, operation_id, payload_hash, resp_json, self._now_iso()),
                 )
                 res = (resp_json, True)
             else:
@@ -715,7 +875,6 @@ class HubStore:
             record = self._require_agent(connection, agent)
             asked = self._asked_question(connection, task.id, sent_as)
             if asked is not None:
-                self._touch(connection, agent)
                 return asked
             message_id = self._add_message(
                 connection,
@@ -744,7 +903,6 @@ class HubStore:
                     "message_id": message_id,
                 },
             )
-            self._touch(connection, agent)
         self.signals.notify(EVENT_KEY)
         return message_id
 
@@ -770,11 +928,30 @@ class HubStore:
                     return int(row["id"])
         return None
 
-    def reply(self, task_id: str, text: str) -> None:
-        """Answer a worker question and put the task back to `working`."""
+    def reply(self, task_id: str, text: str, message_id: int | None = None) -> bool:
+        """Answer a worker question and put the task back to `working`.
+
+        Returns True if the reply was applied, or False if skipped due to state guards.
+        """
 
         with database(self.path) as connection:
-            task = self._require_open_task(connection, task_id)
+            task = self._require_task(connection, task_id)
+            if task.state != TaskState.INPUT_REQUIRED:
+                return False
+            if message_id is not None:
+                prior = connection.execute(
+                    """
+                    SELECT id FROM message
+                     WHERE task_id = ?
+                       AND id > ?
+                       AND direction = 'from_alice'
+                     ORDER BY id LIMIT 1
+                    """,
+                    (task.id, message_id),
+                ).fetchone()
+                if prior is not None:
+                    return False
+
             context_id = self._task_context_id(connection, task)
             self._add_message(
                 connection,
@@ -786,6 +963,7 @@ class HubStore:
             )
             self._set_state(connection, task.id, TaskState.WORKING)
         self.signals.notify(task_key(task_id))
+        return True
 
     def pending_reply(self, task_id: str, after_message_id: int) -> MessageRecord | None:
         """Return Alice's first reply on this task after the given message."""
@@ -819,7 +997,7 @@ class HubStore:
             connection.execute(
                 "INSERT INTO operation (actor, operation_id, payload_hash, response_json, created)"
                 " VALUES (?, ?, ?, ?, ?)",
-                (actor, operation_id, payload_hash, response_json, utcnow_iso()),
+                (actor, operation_id, payload_hash, response_json, self._now_iso()),
             )
 
     def submit_result(
@@ -952,7 +1130,6 @@ class HubStore:
                 else EventKind.TASK_FAILED,
                 event_payload,
             )
-            self._touch(connection, agent)
             finished = self._require_task(connection, task.id)
             res: tuple[Any, bool]
             if (
@@ -965,7 +1142,7 @@ class HubStore:
                     "INSERT INTO operation ("
                     "actor, operation_id, payload_hash, response_json, created"
                     ") VALUES (?, ?, ?, ?, ?)",
-                    (agent, operation_id, payload_hash, resp_json, utcnow_iso()),
+                    (agent, operation_id, payload_hash, resp_json, self._now_iso()),
                 )
                 res = (resp_json, True)
             else:
@@ -1014,7 +1191,7 @@ class HubStore:
     def _set_state(self, connection: Connection, task_id: str, state: TaskState) -> None:
         connection.execute(
             "UPDATE task SET state = ?, updated = ? WHERE id = ?",
-            (state.value, utcnow_iso(), task_id),
+            (state.value, self._now_iso(), task_id),
         )
 
     def _finish(
@@ -1029,7 +1206,12 @@ class HubStore:
         connection.execute(
             "UPDATE task SET state = ?, updated = ?, lease_expires = NULL, result_json = ?"
             " WHERE id = ?",
-            (state.value, utcnow_iso(), None if payload is None else json.dumps(payload), task_id),
+            (
+                state.value,
+                self._now_iso(),
+                None if payload is None else json.dumps(payload),
+                task_id,
+            ),
         )
         connection.execute(
             "UPDATE agent SET status = CASE status WHEN ? THEN ? ELSE status END,"
@@ -1037,8 +1219,13 @@ class HubStore:
             (AgentStatus.BUSY.value, AgentStatus.IDLE.value, task_id),
         )
 
-    def _touch(self, connection: Connection, name: str) -> None:
-        connection.execute("UPDATE agent SET last_seen = ? WHERE name = ?", (utcnow_iso(), name))
+    def _record_progress_at(self, connection: Connection, name: str) -> None:
+        """Update progress recency without treating an LLM call as liveness."""
+
+        connection.execute(
+            "UPDATE agent SET last_progress_at = ? WHERE name = ?",
+            (self._now_iso(), name),
+        )
 
     # -- transcript and events ---------------------------------------------
 
@@ -1055,7 +1242,7 @@ class HubStore:
         cursor = connection.execute(
             "INSERT INTO message (task_id, context_id, sender, direction, parts_json, ts)"
             " VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, context_id, sender, direction, json.dumps(parts), utcnow_iso()),
+            (task_id, context_id, sender, direction, json.dumps(parts), self._now_iso()),
         )
         return int(cursor.lastrowid or 0)
 
@@ -1063,8 +1250,8 @@ class HubStore:
         self, connection: Connection, kind: EventKind, payload: Mapping[str, Any]
     ) -> int:
         cursor = connection.execute(
-            "INSERT INTO event (kind, payload_json, ts) VALUES (?, ?, ?)",
-            (kind.value, json.dumps(dict(payload)), utcnow_iso()),
+            "INSERT INTO event (kind, payload_json, state, ts) VALUES (?, ?, 'queued', ?)",
+            (kind.value, json.dumps(dict(payload)), self._now_iso()),
         )
         return int(cursor.lastrowid or 0)
 
@@ -1078,28 +1265,97 @@ class HubStore:
         self.signals.notify(EVENT_KEY)
         return event
 
-    def next_event(self) -> EventRecord | None:
-        """Consume the oldest unconsumed event, if any."""
+    def ack_event(self, delivery_id: str | None) -> bool:
+        """Acknowledge an active event delivery. Wrong or expired delivery_id is ignored."""
 
+        if not delivery_id:
+            return False
+        now = self._now_iso()
+        with database(self.path) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE event
+                SET state = 'acked',
+                    acked_at = ?
+                WHERE delivery_id = ?
+                  AND state = 'delivered'
+                  AND delivery_expires > ?
+                """,
+                (now, delivery_id, now),
+            )
+            return cursor.rowcount > 0
+
+    def lease_next_event(self, lease_s: float | None = None) -> EventRecord | None:
+        """Lease the oldest queued or expired-delivered event, returning it with delivery_id."""
+
+        effective_lease_s = self.default_event_lease_s if lease_s is None else lease_s
+        now_moment = self._now()
+        now = to_iso(now_moment)
+        expires = to_iso(now_moment + timedelta(seconds=effective_lease_s))
+        delivery_id = uuid4().hex
         with database(self.path) as connection:
             row = connection.execute(
-                "SELECT * FROM event WHERE consumed = 0 ORDER BY id LIMIT 1"
+                """
+                SELECT * FROM event
+                WHERE state = 'queued'
+                   OR (state = 'delivered' AND delivery_expires <= ?)
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (now,),
             ).fetchone()
             if row is None:
                 return None
-            connection.execute("UPDATE event SET consumed = 1 WHERE id = ?", (row["id"],))
-        return _event(row)
+            connection.execute(
+                """
+                UPDATE event
+                SET state = 'delivered',
+                    delivery_id = ?,
+                    delivery_attempts = delivery_attempts + 1,
+                    delivered_at = ?,
+                    delivery_expires = ?
+                WHERE id = ?
+                """,
+                (delivery_id, now, expires, row["id"]),
+            )
+            updated_row = connection.execute(
+                "SELECT * FROM event WHERE id = ?", (row["id"],)
+            ).fetchone()
+            return _event(updated_row)
+
+    def next_event(self, lease_s: float | None = None) -> EventRecord | None:
+        """Lease the oldest eligible event, if any."""
+
+        return self.lease_next_event(lease_s)
 
     def pending_events(self) -> int:
         with database(self.path) as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS n FROM event WHERE consumed = 0"
+                "SELECT COUNT(*) AS n FROM event WHERE state = 'queued'"
             ).fetchone()
         return int(row["n"])
 
     # -- waits --------------------------------------------------------------
 
-    async def _wait_for(self, key: str, poll: Callable[[], T | None], timeout_s: float) -> T | None:
+    def _earliest_delivery_expires_s(self) -> float | None:
+        now_moment = self._now()
+        with database(self.path) as connection:
+            row = connection.execute(
+                "SELECT MIN(delivery_expires) AS min_exp FROM event WHERE state = 'delivered'"
+            ).fetchone()
+            if row is None or row["min_exp"] is None:
+                return None
+            min_exp = _parse_timestamp(row["min_exp"])
+            delta = (min_exp - now_moment).total_seconds()
+            return max(0.01, delta)
+
+    async def _wait_for(
+        self,
+        key: str,
+        poll: Callable[[], T | None],
+        timeout_s: float,
+        next_timeout: Callable[[], float | None] | None = None,
+    ) -> T | None:
         """Poll under a subscription until `poll` yields or the deadline passes."""
 
         deadline = monotonic() + timeout_s
@@ -1114,8 +1370,13 @@ class HubStore:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     return None
+                wait_step = remaining
+                if next_timeout is not None:
+                    dynamic_timeout = next_timeout()
+                    if dynamic_timeout is not None:
+                        wait_step = min(remaining, dynamic_timeout)
                 with suppress(TimeoutError):
-                    await asyncio.wait_for(woken.wait(), remaining)
+                    await asyncio.wait_for(woken.wait(), wait_step)
 
     async def await_assignment(
         self, context_id: str, timeout_s: float
@@ -1125,15 +1386,11 @@ class HubStore:
         agent = self.agent_by_context(context_id)
         if agent is None:
             raise NotFoundError(f"unknown context: {context_id}")
-        self.touch(agent.name)
-        try:
-            return await self._wait_for(
-                context_key(context_id),
-                lambda: self._claim_assignment(agent.name),
-                timeout_s,
-            )
-        finally:
-            self.touch(agent.name)
+        return await self._wait_for(
+            context_key(context_id),
+            lambda: self._claim_assignment(agent.name),
+            timeout_s,
+        )
 
     def _claim_assignment(self, name: str) -> TaskRecord | Released | None:
         with database(self.path) as connection:
@@ -1160,24 +1417,36 @@ class HubStore:
             timeout_s,
         )
 
-    async def wait_for_event(self, timeout_s: float) -> EventRecord | None:
-        """Hold until Alice's inbox has an event, consuming it."""
+    async def wait_for_event(
+        self,
+        timeout_s: float,
+        ack: str | None = None,
+        lease_s: float | None = None,
+    ) -> EventRecord | None:
+        """Hold until Alice's inbox has an event, leasing it and acking prior delivery."""
 
-        return await self._wait_for(EVENT_KEY, self.next_event, timeout_s)
+        if ack is not None:
+            self.ack_event(ack)
+        return await self._wait_for(
+            EVENT_KEY,
+            lambda: self.lease_next_event(lease_s),
+            timeout_s,
+            next_timeout=self._earliest_delivery_expires_s,
+        )
 
     # -- sweeper ------------------------------------------------------------
 
-    def sweep(self, heartbeat_timeout_s: float) -> list[EventRecord]:
+    def sweep(self, lost_after_s: float) -> list[EventRecord]:
         """Expire overdue leases and declare silent agents lost.
 
         Returns the events it queued, so the caller can log what changed.
         """
 
-        now = utcnow()
+        now = self._now()
         emitted: list[int] = []
         with database(self.path) as connection:
             emitted += self._expire_leases(connection, to_iso(now))
-            cutoff = to_iso(now - timedelta(seconds=heartbeat_timeout_s))
+            cutoff = to_iso(now - timedelta(seconds=lost_after_s))
             emitted += self._lose_agents(connection, cutoff)
             if not emitted:
                 return []
@@ -1205,7 +1474,7 @@ class HubStore:
             # whether to extend, reassign or fail it.
             connection.execute(
                 "UPDATE task SET lease_expires = NULL, updated = ? WHERE id = ?",
-                (utcnow_iso(), row["id"]),
+                (self._now_iso(), row["id"]),
             )
             emitted.append(
                 self._add_event(
@@ -1223,7 +1492,8 @@ class HubStore:
     def _lose_agents(self, connection: Connection, cutoff: str) -> list[int]:
         live = (AgentStatus.IDLE, AgentStatus.BUSY)
         rows = connection.execute(
-            f"SELECT * FROM agent WHERE status IN ({_placeholders(live)}) AND last_seen <= ?",
+            f"SELECT * FROM agent WHERE status IN ({_placeholders(live)})"
+            " AND last_heartbeat <= ?",
             (*(status.value for status in live), cutoff),
         ).fetchall()
         emitted = []
@@ -1243,7 +1513,7 @@ class HubStore:
                     TaskState.FAILED,
                     {
                         "status": TaskState.FAILED.value,
-                        "summary": f"worker {agent.name} stopped contacting the hub",
+                        "summary": f"worker {agent.name} stopped heartbeating",
                         "reason": LOST_REASON,
                         "artifacts": [],
                     },
@@ -1252,7 +1522,11 @@ class HubStore:
                 self._add_event(
                     connection,
                     EventKind.AGENT_LOST,
-                    {"agent": agent.name, "task_id": task_id, "last_seen": agent.last_seen},
+                    {
+                        "agent": agent.name,
+                        "task_id": task_id,
+                        "last_heartbeat": agent.last_heartbeat,
+                    },
                 )
             )
         return emitted
@@ -1275,3 +1549,13 @@ def _readmitted(previous: AgentStatus, open_task: str | None) -> AgentStatus:
 
 def _placeholders(values: Sequence[object]) -> str:
     return ", ".join("?" * len(values))
+
+
+def _parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _age_seconds(value: str | None, now: datetime) -> float | None:
+    if not value:
+        return None
+    return max(0.0, (now - _parse_timestamp(value)).total_seconds())

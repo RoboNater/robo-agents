@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from contextlib import suppress
 from dataclasses import asdict, replace
 from typing import Any
 from uuid import uuid4
@@ -51,6 +52,9 @@ class WorkerHubClient:
         self._external_client = http_client
         self._client: httpx.AsyncClient | None = http_client
         self.context_id: str | None = None
+        self.worker_instance_id = uuid4().hex
+        self.current_task_id: str | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
         # Active pending question (question_text, message_id) per task (§4.1)
         self._pending_questions: dict[str, tuple[str, str]] = {}
         # Active pending result (result_dict, operation_id) per task (§4.1)
@@ -66,15 +70,75 @@ class WorkerHubClient:
                 base_url=self.settings.hub_url,
                 headers={"Authorization": f"Bearer {self.settings.token}"},
             )
+        self.start_heartbeat()
         return self
 
     async def __aexit__(self, *args: object) -> None:
         await self.close()
 
     async def close(self) -> None:
+        await self.stop_heartbeat()
         if self._external_client is None and self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    def start_heartbeat(self) -> None:
+        """Start the process-level heartbeat timer once."""
+
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(), name=f"worker-heartbeat-{self.settings.agent_name}"
+            )
+
+    async def stop_heartbeat(self) -> None:
+        task = self._heartbeat_task
+        self._heartbeat_task = None
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.heartbeat_s)
+            if self.context_id is None:
+                continue
+            try:
+                await self.heartbeat()
+            except Exception:
+                # The normal request retry policy has already been exhausted;
+                # keep worker MCP alive so the next timer tick can recover.
+                logger.exception("Background heartbeat failed")
+
+    async def heartbeat(self) -> bool:
+        """Send one timer heartbeat; stale instances receive an ignored ack."""
+
+        if self.context_id is None:
+            raise RuntimeError("Worker has not checked in yet; call check_in first")
+        metadata: dict[str, Any] = {
+            MetaKeys.KIND: "heartbeat",
+            MetaKeys.AGENT: self.settings.agent_name,
+            MetaKeys.WORKER_INSTANCE_ID: self.worker_instance_id,
+            MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+        }
+        if self.current_task_id is not None:
+            metadata[MetaKeys.CURRENT_TASK_ID] = self.current_task_id
+        result = await self._post_rpc(
+            "message/send",
+            {
+                "message": {
+                    "messageId": uuid4().hex,
+                    "contextId": self.context_id,
+                    "role": "user",
+                    "parts": [{"kind": "text", "text": "HEARTBEAT"}],
+                    "metadata": metadata,
+                }
+            },
+        )
+        if not isinstance(result, dict):
+            raise WorkerProtocolError(None, "heartbeat response was not a dict")
+        return (result.get("metadata") or {}).get(MetaKeys.ACCEPTED) is True
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -348,6 +412,7 @@ class WorkerHubClient:
             MetaKeys.MODEL_SOURCE: profile.model_source.value,
             MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
             MetaKeys.OPERATION_ID: op_id,
+            MetaKeys.WORKER_INSTANCE_ID: self.worker_instance_id,
         }
         if profile.workspace_id is not None:
             metadata[MetaKeys.WORKSPACE_ID] = profile.workspace_id
@@ -367,6 +432,7 @@ class WorkerHubClient:
         if not context_id or not isinstance(context_id, str):
             raise WorkerProtocolError(None, "check_in response did not contain contextId")
         self.context_id = context_id
+        self.current_task_id = None
         self._pending_checkin = None
         return {
             "status": "registered",
@@ -399,7 +465,10 @@ class WorkerHubClient:
                 "contextId": self.context_id,
                 "role": "user",
                 "parts": [{"kind": "text", "text": "NEXT"}],
-                "metadata": {MetaKeys.TIMEOUT_S: hold_s},
+                "metadata": {
+                    MetaKeys.TIMEOUT_S: hold_s,
+                    MetaKeys.WORKER_INSTANCE_ID: self.worker_instance_id,
+                },
             }
         }
         result = await self._stream_rpc("message/stream", params, hold_s)
@@ -427,6 +496,7 @@ class WorkerHubClient:
             ):
                 instructions += part["root"]["text"]
 
+        self.current_task_id = str(task_id) if task_id else None
         assignment = {
             "task_id": str(task_id) if task_id else "",
             "role": str(role),
@@ -466,6 +536,7 @@ class WorkerHubClient:
                     MetaKeys.KIND: "progress",
                     MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
                     MetaKeys.OPERATION_ID: op_id,
+                    MetaKeys.WORKER_INSTANCE_ID: self.worker_instance_id,
                 },
             }
         }
@@ -508,6 +579,7 @@ class WorkerHubClient:
                     MetaKeys.KIND: "question",
                     MetaKeys.TIMEOUT_S: hold_s,
                     MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+                    MetaKeys.WORKER_INSTANCE_ID: self.worker_instance_id,
                 },
             }
         }
@@ -526,6 +598,7 @@ class WorkerHubClient:
         )
         if overridden:
             self._pending_questions.pop(task_id, None)
+            self.current_task_id = None
             task_result = (result.get("metadata") or {}).get(MetaKeys.RESULT)
             note = task_result.get("summary") if isinstance(task_result, dict) else None
             if not note:
@@ -629,6 +702,7 @@ class WorkerHubClient:
             MetaKeys.OPERATION_ID: op_id,
             MetaKeys.RESULT: result_dict,
             MetaKeys.ARTIFACTS: artifacts or [],
+            MetaKeys.WORKER_INSTANCE_ID: self.worker_instance_id,
         }
 
         params = {
@@ -643,6 +717,7 @@ class WorkerHubClient:
         }
         await self._post_rpc("message/send", params)
         self._pending_progress.pop(task_id, None)
+        self.current_task_id = None
         return {
             "status": terminal_status,
             "task_id": task_id,

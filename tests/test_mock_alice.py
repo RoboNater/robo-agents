@@ -3,13 +3,16 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 from agent_hub import create_app
 from agent_hub.database import database, initialize_database
-from agent_hub.store import HubStore
+from agent_hub.mcp import create_mcp
+from agent_hub.store import HubStore, TaskRecord
 from agent_hub_common import AgentProfile, HubSettings, TaskState, WorkflowStatus
 from conftest import BASE_URL, TOKEN
+from mcp import ClientSession
 from worker_mcp.client import WorkerHubClient
 from worker_mcp.config import WorkerSettings
 
@@ -45,7 +48,7 @@ async def test_mock_alice_drives_worker_through_full_task(
         guides_dir=tmp_path / "guides",
         default_wait_s=0.5,
         max_wait_s=1.0,
-        heartbeat_timeout_s=60.0,
+        lost_after_s=60.0,
         sweep_interval_s=3600.0,
     )
     app = create_app(settings)
@@ -307,3 +310,112 @@ def test_mock_alice_main_cli_mcp_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     mock_alice.main()
     assert called_mcp is True
+
+
+async def test_mock_alice_drives_worker_mcp_session(tmp_path: Path) -> None:
+    db_path = tmp_path / "hub_mcp.db"
+    initialize_database(db_path)
+    store = HubStore(db_path)
+    mcp_server = create_mcp(store)
+
+    client_send, server_receive = anyio.create_memory_object_stream(10)
+    server_send, client_receive = anyio.create_memory_object_stream(10)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            mcp_server._mcp_server.run,
+            server_receive,
+            server_send,
+            mcp_server._mcp_server.create_initialization_options(),
+        )
+        async with ClientSession(client_receive, client_send) as session:
+            await session.initialize()
+
+            async def run_worker() -> None:
+                bob = store.check_in("bob", AgentProfile(harness="claude-code"))
+                task = await store.await_assignment(bob.context_id, timeout_s=2.0)
+                assert isinstance(task, TaskRecord)
+                task_id = task.id
+                store.record_progress(task_id, "bob", "Making progress...")
+                q_id = store.open_question(task_id, "bob", "Confirm design?", "q-1")
+                reply = await store.await_reply(task_id, q_id, timeout_s=2.0)
+                assert reply is not None
+                assert "Approved" in reply.parts[0]["text"]
+                store.submit_result(
+                    task_id,
+                    "bob",
+                    TaskState.COMPLETED,
+                    "Feature implemented and tested",
+                    artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
+                )
+
+            worker_fut = asyncio.create_task(run_worker())
+            alice_fut = asyncio.create_task(
+                mock_alice.drive_one_task_mcp(
+                    session=session,
+                    expected_agent="bob",
+                    role="implementer",
+                    title="MCP Issue",
+                    instructions="Implement via MCP.",
+                    timeout_s=5.0,
+                    expected_harness="claude-code",
+                )
+            )
+            alice_res, _ = await asyncio.gather(alice_fut, worker_fut)
+            assert alice_res.get("summary") == "Feature implemented and tested"
+            assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+            with database(db_path) as conn:
+                decisions = conn.execute("SELECT * FROM decision ORDER BY id").fetchall()
+                assert any(
+                    d["key"] and d["key"].startswith("event:") and d["key"].endswith(":assign")
+                    for d in decisions
+                )
+            tg.cancel_scope.cancel()
+
+
+@pytest.mark.parametrize(
+    ("crash_at", "match"),
+    [
+        ("delivery", "crash at delivery"),
+        ("after_action", "crash after action"),
+        ("after_reply", "crash after reply"),
+    ],
+)
+async def test_mock_alice_mcp_crash_points(crash_at: str, match: str, tmp_path: Path) -> None:
+    db_path = tmp_path / f"hub_crash_{crash_at}.db"
+    initialize_database(db_path)
+    store = HubStore(db_path)
+    mcp_server = create_mcp(store)
+
+    client_send, server_receive = anyio.create_memory_object_stream(10)
+    server_send, client_receive = anyio.create_memory_object_stream(10)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            mcp_server._mcp_server.run,
+            server_receive,
+            server_send,
+            mcp_server._mcp_server.create_initialization_options(),
+        )
+        async with ClientSession(client_receive, client_send) as session:
+            await session.initialize()
+
+            async def run_worker() -> None:
+                bob = store.check_in("bob", AgentProfile(harness="claude-code"))
+                task = await store.await_assignment(bob.context_id, timeout_s=2.0)
+                if isinstance(task, TaskRecord):
+                    q_id = store.open_question(task.id, "bob", "Proceed?", "q-1")
+                    await store.await_reply(task.id, q_id, timeout_s=0.5)
+
+            worker_fut = asyncio.create_task(run_worker())
+            with pytest.raises(mock_alice.AliceCrashError, match=match):
+                await mock_alice.drive_one_task_mcp(
+                    session=session,
+                    expected_agent="bob",
+                    role="implementer",
+                    timeout_s=5.0,
+                    expected_harness="claude-code",
+                    crash_at=crash_at,
+                )
+            worker_fut.cancel()
+            tg.cancel_scope.cancel()

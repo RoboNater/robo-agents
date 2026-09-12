@@ -48,10 +48,8 @@ def test_initialization_rejects_unknown_schema_version(tmp_path: Path) -> None:
 
 
 def _legacy_database(path: Path, version: int) -> None:
-    """Write a Step 1 (v1), Step 4 (v2, with runtime), main (v3, with profile) or
-    main (v4, with the operation ledger) schema."""
+    """Write a Step 1 (v1), Step 4 (v2, with runtime), or main (v3, with profile) schema."""
 
-    operation_table = ""
     if version == 1:
         extra_columns = ""
     elif version == 2:
@@ -60,8 +58,17 @@ def _legacy_database(path: Path, version: int) -> None:
         extra_columns = "".join(
             f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
         )
-        if version == 4:
-            operation_table = """
+    elif version == 5:
+        extra_columns = "".join(
+            f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
+        ) + ",\n                worker_instance_id TEXT NOT NULL DEFAULT ''," \
+            "\n                last_heartbeat TEXT NOT NULL DEFAULT ''," \
+            "\n                last_progress_at TEXT"
+    else:
+        raise ValueError(f"unsupported legacy version {version}")
+
+    with sqlite3.connect(path) as connection:
+        operation_table = """
             CREATE TABLE operation (
                 actor TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
@@ -69,11 +76,13 @@ def _legacy_database(path: Path, version: int) -> None:
                 response_json TEXT NOT NULL,
                 created TEXT NOT NULL,
                 PRIMARY KEY (actor, operation_id)
-            );"""
-    else:
-        raise ValueError(f"unsupported legacy version {version}")
-
-    with sqlite3.connect(path) as connection:
+            );
+        """ if version in (4, 5) else ""
+        task_lease_duration = (
+            ",\n                lease_duration_s REAL NOT NULL DEFAULT 1800"
+            if version == 5
+            else ""
+        )
         connection.executescript(f"""
             CREATE TABLE workflow (
                 id TEXT PRIMARY KEY,
@@ -101,7 +110,7 @@ def _legacy_database(path: Path, version: int) -> None:
                 lease_expires TEXT,
                 result_json TEXT,
                 created TEXT NOT NULL,
-                updated TEXT NOT NULL
+                updated TEXT NOT NULL{task_lease_duration}
             );
             CREATE TABLE message (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,27 +125,38 @@ def _legacy_database(path: Path, version: int) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0,
+                consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0, 1)),
                 ts TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_event_inbox ON event(consumed, id);
             CREATE TABLE decision (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 rationale TEXT NOT NULL
-            );{operation_table}
+            );
+            {operation_table}
             PRAGMA user_version = {version};
         """)
 
 
-def _columns(path: Path, table: str) -> dict[str, tuple[str, int, str | None]]:
+def _v6_database(path: Path) -> None:
+    """A database as the merged #25 left it: today's schema without `pr_head_sha`."""
+
+    initialize_database(path)
+    with database(path) as connection:
+        connection.execute("ALTER TABLE task DROP COLUMN pr_head_sha")
+        connection.execute("PRAGMA user_version = 6")
+
+
+def _table_columns(path: Path, table: str) -> dict[str, tuple[str, int, str | None]]:
     with database(path) as connection:
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     return {row["name"]: (row["type"], row["notnull"], row["dflt_value"]) for row in rows}
 
 
 def _agent_columns(path: Path) -> dict[str, tuple[str, int, str | None]]:
-    return _columns(path, "agent")
+    return _table_columns(path, "agent")
 
 
 def test_migration_from_v1_adds_an_unknown_profile(tmp_path: Path) -> None:
@@ -270,8 +290,8 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     assert row["created"] == "2026-09-07T00:00:00Z"
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
-def test_migrated_tables_match_fresh_ones(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) -> None:
     fresh = tmp_path / "fresh.db"
     migrated = tmp_path / f"v{version}.db"
     initialize_database(fresh)
@@ -279,13 +299,19 @@ def test_migrated_tables_match_fresh_ones(tmp_path: Path, version: int) -> None:
 
     initialize_database(migrated)
 
-    for table in ("agent", "task", "operation"):
-        assert _columns(migrated, table) == _columns(fresh, table), table
+    assert _agent_columns(migrated) == _agent_columns(fresh)
+    assert _table_columns(migrated, "task") == _table_columns(fresh, "task")
+    assert _table_columns(migrated, "operation") == _table_columns(fresh, "operation")
+    assert _table_columns(migrated, "event") == _table_columns(fresh, "event")
 
 
-def test_migration_from_v4_leaves_existing_tasks_unbound(tmp_path: Path) -> None:
-    path = tmp_path / "v4_hub.db"
-    _legacy_database(path, version=4)
+def test_migration_from_v6_leaves_existing_tasks_unbound(tmp_path: Path) -> None:
+    """#27/#41's `pr_head_sha`: tasks assigned before it was bound to nothing."""
+
+    path = tmp_path / "v6_hub.db"
+    fresh = tmp_path / "fresh.db"
+    initialize_database(fresh)
+    _v6_database(path)
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO workflow (id, goal, status, created)"
@@ -307,6 +333,7 @@ def test_migration_from_v4_leaves_existing_tasks_unbound(tmp_path: Path) -> None
     head = "ABCDEF0123456789abcdef0123456789abcdef01"
     new = store.assign_task("bob", "reviewer", "Review", "Look again", pr_head_sha=head)
     assert new.pr_head_sha == head.lower()
+    assert _table_columns(path, "task") == _table_columns(fresh, "task")
     with database(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
@@ -349,10 +376,10 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
             ),
         )
 
-    # Migrate from v3 to the current version
+    # Migrate from v3 through the composed migrations to v5.
     initialize_database(path)
 
-    # 1. Verify the version advanced
+    # 1. Verify version advanced to the current schema.
     with database(path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
@@ -363,7 +390,7 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
             row["name"] for row in connection.execute("PRAGMA table_info(operation)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION
+    assert version == SCHEMA_VERSION  # 5
     assert "operation" in tables
     assert {"actor", "operation_id", "payload_hash", "response_json", "created"} <= op_columns
 
@@ -380,6 +407,8 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
     assert bob.model == "claude-3-7-sonnet"
     assert bob.model_source == ModelSource.ENV
     assert bob.workspace_id == "ws-bob-main"
+    assert bob.last_heartbeat == "2026-09-10T20:00:00Z"
+    assert bob.worker_instance_id == ""
 
     # 3. Verify an idempotent wire check-in succeeds on the migrated database
     guides_dir = tmp_path / "guides"
@@ -395,7 +424,7 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
         guides_dir=guides_dir,
         default_wait_s=0.2,
         max_wait_s=1.0,
-        heartbeat_timeout_s=60.0,
+        lost_after_s=60.0,
         sweep_interval_s=3600.0,
     )
     app = create_app(settings)
@@ -420,6 +449,7 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
                     MetaKeys.WORKSPACE_ID: "ws-bob-main",
                     MetaKeys.SCHEMA_VERSION: 1,
                     MetaKeys.OPERATION_ID: op_id,
+                    MetaKeys.WORKER_INSTANCE_ID: "worker-v3-migration",
                 },
             }
         },
@@ -452,3 +482,69 @@ async def test_migration_from_v3_mainline_preserves_profiles_and_enables_idempot
         resp2 = await client.post("/a2a", json=payload)
         assert resp2.status_code == 200
         assert resp2.json()["result"] == res1
+
+
+def test_migration_from_v5_to_v6_durable_event_delivery(tmp_path: Path) -> None:
+    path = tmp_path / "v5_hub.db"
+    _legacy_database(path, version=5)
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO event (kind, payload_json, consumed, ts) VALUES (?, ?, ?, ?)",
+            ("agent_checked_in", '{"agent": "bob"}', 1, "2026-09-10T12:00:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO event (kind, payload_json, consumed, ts) VALUES (?, ?, ?, ?)",
+            ("task_progress", '{"note": "working"}', 0, "2026-09-10T12:01:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO decision (ts, summary, rationale) VALUES (?, ?, ?)",
+            ("2026-09-10T12:00:00Z", "Initial decision", "Setup"),
+        )
+
+    initialize_database(path)
+
+    with database(path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        event_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(event)").fetchall()
+        }
+        decision_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(decision)").fetchall()
+        }
+        events = connection.execute("SELECT * FROM event ORDER BY id").fetchall()
+
+    assert version == SCHEMA_VERSION  # 6
+    assert "consumed" not in event_columns
+    assert {
+        "state",
+        "delivery_id",
+        "delivery_attempts",
+        "delivered_at",
+        "delivery_expires",
+        "acked_at",
+    } <= event_columns
+    assert "key" in decision_columns
+
+    # Check consumed event was migrated to acked
+    assert events[0]["state"] == "acked"
+    assert events[0]["acked_at"] == "2026-09-10T12:00:00Z"
+    assert events[0]["delivery_attempts"] == 1
+
+    # Check unconsumed event was migrated to queued
+    assert events[1]["state"] == "queued"
+    assert events[1]["acked_at"] is None
+    assert events[1]["delivery_attempts"] == 0
+
+    # Test store can log deduped decision and lease the queued event
+    store = HubStore(path)
+    d1 = store.log_decision("Step", "Reason", key="chk-1")
+    d2 = store.log_decision("Step", "Reason", key="chk-1")
+    assert d1 == d2
+
+    leased = store.lease_next_event()
+    assert leased is not None
+    assert leased.id == events[1]["id"]
+    assert leased.state.value == "delivered"
+    assert leased.delivery_attempts == 1
+    assert leased.delivery_id is not None
