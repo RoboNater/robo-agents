@@ -58,6 +58,15 @@ class WorkerHubClient:
             settings.telemetry_log,
             agent=settings.agent_name,
             worker_instance_id=self.worker_instance_id,
+            session_fields={
+                "harness": settings.profile.harness,
+                "harness_version": settings.profile.harness_version,
+                "provider": settings.profile.provider,
+                "model": settings.profile.model,
+                "model_source": settings.profile.model_source.value,
+                "heartbeat_s": settings.heartbeat_s,
+                "max_retries": settings.max_retries,
+            },
         )
         self.current_task_id: str | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None

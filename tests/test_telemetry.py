@@ -10,7 +10,12 @@ def _records(path: Path) -> list[dict[str, object]]:
 
 def test_telemetry_appends_bounded_structured_events(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "worker.jsonl"
-    telemetry = TelemetryLog(path, agent="bob", worker_instance_id="worker-1")
+    telemetry = TelemetryLog(
+        path,
+        agent="bob",
+        worker_instance_id="worker-1",
+        session_fields={"harness": "codex", "model": "gpt-test"},
+    )
 
     call_id, started = telemetry.start_tool("await_assignment")
     telemetry.finish_tool(
@@ -32,6 +37,8 @@ def test_telemetry_appends_bounded_structured_events(tmp_path: Path) -> None:
         "tool_call",
         "retry",
     ]
+    assert records[0]["harness"] == "codex"
+    assert records[0]["model"] == "gpt-test"
     assert records[2]["phase"] == "success"
     assert records[2]["outcome"] == "timeout"
     assert "instructions" not in records[2]

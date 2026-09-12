@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -25,14 +26,21 @@ class TelemetryLog:
     reported on stderr and never break the worker protocol.
     """
 
-    def __init__(self, path: Path | None, *, agent: str, worker_instance_id: str) -> None:
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        agent: str,
+        worker_instance_id: str,
+        session_fields: Mapping[str, Any] | None = None,
+    ) -> None:
         self.path = path
         self.agent = agent
         self.worker_instance_id = worker_instance_id
         self.session_id = uuid4().hex
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self.emit("session_started")
+            self.emit("session_started", **dict(session_fields or {}))
 
     def emit(self, event: str, **fields: Any) -> None:
         if self.path is None:
