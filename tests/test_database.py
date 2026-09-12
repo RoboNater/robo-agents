@@ -1,18 +1,27 @@
 import sqlite3
 from pathlib import Path
 
+import agent_hub.database as database_module
 import httpx
 import pytest
 from agent_hub import create_app
 from agent_hub.database import (
-    PROFILE_COLUMNS,
     SCHEMA_VERSION,
     DatabaseVersionError,
     database,
     initialize_database,
 )
 from agent_hub.store import HubStore
-from agent_hub_common import UNKNOWN, AgentProfile, HubSettings, MetaKeys, ModelSource
+from agent_hub_common import (
+    UNKNOWN,
+    AgentProfile,
+    AgentStatus,
+    EventKind,
+    HubSettings,
+    MetaKeys,
+    ModelSource,
+    TaskState,
+)
 from conftest import BASE_URL, TOKEN
 
 
@@ -47,106 +56,44 @@ def test_initialization_rejects_unknown_schema_version(tmp_path: Path) -> None:
         initialize_database(path)
 
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+SHIPPED_VERSIONS = sorted(
+    int(path.stem.removeprefix("schema_v")) for path in FIXTURES.glob("schema_v*.sql")
+)
+
+
 def _legacy_database(path: Path, version: int) -> None:
-    """Write a Step 1 (v1), Step 4 (v2, with runtime), or main (v3, with profile) schema."""
+    """Recreate a database exactly as the commit that shipped v`version` wrote it.
 
-    if version == 1:
-        extra_columns = ""
-    elif version == 2:
-        extra_columns = ",\n                runtime TEXT"
-    elif version in (3, 4):
-        extra_columns = "".join(
-            f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
-        )
-    elif version == 5:
-        extra_columns = "".join(
-            f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
-        ) + ",\n                worker_instance_id TEXT NOT NULL DEFAULT ''," \
-            "\n                last_heartbeat TEXT NOT NULL DEFAULT ''," \
-            "\n                last_progress_at TEXT"
-    else:
-        raise ValueError(f"unsupported legacy version {version}")
+    The dumps come from `scripts/dump-schema.py`, not from memory: a fixture
+    that describes history by hand drifts from it silently, which is how a
+    missing `idx_event_inbox` let #49's `DROP COLUMN consumed` pass CI and then
+    fail on every live hub.
+    """
 
+    fixture = FIXTURES / f"schema_v{version}.sql"
+    if not fixture.exists():
+        raise ValueError(f"no schema dump for legacy version {version}")
     with sqlite3.connect(path) as connection:
-        operation_table = """
-            CREATE TABLE operation (
-                actor TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                payload_hash TEXT NOT NULL,
-                response_json TEXT NOT NULL,
-                created TEXT NOT NULL,
-                PRIMARY KEY (actor, operation_id)
-            );
-        """ if version in (4, 5) else ""
-        task_lease_duration = (
-            ",\n                lease_duration_s REAL NOT NULL DEFAULT 1800"
-            if version == 5
-            else ""
-        )
-        connection.executescript(f"""
-            CREATE TABLE workflow (
-                id TEXT PRIMARY KEY,
-                goal TEXT NOT NULL,
-                status TEXT NOT NULL,
-                policy_json TEXT NOT NULL DEFAULT '{{}}',
-                created TEXT NOT NULL
-            );
-            CREATE TABLE agent (
-                name TEXT PRIMARY KEY,
-                capabilities_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL,
-                context_id TEXT UNIQUE,
-                last_seen TEXT NOT NULL,
-                current_task_id TEXT{extra_columns}
-            );
-            CREATE TABLE task (
-                id TEXT PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                assignee TEXT,
-                role TEXT NOT NULL,
-                title TEXT NOT NULL,
-                instructions TEXT NOT NULL,
-                state TEXT NOT NULL,
-                lease_expires TEXT,
-                result_json TEXT,
-                created TEXT NOT NULL,
-                updated TEXT NOT NULL{task_lease_duration}
-            );
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT,
-                context_id TEXT NOT NULL,
-                sender TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                parts_json TEXT NOT NULL,
-                ts TEXT NOT NULL
-            );
-            CREATE TABLE event (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0, 1)),
-                ts TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_event_inbox ON event(consumed, id);
-            CREATE TABLE decision (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                rationale TEXT NOT NULL
-            );
-            {operation_table}
-            PRAGMA user_version = {version};
-        """)
+        connection.executescript(fixture.read_text())
 
 
-def _v6_database(path: Path) -> None:
-    """A database as the merged #25 left it: today's schema without `pr_head_sha`."""
+def _schema_objects(path: Path) -> dict[str, str]:
+    """Every named schema object, as raw `sqlite_master` SQL.
 
-    initialize_database(path)
+    Nothing is normalised away but whitespace. Since #59 a migrated database is
+    rebuilt into the shape `SCHEMA` declares, so this compares exactly — which
+    is what lets it catch a column inserted in the wrong place, a duplicated
+    one, or a lost constraint, none of which an order-insensitive comparison
+    can see.
+    """
+
     with database(path) as connection:
-        connection.execute("ALTER TABLE task DROP COLUMN pr_head_sha")
-        connection.execute("PRAGMA user_version = 6")
+        rows = connection.execute(
+            "SELECT name, sql FROM sqlite_master"
+            " WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    return {row["name"]: " ".join(row["sql"].split()) for row in rows}
 
 
 def _table_columns(path: Path, table: str) -> dict[str, tuple[str, int, str | None]]:
@@ -212,61 +159,7 @@ def test_migration_from_v2_carries_the_runtime_over_as_the_harness(tmp_path: Pat
 
 def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     path = tmp_path / "v2_hub.db"
-    with sqlite3.connect(path) as connection:
-        connection.executescript("""
-            CREATE TABLE workflow (
-                id TEXT PRIMARY KEY,
-                goal TEXT NOT NULL,
-                status TEXT NOT NULL,
-                policy_json TEXT NOT NULL DEFAULT '{}',
-                created TEXT NOT NULL
-            );
-            CREATE TABLE agent (
-                name TEXT PRIMARY KEY,
-                capabilities_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL,
-                context_id TEXT UNIQUE,
-                last_seen TEXT NOT NULL,
-                current_task_id TEXT,
-                runtime TEXT
-            );
-            CREATE TABLE task (
-                id TEXT PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                assignee TEXT,
-                role TEXT NOT NULL,
-                title TEXT NOT NULL,
-                instructions TEXT NOT NULL,
-                state TEXT NOT NULL,
-                lease_expires TEXT,
-                result_json TEXT,
-                created TEXT NOT NULL,
-                updated TEXT NOT NULL
-            );
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT,
-                context_id TEXT NOT NULL,
-                sender TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                parts_json TEXT NOT NULL,
-                ts TEXT NOT NULL
-            );
-            CREATE TABLE event (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0,
-                ts TEXT NOT NULL
-            );
-            CREATE TABLE decision (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                rationale TEXT NOT NULL
-            );
-            PRAGMA user_version = 2;
-        """)
+    _legacy_database(path, version=2)
 
     initialize_database(path)
 
@@ -290,8 +183,16 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     assert row["created"] == "2026-09-07T00:00:00Z"
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
-def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", SHIPPED_VERSIONS)
+def test_migrating_a_shipped_schema_reproduces_a_fresh_one(tmp_path: Path, version: int) -> None:
+    """Both routes to v{SCHEMA_VERSION} must end at the same schema.
+
+    Comparing every object, not a chosen few columns, is what catches a
+    migration and the `SCHEMA` constant disagreeing — a table that exists two
+    different ways depending on how you got there, including an index the
+    migration forgot to rebuild.
+    """
+
     fresh = tmp_path / "fresh.db"
     migrated = tmp_path / f"v{version}.db"
     initialize_database(fresh)
@@ -299,10 +200,21 @@ def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) 
 
     initialize_database(migrated)
 
+    assert _schema_objects(migrated) == _schema_objects(fresh)
     assert _agent_columns(migrated) == _agent_columns(fresh)
     assert _table_columns(migrated, "task") == _table_columns(fresh, "task")
     assert _table_columns(migrated, "operation") == _table_columns(fresh, "operation")
     assert _table_columns(migrated, "event") == _table_columns(fresh, "event")
+
+
+def test_every_shipped_version_has_a_schema_dump() -> None:
+    """Bumping `SCHEMA_VERSION` includes dumping the version it replaces (#54).
+
+    Without the outgoing dump, the next migration is only ever tested against
+    schemas it was not written for.
+    """
+
+    assert list(range(1, SCHEMA_VERSION)) == SHIPPED_VERSIONS
 
 
 def test_migration_from_v6_leaves_existing_tasks_unbound(tmp_path: Path) -> None:
@@ -311,7 +223,7 @@ def test_migration_from_v6_leaves_existing_tasks_unbound(tmp_path: Path) -> None
     path = tmp_path / "v6_hub.db"
     fresh = tmp_path / "fresh.db"
     initialize_database(fresh)
-    _v6_database(path)
+    _legacy_database(path, 6)
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO workflow (id, goal, status, created)"
@@ -548,3 +460,232 @@ def test_migration_from_v5_to_v6_durable_event_delivery(tmp_path: Path) -> None:
     assert leased.state.value == "delivered"
     assert leased.delivery_attempts == 1
     assert leased.delivery_id is not None
+
+
+def _populate(path: Path, version: int) -> None:
+    """Write one row into every table the shipped schema at `version` has."""
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO workflow (id, goal, status, created)"
+            " VALUES ('wf', 'Ship it', 'active', '2026-09-10T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO agent (name, capabilities_json, status, context_id, last_seen)"
+            " VALUES ('bob', '[\"python\"]', 'idle', 'ctx-bob', '2026-09-10T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO task (id, workflow_id, assignee, role, title, instructions, state,"
+            " lease_expires, created, updated)"
+            " VALUES ('t1', 'wf', 'bob', 'implementer', 'Fix it', 'Please fix it', 'working',"
+            " '2026-09-10T01:00:00Z', '2026-09-10T00:00:00Z', '2026-09-10T00:30:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO message (id, task_id, context_id, sender, direction, parts_json, ts)"
+            " VALUES (7, 't1', 'ctx-bob', 'bob', 'to_alice', '[]', '2026-09-10T00:20:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO event (id, kind, payload_json, ts)"
+            " VALUES (11, 'task_progress', '{\"note\": \"working\"}', '2026-09-10T00:20:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO decision (id, ts, summary, rationale)"
+            " VALUES (3, '2026-09-10T00:10:00Z', 'Assigned bob', 'Only worker available')"
+        )
+        if version >= 4:
+            connection.execute(
+                "INSERT INTO operation (actor, operation_id, payload_hash, response_json, created)"
+                " VALUES ('bob', 'op-1', 'hash-1', '{}', '2026-09-10T00:20:00Z')"
+            )
+
+
+@pytest.mark.parametrize("version", SHIPPED_VERSIONS)
+def test_the_rebuild_carries_every_row_across(tmp_path: Path, version: int) -> None:
+    """#59 rebuilds four tables; nothing may be dropped on the way through."""
+
+    path = tmp_path / f"v{version}.db"
+    _legacy_database(path, version)
+    _populate(path, version)
+
+    initialize_database(path)
+
+    store = HubStore(path)
+    agent = store.agent_by_name("bob")
+    assert agent is not None
+    assert agent.capabilities == ["python"]
+    assert agent.status is AgentStatus.IDLE
+
+    task = store.get_task("t1")
+    assert task is not None
+    assert (task.workflow_id, task.assignee, task.role) == ("wf", "bob", "implementer")
+    assert task.title == "Fix it"
+    assert task.state is TaskState.WORKING
+    assert task.lease_expires == "2026-09-10T01:00:00Z"
+
+    with database(path) as connection:
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            for table in ("workflow", "agent", "task", "message", "event", "decision")
+        }
+        event = connection.execute("SELECT * FROM event WHERE id = 11").fetchone()
+        decision = connection.execute("SELECT * FROM decision WHERE id = 3").fetchone()
+
+    assert counts == dict.fromkeys(counts, 1)
+    assert event["kind"] == "task_progress"
+    assert event["payload_json"] == '{"note": "working"}'
+    assert decision["summary"] == "Assigned bob"
+    assert decision["key"] is None
+
+
+@pytest.mark.parametrize("version", SHIPPED_VERSIONS)
+def test_autoincrement_keeps_counting_after_the_rebuild(tmp_path: Path, version: int) -> None:
+    """Dropping the old table drops its `sqlite_sequence` row with it.
+
+    If the rebuild lost the high-water mark, the next event would reuse an id
+    an acked event already holds — and `delivery_id` is scoped by event id.
+    """
+
+    path = tmp_path / f"v{version}.db"
+    _legacy_database(path, version)
+    _populate(path, version)
+
+    initialize_database(path)
+
+    store = HubStore(path)
+    appended = store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"})
+    assert appended.id > 11
+    logged = store.log_decision("Later", "After the rebuild", key="k-1")
+    assert logged > 3
+
+
+@pytest.mark.parametrize("version", SHIPPED_VERSIONS)
+def test_migration_is_idempotent_including_the_rebuild(tmp_path: Path, version: int) -> None:
+    path = tmp_path / f"v{version}.db"
+    fresh = tmp_path / "fresh.db"
+    initialize_database(fresh)
+    _legacy_database(path, version)
+    _populate(path, version)
+
+    initialize_database(path)
+    once = _schema_objects(path)
+    initialize_database(path)
+
+    assert _schema_objects(path) == once == _schema_objects(fresh)
+    with database(path) as connection:
+        assert connection.execute("SELECT COUNT(*) AS n FROM task").fetchone()["n"] == 1
+        # A scratch table left behind would mean a rebuild stopped half way.
+        leftovers = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE '%__rebuilding'"
+        ).fetchall()
+        assert leftovers == []
+
+
+def test_the_rebuild_leaves_foreign_keys_intact(tmp_path: Path) -> None:
+    """`agent`, `task` and `message` reference each other across the rebuild."""
+
+    path = tmp_path / "v1.db"
+    _legacy_database(path, 1)
+    _populate(path, 1)
+
+    initialize_database(path)
+
+    with database(path) as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        # The cascade still bites: deleting the workflow takes its task, and
+        # the task's message, with it.
+        connection.execute("DELETE FROM workflow WHERE id = 'wf'")
+        assert connection.execute("SELECT COUNT(*) AS n FROM task").fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) AS n FROM message").fetchone()["n"] == 0
+
+
+def test_a_failed_rebuild_rolls_back_the_rename_create_and_copy_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rebuild is one transaction, including the DDL.
+
+    Python's legacy mode opens a transaction only before DML, and `with
+    connection` issues no BEGIN, so without an explicit one the rename and the
+    CREATE commit on their own. A failing copy then rolls back only the copy,
+    leaving the canonical table empty and the rows stranded in the scratch
+    table — and because the shape is now right, the retry skips the table and
+    stamps the version over the loss.
+    """
+
+    path = tmp_path / "v1.db"
+    fresh = tmp_path / "fresh.db"
+    initialize_database(fresh)
+    _legacy_database(path, 1)
+    _populate(path, 1)
+
+    real_rebuild = database_module._rebuild_table
+
+    def failing_rebuild(connection: sqlite3.Connection, table: str, create_sql: str) -> None:
+        real_rebuild(connection, table, create_sql)
+        raise sqlite3.OperationalError("simulated copy failure")
+
+    monkeypatch.setattr(database_module, "_rebuild_table", failing_rebuild)
+    with pytest.raises(sqlite3.OperationalError, match="simulated copy failure"):
+        initialize_database(path)
+
+    # The ALTER steps before the rebuild are idempotent and commit on their own,
+    # by design; what must be all-or-nothing is the rebuild. So the drifted
+    # tables still hold their appended-order shape, their rows are all there,
+    # no scratch table is left behind, and the version still says v1 — under the
+    # bug `agent` would instead be canonical, empty, and its row stranded.
+    assert _schema_objects(path) != _schema_objects(fresh)
+    with database(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            for table in ("agent", "task", "event", "decision")
+        }
+        leftovers = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE '%__rebuilding'"
+        ).fetchall()
+    assert counts == dict.fromkeys(counts, 1)
+    assert leftovers == []
+
+    # And the retry, with nothing stranded, completes the migration.
+    monkeypatch.undo()
+    initialize_database(path)
+
+    assert _schema_objects(path) == _schema_objects(fresh)
+    store = HubStore(path)
+    agent = store.agent_by_name("bob")
+    assert agent is not None and agent.capabilities == ["python"]
+
+
+@pytest.mark.parametrize("version", SHIPPED_VERSIONS)
+def test_the_rebuild_keeps_the_autoincrement_high_water_mark(
+    tmp_path: Path, version: int
+) -> None:
+    """Deleting the highest rows before migrating must not let ids be reused.
+
+    Dropping the old table drops its `sqlite_sequence` row, and copying rows
+    with explicit ids only re-establishes `max(id)` of the survivors. A reused
+    event id would let a checkpoint key like `event:{id}:assign` match the
+    decision Alice recorded for a different event, and she would skip the
+    action she was replaying instead of performing it.
+    """
+
+    path = tmp_path / f"v{version}.db"
+    _legacy_database(path, version)
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO event (kind, payload_json, ts) VALUES ('task_progress', '{}', 't')",
+            [()] * 100,
+        )
+        connection.executemany(
+            "INSERT INTO decision (ts, summary, rationale) VALUES ('t', 's', 'r')",
+            [()] * 100,
+        )
+        # The tail is gone, so `max(id)` no longer tells the whole story.
+        connection.execute("DELETE FROM event WHERE id > 10")
+        connection.execute("DELETE FROM decision WHERE id > 10")
+
+    initialize_database(path)
+
+    store = HubStore(path)
+    assert store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"}).id == 101
+    assert store.log_decision("After", "the rebuild", key="k-1") == 101

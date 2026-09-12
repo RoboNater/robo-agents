@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,12 +19,21 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-# v7 is #27/#41's `task.pr_head_sha`, after #24's v5 and #25's v6.
-SCHEMA_VERSION = 7
+# v8 is #59's rebuild of the tables `ALTER TABLE` could not reshape, after
+# #27/#41's v7, #24's v5 and #25's v6.
+# Bumping this means first dumping the version it replaces:
+# `uv run python scripts/dump-schema.py` writes tests/fixtures/schema_v<N>.sql,
+# which is what the migration tests replay instead of a fixture written from
+# memory (#54).
+SCHEMA_VERSION = 8
 
 
 class DatabaseVersionError(RuntimeError):
     """Raised when the on-disk schema does not match this application."""
+
+
+class MigrationError(RuntimeError):
+    """Raised when a migration cannot leave the database in a usable state."""
 
 
 def _sql_values(enum_type: type[StrEnum]) -> str:
@@ -114,7 +124,7 @@ CREATE TABLE IF NOT EXISTS decision (
     ts TEXT NOT NULL,
     summary TEXT NOT NULL,
     rationale TEXT NOT NULL,
-    key TEXT UNIQUE
+    key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS operation (
@@ -133,6 +143,49 @@ CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id);
 CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_key ON decision(key) WHERE key IS NOT NULL;
 """
+# `idx_decision_key` — not a column-level UNIQUE on `decision.key` — is what
+# makes `log_decision` idempotent. It is partial (`key IS NOT NULL`), which is
+# the intended semantics, and unlike a column constraint it is reachable by
+# `ALTER TABLE`, so a migrated database can have it too (#59).
+
+
+# `ALTER TABLE` can only append columns, and cannot add a column-level UNIQUE
+# at all, so a migrated database reaches the current version with its columns in
+# arrival order rather than the order `SCHEMA` declares. These are the tables
+# that drift (#59); v8 rebuilds them into the declared shape.
+REBUILT_TABLES = ("agent", "task", "event", "decision")
+
+_CREATE_TABLE_RE = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+)\s*\(", re.IGNORECASE)
+
+
+def _schema_statements() -> list[str]:
+    return [statement.strip() for statement in SCHEMA.split(";") if statement.strip()]
+
+
+def _canonical_tables() -> dict[str, str]:
+    """The `CREATE TABLE` statement `SCHEMA` declares, per table name."""
+
+    statements = {}
+    for statement in _schema_statements():
+        match = _CREATE_TABLE_RE.match(statement)
+        if match is not None:
+            statements[match.group(1)] = statement
+    return statements
+
+
+def _index_statements() -> list[str]:
+    return [
+        statement
+        for statement in _schema_statements()
+        if statement.upper().startswith("CREATE INDEX")
+        or statement.upper().startswith("CREATE UNIQUE INDEX")
+    ]
+
+
+def _normalized_sql(sql: str) -> str:
+    """Collapse whitespace and `IF NOT EXISTS` so two spellings compare equal."""
+
+    return " ".join(sql.replace("IF NOT EXISTS ", "").replace("if not exists ", "").split())
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -172,6 +225,14 @@ def initialize_database(path: Path) -> None:
         _migrate_event_delivery(connection)
         _migrate_decision_key(connection)
         _migrate_task_pr_head_sha(connection)
+
+    # v8 (#59). Outside the transaction above: the rebuild needs its own
+    # connection, because `PRAGMA foreign_keys` is a no-op inside one. The
+    # version is stamped only once it succeeds, so a failed rebuild leaves a
+    # database that the next run migrates again rather than one that claims to
+    # be current.
+    _rebuild_drifted_tables(path)
+    with database(path) as connection:
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -302,6 +363,141 @@ def _migrate_task_pr_head_sha(connection: sqlite3.Connection) -> None:
 
     if "pr_head_sha" not in _columns(connection, "task"):
         connection.execute("ALTER TABLE task ADD COLUMN pr_head_sha TEXT")
+
+
+def _rebuild_drifted_tables(path: Path) -> None:
+    """Rebuild every table whose shape `ALTER TABLE` could not converge (#59).
+
+    `ADD COLUMN` appends, so a migrated `agent`, `task` or `event` carries its
+    columns in arrival order rather than the order `SCHEMA` declares, and a
+    column-level `UNIQUE` cannot be added at all. Neither is harmful to run
+    against, but both make a table's shape depend on how the database got here,
+    which is the one thing the migration tests exist to rule out.
+
+    This is SQLite's supported procedure: rename the old table aside, create the
+    declared one in its place, copy, drop the old, then recreate the indexes
+    that went with it. Each table is skipped when its shape already matches, so
+    the step is safe to re-run, and the whole pass is one transaction.
+    """
+
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    # The transaction is driven by hand. Python's legacy mode opens one only
+    # before DML, and `with connection` issues no BEGIN of its own, so a rename
+    # and a CREATE would each commit on their own and a failing copy would roll
+    # back only the copy — leaving the canonical table empty, the rows in the
+    # scratch table, and a retry seeing the right shape, skipping the table and
+    # stamping the version over stranded data.
+    connection.isolation_level = None
+    try:
+        # Both pragmas are no-ops inside a transaction, so they are set first.
+        # `foreign_keys` off allows dropping a table that others reference;
+        # `legacy_alter_table` keeps RENAME from re-parsing the whole schema
+        # while the table those references point at is briefly absent.
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("PRAGMA legacy_alter_table = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if _rebuild_all(connection):
+                # Dropping a table drops its indexes with it.
+                for statement in _index_statements():
+                    connection.execute(statement)
+                violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise MigrationError(
+                        f"rebuilding {', '.join(REBUILT_TABLES)} left "
+                        f"{len(violations)} foreign key violation(s)"
+                    )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
+
+
+def _rebuild_all(connection: sqlite3.Connection) -> bool:
+    """Rebuild each drifted table in place; True if any table was touched."""
+
+    canonical = _canonical_tables()
+    rebuilt = False
+    for table in REBUILT_TABLES:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if row is None:
+            continue
+        if _normalized_sql(row["sql"]) == _normalized_sql(canonical[table]):
+            continue
+        _rebuild_table(connection, table, canonical[table])
+        rebuilt = True
+    return rebuilt
+
+
+def _rebuild_table(connection: sqlite3.Connection, table: str, create_sql: str) -> None:
+    """Copy one table into the shape `SCHEMA` declares.
+
+    The old table is renamed aside and the new one created under the real name,
+    rather than the other way round: `ALTER TABLE ... RENAME TO` stores the name
+    quoted (`CREATE TABLE "event"`), so a table that arrived by rename would
+    still not match a fresh one character for character.
+    """
+
+    scratch = f"{table}__rebuilding"
+    high_water = _sequence_value(connection, table)
+    connection.execute(f"DROP TABLE IF EXISTS {scratch}")
+    connection.execute(f"ALTER TABLE {table} RENAME TO {scratch}")
+    connection.execute(create_sql)
+
+    # Only columns both shapes agree on; by this point the ALTER steps above
+    # have added every column the canonical shape names.
+    shared = _columns(connection, scratch) & _columns(connection, table)
+    columns = ", ".join(sorted(shared))
+    connection.execute(f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {scratch}")
+    connection.execute(f"DROP TABLE {scratch}")
+    _restore_sequence(connection, table, high_water)
+
+
+def _sequence_value(connection: sqlite3.Connection, table: str) -> int | None:
+    """This table's `AUTOINCREMENT` high-water mark, or None if it has none."""
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+    ).fetchone()
+    if exists is None:
+        return None
+    row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)
+    ).fetchone()
+    return None if row is None else int(row["seq"])
+
+
+def _restore_sequence(connection: sqlite3.Connection, table: str, high_water: int | None) -> None:
+    """Carry an `AUTOINCREMENT` high-water mark across a rebuild.
+
+    Dropping the old table drops its `sqlite_sequence` row, and copying rows
+    with explicit ids only re-establishes `max(id)` of what survived. Where the
+    highest rows had been deleted, that regresses the mark and the next insert
+    reuses an id — which `AUTOINCREMENT` exists precisely to prevent, and which
+    would let a checkpoint key like `event:{id}:assign` match a decision made
+    for a different event.
+    """
+
+    if high_water is None:
+        return
+    row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)
+    ).fetchone()
+    if row is None:
+        connection.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (table, high_water)
+        )
+    elif int(row["seq"]) < high_water:
+        connection.execute(
+            "UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (high_water, table)
+        )
 
 
 @contextmanager
