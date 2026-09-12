@@ -378,6 +378,9 @@ async def test_mock_alice_drives_worker_mcp_session(tmp_path: Path) -> None:
     [
         ("delivery", "crash at delivery"),
         ("after_action", "crash after action"),
+        # Restored in #49's last commit and never covered: the one crash point
+        # that fires between handling an event and acking it (#55).
+        ("before_ack", "crash before ack"),
         ("after_reply", "crash after reply"),
     ],
 )
