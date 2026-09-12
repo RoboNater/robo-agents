@@ -1,6 +1,8 @@
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+from agent_hub_common import ImplementerResult, RebaseResult
 from worker_mcp.client import WorkerHubClient
 from worker_mcp.config import WorkerSettings
 from worker_mcp.tools import create_worker_mcp
@@ -75,3 +77,53 @@ async def test_worker_mcp_tools_list_and_dispatch() -> None:
             },
         )
     ) == {"status": "completed", "task_id": "t1"}
+
+
+SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param(
+            {"outcome": "completed", "head_sha": SHA, "summary": "Rebased"},
+            RebaseResult,
+            id="clean-rebase-without-pr-url",
+        ),
+        pytest.param(
+            {
+                "outcome": "completed",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "head_sha": SHA,
+                "conflict_files": ["README.md"],
+                "resolution_summary": "Kept both",
+                "summary": "Rebased",
+            },
+            RebaseResult,
+            id="rebase-that-also-names-its-pr",
+        ),
+        pytest.param(
+            {
+                "outcome": "completed",
+                "pr_url": "https://github.com/org/repo/pull/1",
+                "head_sha": SHA,
+                "summary": "Done",
+            },
+            ImplementerResult,
+            id="implementer",
+        ),
+    ],
+)
+async def test_submit_result_keeps_a_rebase_body_whole(
+    body: dict[str, Any], expected: type[Any]
+) -> None:
+    settings = WorkerSettings(hub_url="http://hub.example", token="t", agent_name="b")
+    client = WorkerHubClient(settings)
+    client.submit_result = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    server = create_worker_mcp(client)
+
+    await server.call_tool("submit_result", {"task_id": "t1", "result": body})
+
+    submitted = client.submit_result.call_args.args[1]
+    assert type(submitted) is expected
+    assert submitted.model_dump(exclude_unset=True) == body

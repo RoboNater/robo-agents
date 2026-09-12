@@ -1,11 +1,13 @@
 import pytest
 from agent_hub_common.models import (
     IMPLEMENTER_RESULT_SCHEMA,
+    REBASE_RESULT_SCHEMA,
     REVIEWER_RESULT_SCHEMA,
     SCHEMA_VERSION,
     Finding,
     ImplementerOutcome,
     ImplementerResult,
+    RebaseResult,
     ReviewerResult,
     ReviewerVerdict,
     TestResult,
@@ -182,3 +184,49 @@ def test_exported_json_schemas() -> None:
     assert "outcome" in IMPLEMENTER_RESULT_SCHEMA["properties"]
     assert REVIEWER_RESULT_SCHEMA["type"] == "object"
     assert "verdict" in REVIEWER_RESULT_SCHEMA["properties"]
+    assert {"outcome", "head_sha", "conflict_files", "resolution_summary"} <= set(
+        REBASE_RESULT_SCHEMA["properties"]
+    )
+
+
+def test_a_clean_rebase_reports_its_new_head_and_no_conflicts() -> None:
+    res = RebaseResult(outcome=ImplementerOutcome.COMPLETED, head_sha=VALID_SHA, summary="Rebased")
+
+    assert res.conflict_files == []
+    assert res.resolution_summary is None
+
+
+def test_a_completed_rebase_requires_its_head_sha() -> None:
+    with pytest.raises(ValidationError, match="head_sha"):
+        RebaseResult(outcome=ImplementerOutcome.COMPLETED, summary="Rebased")
+
+
+@pytest.mark.parametrize("resolution", [None, "", "   "])
+def test_resolved_conflicts_must_say_how_they_were_resolved(resolution: str | None) -> None:
+    with pytest.raises(ValidationError, match="resolution_summary"):
+        RebaseResult(
+            outcome=ImplementerOutcome.COMPLETED,
+            head_sha=VALID_SHA,
+            conflict_files=["packages/hub/src/agent_hub/database.py"],
+            resolution_summary=resolution,
+            summary="Rebased",
+        )
+
+    res = RebaseResult(
+        outcome=ImplementerOutcome.COMPLETED,
+        head_sha=VALID_SHA,
+        conflict_files=["packages/hub/src/agent_hub/database.py"],
+        resolution_summary="Kept both migrations; schema version from Reservations.",
+        summary="Rebased",
+    )
+    assert res.conflict_files == ["packages/hub/src/agent_hub/database.py"]
+
+
+def test_a_blocked_rebase_needs_no_head() -> None:
+    res = RebaseResult(
+        outcome=ImplementerOutcome.BLOCKED,
+        blocker="main rewrote the module this PR changes",
+        summary="Cannot rebase without a design decision",
+    )
+
+    assert res.head_sha is None

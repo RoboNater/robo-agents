@@ -140,6 +140,15 @@ def _legacy_database(path: Path, version: int) -> None:
         """)
 
 
+def _v6_database(path: Path) -> None:
+    """A database as the merged #25 left it: today's schema without `pr_head_sha`."""
+
+    initialize_database(path)
+    with database(path) as connection:
+        connection.execute("ALTER TABLE task DROP COLUMN pr_head_sha")
+        connection.execute("PRAGMA user_version = 6")
+
+
 def _table_columns(path: Path, table: str) -> dict[str, tuple[str, int, str | None]]:
     with database(path) as connection:
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -281,7 +290,7 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     assert row["created"] == "2026-09-07T00:00:00Z"
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
 def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) -> None:
     fresh = tmp_path / "fresh.db"
     migrated = tmp_path / f"v{version}.db"
@@ -292,6 +301,41 @@ def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) 
 
     assert _agent_columns(migrated) == _agent_columns(fresh)
     assert _table_columns(migrated, "task") == _table_columns(fresh, "task")
+    assert _table_columns(migrated, "operation") == _table_columns(fresh, "operation")
+    assert _table_columns(migrated, "event") == _table_columns(fresh, "event")
+
+
+def test_migration_from_v6_leaves_existing_tasks_unbound(tmp_path: Path) -> None:
+    """#27/#41's `pr_head_sha`: tasks assigned before it was bound to nothing."""
+
+    path = tmp_path / "v6_hub.db"
+    fresh = tmp_path / "fresh.db"
+    initialize_database(fresh)
+    _v6_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO workflow (id, goal, status, created)"
+            " VALUES ('wf', 'goal', 'active', '2026-09-10T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO task (id, workflow_id, role, title, instructions, state, created, updated)"
+            " VALUES ('t1', 'wf', 'reviewer', 'Review', 'Look', 'completed',"
+            " '2026-09-10T00:00:00Z', '2026-09-10T00:00:00Z')"
+        )
+
+    initialize_database(path)
+    initialize_database(path)
+
+    store = HubStore(path)
+    old = store.get_task("t1")
+    assert old is not None and old.pr_head_sha is None
+    store.check_in("bob")
+    head = "ABCDEF0123456789abcdef0123456789abcdef01"
+    new = store.assign_task("bob", "reviewer", "Review", "Look again", pr_head_sha=head)
+    assert new.pr_head_sha == head.lower()
+    assert _table_columns(path, "task") == _table_columns(fresh, "task")
+    with database(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_model_source_is_constrained_to_its_enum(tmp_path: Path) -> None:

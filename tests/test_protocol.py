@@ -544,6 +544,93 @@ async def test_a_result_requires_typed_result(
     assert body["error"]["code"] == -32602
 
 
+HEAD = "0123456789abcdef0123456789abcdef01234567"
+
+
+async def assigned_rebase(client: httpx.AsyncClient, store: HubStore) -> tuple[str, dict[str, Any]]:
+    """Check Bob in, give him a rebase bound to HEAD, and return what NEXT delivered."""
+
+    context_id = await check_in(client, "bob")
+    store.assign_task("bob", "rebase", "Rebase #7", "Bring #7 up to date", pr_head_sha=HEAD)
+    stream = await client.post(
+        "/a2a", json=rpc("message/stream", message("NEXT", context_id=context_id))
+    )
+    return context_id, sse_results(stream)[0]
+
+
+async def test_a_rebase_assignment_carries_the_head_it_is_bound_to(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    _, task = await assigned_rebase(client, hub_store)
+
+    assert task["metadata"][MetaKeys.ROLE] == "rebase"
+    assert task["metadata"][MetaKeys.PR_HEAD_SHA] == HEAD
+    assert task["status"]["message"]["metadata"][MetaKeys.PR_HEAD_SHA] == HEAD
+
+
+def rebase_result(result: dict[str, Any], operation_id: str) -> dict[str, Any]:
+    return {
+        MetaKeys.KIND: "result",
+        MetaKeys.SCHEMA_VERSION: 1,
+        MetaKeys.OPERATION_ID: operation_id,
+        MetaKeys.RESULT: result,
+    }
+
+
+async def test_a_rebase_result_is_validated_as_a_rebase(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    context_id, task = await assigned_rebase(client, hub_store)
+    # No pr_url: an implementer result would be refused for that; a rebase
+    # of an existing PR needs none.
+    result = {"outcome": "completed", "head_sha": HEAD, "summary": "Rebased, no conflicts"}
+
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "Rebased",
+            context_id=context_id,
+            task_id=task["id"],
+            metadata=rebase_result(result, "op-rebase-1"),
+        ),
+    )
+
+    stored = hub_store.get_task(task["id"])
+    assert body["result"]["status"]["state"] == "completed"
+    assert stored is not None and stored.result is not None
+    assert stored.result["conflict_files"] == []
+    assert stored.result["resolution_summary"] is None
+
+
+async def test_a_rebase_claiming_conflicts_must_explain_them(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    context_id, task = await assigned_rebase(client, hub_store)
+    result = {
+        "outcome": "completed",
+        "head_sha": HEAD,
+        "conflict_files": ["packages/hub/src/agent_hub/database.py"],
+        "summary": "Rebased",
+    }
+
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "Rebased",
+            context_id=context_id,
+            task_id=task["id"],
+            metadata=rebase_result(result, "op-rebase-2"),
+        ),
+        status_code=400,
+    )
+
+    stored = hub_store.get_task(task["id"])
+    assert "resolution_summary" in body["error"]["message"]
+    assert stored is not None and stored.state is TaskState.WORKING
+
+
 async def test_a_worker_cannot_act_on_another_workers_task(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:

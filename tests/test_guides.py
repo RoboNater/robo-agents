@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 from agent_hub.guides import guide_response
-from agent_hub_common import HubSettings
+from agent_hub_common import HubSettings, RebaseResult, TaskRole
 from conftest import BASE_URL, TOKEN
 from fastapi import FastAPI, HTTPException
 
@@ -164,3 +164,14 @@ def test_only_a_role_slug_names_a_guide(guides: Path, role: str) -> None:
         guide_response(guides, role)
 
     assert raised.value.status_code == 404
+
+
+CHECKED_IN_GUIDES = Path(__file__).resolve().parents[1] / "guides"
+
+
+def test_the_rebase_guide_documents_every_result_field() -> None:
+    """A worker fills in RebaseResult from this guide alone, so none may be missing."""
+
+    text = (CHECKED_IN_GUIDES / f"{TaskRole.REBASE}.md").read_text(encoding="utf-8")
+
+    assert {name for name in RebaseResult.model_fields if f"`{name}`" not in text} == set()

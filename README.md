@@ -5,7 +5,7 @@ This repository implements the proof of concept described in
 Steps 1–4: the uv workspace, shared configuration and bearer-token provisioning,
 the SQLite schema, A2A agent-card discovery, the hub core (A2A request handlers,
 role-guide route, event queue, lease/heartbeat sweeper, bearer enforcement),
-Alice's eight MCP tools over stdio, and worker MCP tools connecting Claude Code
+Alice's MCP tools over stdio (including the `check_merge_gate` merge gate), and worker MCP tools connecting Claude Code
 and Codex CLI workers to the hub. The Step 4A durability retrofit is currently in progress.
 Alice so far runs in relay mode: a prompts-only skill,
 [`skills/alice-relay/`](skills/alice-relay/SKILL.md), whose prompts a human
@@ -150,8 +150,9 @@ The files come from the [`guides/`](guides) directory of this checkout, found
 from the installed package and never from the working directory; set
 `HUB_GUIDES_DIR` (absolute) to serve them from anywhere else. `{role}` is a role
 slug, never a path: an unknown role, an unwritten guide and a missing directory
-are all `404`. The guide *content* is written in Step 5, so today every request
-is a 404 and the startup log names the directory the hub is reading.
+are all `404`. The guide *content* is written in Step 5. Until then only
+`rebase.md` exists, so every other request is a 404, and the startup log names
+the directory the hub is reading.
 
 Progress notes, questions and results are `message/send` and `message/stream`
 calls carrying a `taskId` and a `metadata.kind` of `progress`, `question` or

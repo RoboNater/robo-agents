@@ -45,6 +45,14 @@ class EventKind(StrEnum):
     AGENT_LOST = "agent_lost"
 
 
+class TaskRole(StrEnum):
+    """Roles with a typed result body (§4.4); the guide for each is `<role>.md`."""
+
+    IMPLEMENTER = "implementer"
+    REVIEWER = "reviewer"
+    REBASE = "rebase"
+
+
 class EventState(StrEnum):
     QUEUED = "queued"
     DELIVERED = "delivered"
@@ -121,10 +129,40 @@ class ReviewerResult(BaseModel):
         return self
 
 
-TaskResult = ImplementerResult | ReviewerResult
+class RebaseResult(BaseModel):
+    """Bringing an approved PR up to date with its base branch (spec §5 REBASE).
+
+    `conflict_files` decides what follows: empty sends the new head straight
+    to MERGE, anything else sends it back to review, because a resolved
+    conflict is code no reviewer has read. An empty list is therefore a claim,
+    not a default — it must mean git merged every file without a hand edit and
+    nothing else needed changing to make the result correct.
+    """
+
+    outcome: ImplementerOutcome
+    pr_url: str | None = None
+    head_sha: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{40}$")
+    conflict_files: list[str] = Field(default_factory=list)
+    resolution_summary: str | None = None
+    tests: list[TestResult] = Field(default_factory=list)
+    blocker: str | None = None
+    summary: str
+
+    @model_validator(mode="after")
+    def validate_completed(self) -> Self:
+        if self.outcome == ImplementerOutcome.COMPLETED:
+            if not self.head_sha or not SHA_HEX_40_RE.match(self.head_sha):
+                raise ValueError("completed rebase result requires head_sha")
+            if self.conflict_files and not (self.resolution_summary or "").strip():
+                raise ValueError("rebase result with conflict_files requires resolution_summary")
+        return self
+
+
+TaskResult = ImplementerResult | ReviewerResult | RebaseResult
 
 IMPLEMENTER_RESULT_SCHEMA: dict[str, Any] = ImplementerResult.model_json_schema()
 REVIEWER_RESULT_SCHEMA: dict[str, Any] = ReviewerResult.model_json_schema()
+REBASE_RESULT_SCHEMA: dict[str, Any] = RebaseResult.model_json_schema()
 
 
 class ModelSource(StrEnum):

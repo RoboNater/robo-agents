@@ -19,7 +19,10 @@ from agent_hub_common import (
     AgentProfile,
     AgentStatus,
     EventKind,
+    ImplementerOutcome,
+    MetaKeys,
     ModelSource,
+    RebaseResult,
     TaskState,
     iso_after,
     to_iso,
@@ -177,6 +180,76 @@ def test_assignment_marks_the_agent_busy_and_records_the_instructions(store: Hub
     assert agent.status is AgentStatus.BUSY
     assert agent.current_task_id == task.id
     assert [part["text"] for part in store.task_history(task.id)[0].parts] == ["Open a PR"]
+
+
+HEAD = "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_a_review_assignment_is_bound_to_the_head_it_was_given(store: HubStore) -> None:
+    store.check_in("bob")
+
+    task = store.assign_task("bob", "reviewer", "Review #7", "Review it", pr_head_sha=HEAD.upper())
+
+    assert task.pr_head_sha == HEAD
+    assert store.get_state()["tasks"][0]["pr_head_sha"] == HEAD
+    metadata = store.task_history(task.id)[0].parts[0]["metadata"]
+    assert metadata[MetaKeys.PR_HEAD_SHA] == HEAD
+
+
+def test_an_unbound_assignment_carries_no_head(store: HubStore) -> None:
+    store.check_in("bob")
+
+    task = store.assign_task("bob", "implementer", "Fix #1", "Open a PR")
+
+    assert task.pr_head_sha is None
+    assert MetaKeys.PR_HEAD_SHA not in store.task_history(task.id)[0].parts[0]["metadata"]
+
+
+@pytest.mark.parametrize("sha", ["abc123", HEAD + "\n", "g" * 40, ""])
+def test_a_malformed_head_sha_is_refused_before_anything_is_assigned(
+    store: HubStore, sha: str
+) -> None:
+    store.check_in("bob")
+
+    with pytest.raises(ValueError, match="pr_head_sha"):
+        store.assign_task("bob", "reviewer", "Review", "Review it", pr_head_sha=sha)
+
+    assert store.tasks() == []
+    agent = store.agent_by_name("bob")
+    assert agent is not None and agent.status is AgentStatus.IDLE
+
+
+@pytest.mark.parametrize(
+    ("outcome", "state", "kind"),
+    [
+        (ImplementerOutcome.COMPLETED, TaskState.COMPLETED, EventKind.TASK_COMPLETED),
+        (ImplementerOutcome.BLOCKED, TaskState.FAILED, EventKind.TASK_FAILED),
+    ],
+)
+def test_a_rebase_result_is_stored_whole_and_reported_to_alice(
+    store: HubStore, outcome: ImplementerOutcome, state: TaskState, kind: EventKind
+) -> None:
+    store.check_in("bob")
+    task_id = store.assign_task("bob", "rebase", "Rebase", "Rebase it", pr_head_sha=HEAD).id
+    while store.next_event():
+        pass
+    result = RebaseResult(
+        outcome=outcome,
+        head_sha=HEAD if outcome is ImplementerOutcome.COMPLETED else None,
+        conflict_files=["README.md"],
+        resolution_summary="Took main's wording, kept the new section.",
+        blocker=None if outcome is ImplementerOutcome.COMPLETED else "needs a decision",
+        summary="Rebased onto main",
+    )
+
+    finished = store.submit_result(task_id, "bob", result)
+
+    event = store.next_event()
+    assert finished.state is state
+    assert finished.result is not None
+    assert finished.result["conflict_files"] == ["README.md"]
+    assert event is not None and event.kind is kind
+    assert event.payload["result"]["resolution_summary"].startswith("Took main's")
 
 
 def test_a_second_assignment_to_a_busy_agent_is_refused(store: HubStore) -> None:

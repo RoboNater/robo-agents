@@ -6,8 +6,9 @@ Runtime-agnostic instructions for workers, served by the hub at
 worker behaviour cannot live in a Claude Code skill.
 
 The content is written in plan Step 5: `worker.md`, `implementer.md` and
-`reviewer.md` (spec §5). Until then this directory is a placeholder and every
-request for a guide is a `404`.
+`reviewer.md` (spec §5). Until then every request for those is a `404`.
+`rebase.md` is already here: it came with the REBASE step (GitHub issue #41),
+and `assign_task(role="rebase")` points workers at it.
 
 File names are role names as they appear in `assign_task(role=...)`: lowercase
 slugs matching `[a-z][a-z0-9-]*`, with a `.md` suffix. Anything else here —

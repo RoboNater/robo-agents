@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
@@ -21,6 +22,7 @@ from uuid import uuid4
 
 from agent_hub_common import (
     DEFAULT_EVENT_LEASE_S,
+    SHA_HEX_40_RE,
     UNKNOWN,
     AgentProfile,
     AgentStatus,
@@ -30,6 +32,7 @@ from agent_hub_common import (
     ImplementerResult,
     MetaKeys,
     ModelSource,
+    RebaseResult,
     ReviewerResult,
     ReviewerVerdict,
     TaskResult,
@@ -41,6 +44,8 @@ from agent_hub_common import (
 
 from .database import database
 from .signals import EVENT_KEY, Signals, context_key, task_key
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_GOAL = "Drive the assigned GitHub issue to a merged pull request."
 DEFAULT_LEASE_MIN = 30.0
@@ -108,6 +113,8 @@ class TaskRecord:
     result: dict[str, Any] | None
     created: str
     updated: str
+    # The PR head a review or rebase is bound to (#27, #41); None when unbound.
+    pr_head_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +205,7 @@ def _task(row: Row) -> TaskRecord:
         result=_json_object(row["result_json"]),
         created=row["created"],
         updated=row["updated"],
+        pr_head_sha=row["pr_head_sha"],
     )
 
 
@@ -689,9 +697,24 @@ class HubStore:
         title: str,
         instructions: str,
         lease_min: float = DEFAULT_LEASE_MIN,
+        pr_head_sha: str | None = None,
     ) -> TaskRecord:
-        """Create a task for an idle agent and unblock its pending wait."""
+        """Create a task for an idle agent and unblock its pending wait.
 
+        `pr_head_sha` binds a review or rebase to the PR head it was given, so
+        the verdict can be checked against what the PR holds at merge time.
+        """
+
+        if pr_head_sha is not None and not SHA_HEX_40_RE.fullmatch(pr_head_sha):
+            raise ValueError("pr_head_sha must be a 40-character hex commit SHA")
+        head = None if pr_head_sha is None else pr_head_sha.lower()
+        assignment_metadata: dict[str, Any] = {
+            MetaKeys.KIND: "assignment",
+            MetaKeys.ROLE: role,
+            MetaKeys.TITLE: title,
+        }
+        if head is not None:
+            assignment_metadata[MetaKeys.PR_HEAD_SHA] = head
         now_moment = self._now()
         now = to_iso(now_moment)
         with database(self.path) as connection:
@@ -713,8 +736,8 @@ class HubStore:
             task_id = uuid4().hex
             connection.execute(
                 "INSERT INTO task (id, workflow_id, assignee, role, title, instructions, state,"
-                " lease_expires, lease_duration_s, created, updated)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " lease_expires, lease_duration_s, created, updated, pr_head_sha)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     workflow_id,
@@ -727,6 +750,7 @@ class HubStore:
                     lease_min * 60,
                     now,
                     now,
+                    head,
                 ),
             )
             connection.execute(
@@ -739,16 +763,7 @@ class HubStore:
                 context_id=record.context_id,
                 sender="alice",
                 direction="from_alice",
-                parts=[
-                    text_part(
-                        instructions,
-                        metadata={
-                            MetaKeys.KIND: "assignment",
-                            MetaKeys.ROLE: role,
-                            MetaKeys.TITLE: title,
-                        },
-                    )
-                ],
+                parts=[text_part(instructions, metadata=assignment_metadata)],
             )
             task = self._require_task(connection, task_id)
         self.signals.notify(context_key(record.context_id))
@@ -1011,7 +1026,7 @@ class HubStore:
         if actual_result is None:
             raise ConflictError("submit_result requires result or status")
 
-        if isinstance(actual_result, ImplementerResult):
+        if isinstance(actual_result, (ImplementerResult, RebaseResult)):
             terminal_status = (
                 TaskState.COMPLETED
                 if actual_result.outcome == ImplementerOutcome.COMPLETED
@@ -1254,24 +1269,44 @@ class HubStore:
         return event
 
     def ack_event(self, delivery_id: str | None) -> bool:
-        """Acknowledge an active event delivery. Wrong or expired delivery_id is ignored."""
+        """Acknowledge an event delivery; an unknown or superseded id is ignored.
+
+        A matching `delivery_id` is itself the proof that the caller holds the
+        newest delivery, because every lease mints a new one. So the ack counts
+        even after the delivery lease has expired (#50): an action that outlives
+        `HUB_EVENT_LEASE_S` — the §5 MERGE window, where the gate waits on CI
+        and `gh pr merge` follows, is the long one — would otherwise be
+        redelivered and redone after it had already completed. A late ack is
+        logged, so a lease that is chronically too short stays visible.
+        """
 
         if not delivery_id:
             return False
-        now = self._now_iso()
+        now_moment = self._now()
+        now = to_iso(now_moment)
         with database(self.path) as connection:
-            cursor = connection.execute(
-                """
-                UPDATE event
-                SET state = 'acked',
-                    acked_at = ?
-                WHERE delivery_id = ?
-                  AND state = 'delivered'
-                  AND delivery_expires > ?
-                """,
-                (now, delivery_id, now),
+            row = connection.execute(
+                "SELECT id, delivery_expires, delivery_attempts FROM event"
+                " WHERE delivery_id = ? AND state = 'delivered'",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE event SET state = 'acked', acked_at = ? WHERE delivery_id = ?"
+                " AND state = 'delivered'",
+                (now, delivery_id),
             )
-            return cursor.rowcount > 0
+        expires = row["delivery_expires"]
+        if expires is not None and expires <= now:
+            logger.warning(
+                "Late ack for event %s: %.1f s past its delivery lease, attempt %s. "
+                "Raise HUB_EVENT_LEASE_S if this repeats.",
+                row["id"],
+                (now_moment - _parse_timestamp(expires)).total_seconds(),
+                row["delivery_attempts"],
+            )
+        return True
 
     def lease_next_event(self, lease_s: float | None = None) -> EventRecord | None:
         """Lease the oldest queued or expired-delivered event, returning it with delivery_id."""

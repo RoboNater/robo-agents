@@ -52,7 +52,10 @@ from agent_hub_common import (
     ImplementerResult,
     MetaKeys,
     ModelSource,
+    RebaseResult,
     ReviewerResult,
+    TaskResult,
+    TaskRole,
     TaskState,
 )
 from fastapi import Response
@@ -79,6 +82,14 @@ NEXT_TEXT = "NEXT"
 SSE_MEDIA_TYPE = "text/event-stream"
 # Proxies that buffer would defeat the point of holding the response open.
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+# The typed body each role's result is validated against (§4.4). A task whose
+# role has no entry is validated by the shape of what the worker sent.
+RESULT_MODELS: dict[TaskRole, type[TaskResult]] = {
+    TaskRole.IMPLEMENTER: ImplementerResult,
+    TaskRole.REVIEWER: ReviewerResult,
+    TaskRole.REBASE: RebaseResult,
+}
 
 SUPPORTED_METHODS = frozenset({"message/send", "message/stream", "tasks/get", "tasks/cancel"})
 
@@ -336,6 +347,9 @@ def _task_object(
 ) -> Task:
     """Render a stored task as the A2A Task a worker or debugger receives."""
 
+    bound_head: dict[str, Any] = (
+        {} if record.pr_head_sha is None else {MetaKeys.PR_HEAD_SHA: record.pr_head_sha}
+    )
     if status_message is None:
         status_message = _agent_message(
             record.instructions,
@@ -345,7 +359,8 @@ def _task_object(
                 MetaKeys.KIND: "assignment",
                 MetaKeys.ROLE: record.role,
                 MetaKeys.TITLE: record.title,
-            },
+            }
+            | bound_head,
         )
     return Task(
         id=record.id,
@@ -363,7 +378,8 @@ def _task_object(
             MetaKeys.ASSIGNEE: record.assignee,
             MetaKeys.LEASE_EXPIRES: record.lease_expires,
             MetaKeys.RESULT: record.result,
-        },
+        }
+        | bound_head,
     )
 
 
@@ -557,12 +573,10 @@ class A2AProtocol:
         if not result_dict.get("summary") and summary:
             result_dict["summary"] = summary
 
-        typed_result: ImplementerResult | ReviewerResult
+        typed_result: TaskResult
         try:
-            if task.role == "implementer":
-                typed_result = ImplementerResult.model_validate(result_dict)
-            elif task.role == "reviewer":
-                typed_result = ReviewerResult.model_validate(result_dict)
+            if task.role in RESULT_MODELS:
+                typed_result = RESULT_MODELS[TaskRole(task.role)].model_validate(result_dict)
             elif "outcome" in result_dict:
                 typed_result = ImplementerResult.model_validate(result_dict)
             elif "verdict" in result_dict:
