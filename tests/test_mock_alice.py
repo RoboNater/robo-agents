@@ -272,6 +272,14 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
     assert observed["cycles"] == 3
 
 
+def test_endurance_gives_claude_code_a_supported_blocking_wait() -> None:
+    action = mock_alice._long_work_action("claude-code", 210.0)
+
+    assert "run_in_background=true" in action
+    assert "TaskOutput exactly once" in action
+    assert "Do not use `wait`" in action
+
+
 async def test_mock_alice_rejects_unexpected_harness(tmp_path: Path) -> None:
     db_path = tmp_path / "hub_mismatch.db"
     initialize_database(db_path)

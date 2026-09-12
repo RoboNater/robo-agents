@@ -50,6 +50,7 @@ HUB_TELEMETRY_LOG=/absolute/path/endurance-worker.jsonl \
 scripts/supervise-claude-code.sh
 ```
 
-The supervisor pre-approves only literal `sleep` commands and the four worker
-coordination tools. It sends a continuation message after a premature
+The supervisor pre-approves only literal `sleep` commands, the blocking
+background-task wait that Claude Code requires for long sleeps, and the four
+worker coordination tools. It sends a continuation message after a premature
 end-turn, and exits only after telemetry records the hub's release response.

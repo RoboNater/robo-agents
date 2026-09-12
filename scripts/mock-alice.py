@@ -89,6 +89,24 @@ class AliceCrashError(RuntimeError):
 ENDURANCE_QUESTION = "May I continue the endurance probe?"
 
 
+def _long_work_action(harness: str | None, duration_s: float) -> str:
+    if harness == "claude-code":
+        return (
+            f"Run exactly `sleep {duration_s}` once with Bash using "
+            "run_in_background=true, then immediately call TaskOutput exactly once for that "
+            "task with block=true and a timeout higher than the sleep duration. Do not use "
+            "`wait`, Read, a polling loop, or another sleep. Call no hub MCP tool until "
+            "TaskOutput reports completion; the worker-mcp timer must keep you alive "
+            "independently."
+        )
+    return (
+        f"Run exactly `sleep {duration_s}` as one foreground shell command, setting the "
+        "shell-tool timeout higher than the sleep duration. Do not background it and do not "
+        "use a polling loop. Call no hub MCP tool until it finishes; the worker-mcp timer must "
+        "keep you alive independently."
+    )
+
+
 def _part_kind(part: dict[str, Any]) -> Any:
     root = part.get("root")
     normalized = root if isinstance(root, dict) else part
@@ -279,12 +297,7 @@ async def drive_endurance(
                 "with the identical question until Alice replies."
             )
         elif cycle == 1:
-            action = (
-                f"Run exactly `sleep {long_work_s}` as one foreground shell command, setting the "
-                "shell-tool timeout higher than the sleep duration. Do not background it and do "
-                "not use a polling loop. Call no hub MCP tool until it finishes; the worker-mcp "
-                "timer must keep you alive independently."
-            )
+            action = _long_work_action(expected_harness, long_work_s)
         else:
             action = "Complete this cycle immediately."
         instructions = (
