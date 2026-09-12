@@ -75,6 +75,7 @@ while IFS= read -r -u "$read_fd" line; do
   printf '%s\n' "$line"
   if [[ $line =~ \"type\"[[:space:]]*:[[:space:]]*\"result\" ]]; then
     if released; then
+      echo "Claude release observed after $reprompts supervisor reprompt(s)" >&2
       exec {write_fd}>&-
       wait "$claude_pid"
       trap - EXIT INT TERM
@@ -85,6 +86,7 @@ while IFS= read -r -u "$read_fd" line; do
       exit 1
     fi
     sleep "$reprompt_delay_s"
+    echo "Claude ended before release; sending supervisor reprompt $((reprompts + 1))" >&2
     send_message "$continue_prompt"
     ((reprompts += 1))
   fi
@@ -92,6 +94,7 @@ done
 
 wait "$claude_pid" || true
 if released; then
+  echo "Claude release observed after $reprompts supervisor reprompt(s)" >&2
   trap - EXIT INT TERM
   exit 0
 fi

@@ -49,6 +49,8 @@ done
     )
 
     assert completed.returncode == 0, completed.stderr
+    assert "sending supervisor reprompt 1" in completed.stderr
+    assert "release observed after 1 supervisor reprompt" in completed.stderr
     messages = input_log.read_text(encoding="utf-8").splitlines()
     assert len(messages) == 2
     assert "unattended worker" in messages[0]
