@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_hub.database import initialize_database
+from agent_hub.database import database, initialize_database
 from agent_hub.store import HubStore
 from agent_hub_common import (
     AgentStatus,
@@ -128,7 +128,8 @@ async def drive_one_task_mcp(
             existing_task.get("state"),
         )
     else:
-        while asyncio.get_running_loop().time() < deadline:
+        checkin_event_id: Any = None
+        while not agent_name and asyncio.get_running_loop().time() < deadline:
             if crash_at == "before_ack" and last_delivery_id:
                 raise AliceCrashError("Simulated Alice crash before ack")
 
@@ -145,12 +146,9 @@ async def drive_one_task_mcp(
             )
             timeout_to_use = (
                 0.05
-                if known_ag is not None
+                if (known_ag is not None and not last_delivery_id)
                 else max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
             )
-        checkin_event_id: Any = None
-        while not agent_name and asyncio.get_running_loop().time() < deadline:
-            timeout_to_use = 0.05 if (known_ag is not None and not last_delivery_id) else 5.0
             wait_args: dict[str, Any] = {"timeout_s": timeout_to_use}
             if last_delivery_id:
                 wait_args["ack"] = last_delivery_id
@@ -190,11 +188,7 @@ async def drive_one_task_mcp(
             logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
         logger.info("Worker %r checked in! Assigning task...", agent_name)
-        checkpoint_key = (
-            f"event:{checkin_event_id}:assign"
-            if checkin_event_id is not None
-            else f"assign:{agent_name}:{role}"
-        )
+        checkpoint_key = f"event:{checkin_event_id}:assign"
         await _call(
             session,
             "log_decision",
@@ -257,7 +251,7 @@ async def drive_one_task_mcp(
                 },
             )
             logger.info("Alice replied to question on %s", q_task_id)
-            if crash_at == "after_reply":
+            if crash_at in ("after_action", "after_reply"):
                 raise AliceCrashError("Simulated Alice crash after reply")
         elif (
             kind in ("task_completed", "task_failed")
@@ -392,11 +386,19 @@ async def drive_one_task(
             logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
 
         logger.info("Worker %r checked in! Assigning task...", agent_name)
-        checkpoint_key = (
-            f"event:{checkin_event_id}:assign"
-            if checkin_event_id is not None
-            else f"assign:{agent_name}:{role}"
-        )
+        if checkin_event_id is None:
+            with database(store.path) as connection:
+                query = (
+                    "SELECT id FROM event WHERE kind = ? AND "
+                    "json_extract(payload_json, '$.agent') = ? "
+                    "ORDER BY id DESC LIMIT 1"
+                )
+                row = connection.execute(
+                    query, (EventKind.AGENT_CHECKED_IN.value, agent_name)
+                ).fetchone()
+                if row:
+                    checkin_event_id = row["id"]
+        checkpoint_key = f"event:{checkin_event_id}:assign"
         store.log_decision(
             f"Assigned task to {agent_name} for role {role}",
             f"Initial assignment for role {role}",
