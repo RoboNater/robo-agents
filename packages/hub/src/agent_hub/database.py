@@ -382,6 +382,13 @@ def _rebuild_drifted_tables(path: Path) -> None:
 
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    # The transaction is driven by hand. Python's legacy mode opens one only
+    # before DML, and `with connection` issues no BEGIN of its own, so a rename
+    # and a CREATE would each commit on their own and a failing copy would roll
+    # back only the copy — leaving the canonical table empty, the rows in the
+    # scratch table, and a retry seeing the right shape, skipping the table and
+    # stamping the version over stranded data.
+    connection.isolation_level = None
     try:
         # Both pragmas are no-ops inside a transaction, so they are set first.
         # `foreign_keys` off allows dropping a table that others reference;
@@ -390,35 +397,43 @@ def _rebuild_drifted_tables(path: Path) -> None:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("PRAGMA legacy_alter_table = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
-
-        canonical = _canonical_tables()
-        with connection:
-            rebuilt = False
-            for table in REBUILT_TABLES:
-                row = connection.execute(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    (table,),
-                ).fetchone()
-                if row is None:
-                    continue
-                if _normalized_sql(row["sql"]) == _normalized_sql(canonical[table]):
-                    continue
-                _rebuild_table(connection, table, canonical[table])
-                rebuilt = True
-
-            if not rebuilt:
-                return
-            # Dropping a table drops its indexes with it.
-            for statement in _index_statements():
-                connection.execute(statement)
-            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
-                raise MigrationError(
-                    f"rebuilding {', '.join(REBUILT_TABLES)} left "
-                    f"{len(violations)} foreign key violation(s)"
-                )
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if _rebuild_all(connection):
+                # Dropping a table drops its indexes with it.
+                for statement in _index_statements():
+                    connection.execute(statement)
+                violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise MigrationError(
+                        f"rebuilding {', '.join(REBUILT_TABLES)} left "
+                        f"{len(violations)} foreign key violation(s)"
+                    )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
     finally:
         connection.close()
+
+
+def _rebuild_all(connection: sqlite3.Connection) -> bool:
+    """Rebuild each drifted table in place; True if any table was touched."""
+
+    canonical = _canonical_tables()
+    rebuilt = False
+    for table in REBUILT_TABLES:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if row is None:
+            continue
+        if _normalized_sql(row["sql"]) == _normalized_sql(canonical[table]):
+            continue
+        _rebuild_table(connection, table, canonical[table])
+        rebuilt = True
+    return rebuilt
 
 
 def _rebuild_table(connection: sqlite3.Connection, table: str, create_sql: str) -> None:
@@ -431,6 +446,7 @@ def _rebuild_table(connection: sqlite3.Connection, table: str, create_sql: str) 
     """
 
     scratch = f"{table}__rebuilding"
+    high_water = _sequence_value(connection, table)
     connection.execute(f"DROP TABLE IF EXISTS {scratch}")
     connection.execute(f"ALTER TABLE {table} RENAME TO {scratch}")
     connection.execute(create_sql)
@@ -441,6 +457,47 @@ def _rebuild_table(connection: sqlite3.Connection, table: str, create_sql: str) 
     columns = ", ".join(sorted(shared))
     connection.execute(f"INSERT INTO {table} ({columns}) SELECT {columns} FROM {scratch}")
     connection.execute(f"DROP TABLE {scratch}")
+    _restore_sequence(connection, table, high_water)
+
+
+def _sequence_value(connection: sqlite3.Connection, table: str) -> int | None:
+    """This table's `AUTOINCREMENT` high-water mark, or None if it has none."""
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+    ).fetchone()
+    if exists is None:
+        return None
+    row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)
+    ).fetchone()
+    return None if row is None else int(row["seq"])
+
+
+def _restore_sequence(connection: sqlite3.Connection, table: str, high_water: int | None) -> None:
+    """Carry an `AUTOINCREMENT` high-water mark across a rebuild.
+
+    Dropping the old table drops its `sqlite_sequence` row, and copying rows
+    with explicit ids only re-establishes `max(id)` of what survived. Where the
+    highest rows had been deleted, that regresses the mark and the next insert
+    reuses an id — which `AUTOINCREMENT` exists precisely to prevent, and which
+    would let a checkpoint key like `event:{id}:assign` match a decision made
+    for a different event.
+    """
+
+    if high_water is None:
+        return
+    row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)
+    ).fetchone()
+    if row is None:
+        connection.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (table, high_water)
+        )
+    elif int(row["seq"]) < high_water:
+        connection.execute(
+            "UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (high_water, table)
+        )
 
 
 @contextmanager

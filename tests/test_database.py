@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 
+import agent_hub.database as database_module
 import httpx
 import pytest
 from agent_hub import create_app
@@ -596,3 +597,95 @@ def test_the_rebuild_leaves_foreign_keys_intact(tmp_path: Path) -> None:
         connection.execute("DELETE FROM workflow WHERE id = 'wf'")
         assert connection.execute("SELECT COUNT(*) AS n FROM task").fetchone()["n"] == 0
         assert connection.execute("SELECT COUNT(*) AS n FROM message").fetchone()["n"] == 0
+
+
+def test_a_failed_rebuild_rolls_back_the_rename_create_and_copy_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rebuild is one transaction, including the DDL.
+
+    Python's legacy mode opens a transaction only before DML, and `with
+    connection` issues no BEGIN, so without an explicit one the rename and the
+    CREATE commit on their own. A failing copy then rolls back only the copy,
+    leaving the canonical table empty and the rows stranded in the scratch
+    table — and because the shape is now right, the retry skips the table and
+    stamps the version over the loss.
+    """
+
+    path = tmp_path / "v1.db"
+    fresh = tmp_path / "fresh.db"
+    initialize_database(fresh)
+    _legacy_database(path, 1)
+    _populate(path, 1)
+
+    real_rebuild = database_module._rebuild_table
+
+    def failing_rebuild(connection: sqlite3.Connection, table: str, create_sql: str) -> None:
+        real_rebuild(connection, table, create_sql)
+        raise sqlite3.OperationalError("simulated copy failure")
+
+    monkeypatch.setattr(database_module, "_rebuild_table", failing_rebuild)
+    with pytest.raises(sqlite3.OperationalError, match="simulated copy failure"):
+        initialize_database(path)
+
+    # The ALTER steps before the rebuild are idempotent and commit on their own,
+    # by design; what must be all-or-nothing is the rebuild. So the drifted
+    # tables still hold their appended-order shape, their rows are all there,
+    # no scratch table is left behind, and the version still says v1 — under the
+    # bug `agent` would instead be canonical, empty, and its row stranded.
+    assert _schema_objects(path) != _schema_objects(fresh)
+    with database(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            for table in ("agent", "task", "event", "decision")
+        }
+        leftovers = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE '%__rebuilding'"
+        ).fetchall()
+    assert counts == dict.fromkeys(counts, 1)
+    assert leftovers == []
+
+    # And the retry, with nothing stranded, completes the migration.
+    monkeypatch.undo()
+    initialize_database(path)
+
+    assert _schema_objects(path) == _schema_objects(fresh)
+    store = HubStore(path)
+    agent = store.agent_by_name("bob")
+    assert agent is not None and agent.capabilities == ["python"]
+
+
+@pytest.mark.parametrize("version", SHIPPED_VERSIONS)
+def test_the_rebuild_keeps_the_autoincrement_high_water_mark(
+    tmp_path: Path, version: int
+) -> None:
+    """Deleting the highest rows before migrating must not let ids be reused.
+
+    Dropping the old table drops its `sqlite_sequence` row, and copying rows
+    with explicit ids only re-establishes `max(id)` of the survivors. A reused
+    event id would let a checkpoint key like `event:{id}:assign` match the
+    decision Alice recorded for a different event, and she would skip the
+    action she was replaying instead of performing it.
+    """
+
+    path = tmp_path / f"v{version}.db"
+    _legacy_database(path, version)
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO event (kind, payload_json, ts) VALUES ('task_progress', '{}', 't')",
+            [()] * 100,
+        )
+        connection.executemany(
+            "INSERT INTO decision (ts, summary, rationale) VALUES ('t', 's', 'r')",
+            [()] * 100,
+        )
+        # The tail is gone, so `max(id)` no longer tells the whole story.
+        connection.execute("DELETE FROM event WHERE id > 10")
+        connection.execute("DELETE FROM decision WHERE id > 10")
+
+    initialize_database(path)
+
+    store = HubStore(path)
+    assert store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"}).id == 101
+    assert store.log_decision("After", "the rebuild", key="k-1") == 101
