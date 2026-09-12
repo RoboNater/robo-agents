@@ -329,6 +329,17 @@ def test_mock_alice_main_cli_parses_arguments(
     assert called is True
 
 
+def test_endurance_cli_requires_a_telemetry_log(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["mock-alice.py", "--endurance"])
+
+    with pytest.raises(SystemExit, match="2"):
+        mock_alice.main()
+
+    assert "--telemetry-log is required for an endurance run" in capsys.readouterr().err
+
+
 async def test_mock_alice_agent_already_checked_in_event_consumed(tmp_path: Path) -> None:
     db_path = tmp_path / "already_checked_in.db"
     initialize_database(db_path)

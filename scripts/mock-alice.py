@@ -280,8 +280,10 @@ async def drive_endurance(
             )
         elif cycle == 1:
             action = (
-                f"Use a shell sleep to wait at least {long_work_s} seconds without calling any "
-                "hub MCP tool. The worker-mcp timer must keep you alive in the background."
+                f"Run exactly `sleep {long_work_s}` as one foreground shell command, setting the "
+                "shell-tool timeout higher than the sleep duration. Do not background it and do "
+                "not use a polling loop. Call no hub MCP tool until it finishes; the worker-mcp "
+                "timer must keep you alive independently."
             )
         else:
             action = "Complete this cycle immediately."
@@ -898,11 +900,17 @@ def main() -> None:
                 parser.error("--cycles must be at least 3")
             if args.min_elapsed_s < 1800:
                 parser.error("--min-elapsed-s must be at least 1800 for an endurance run")
+            if args.telemetry_log is None:
+                parser.error("--telemetry-log is required for an endurance run")
+            if not args.telemetry_log.is_absolute():
+                parser.error("--telemetry-log must be an absolute path")
             db_path = Path(args.db).resolve()
             initialize_database(db_path)
             store = HubStore(db_path)
             lost_after_s = HubSettings.from_env().lost_after_s
-            long_work_s = args.long_work_s or lost_after_s + 30.0
+            long_work_s = (
+                lost_after_s + 30.0 if args.long_work_s is None else args.long_work_s
+            )
             result = asyncio.run(
                 drive_endurance(
                     store,
