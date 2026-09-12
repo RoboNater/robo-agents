@@ -5,7 +5,6 @@ import httpx
 import pytest
 from agent_hub import create_app
 from agent_hub.database import (
-    PROFILE_COLUMNS,
     SCHEMA_VERSION,
     DatabaseVersionError,
     database,
@@ -47,106 +46,81 @@ def test_initialization_rejects_unknown_schema_version(tmp_path: Path) -> None:
         initialize_database(path)
 
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+SHIPPED_VERSIONS = sorted(
+    int(path.stem.removeprefix("schema_v")) for path in FIXTURES.glob("schema_v*.sql")
+)
+
+
 def _legacy_database(path: Path, version: int) -> None:
-    """Write a Step 1 (v1), Step 4 (v2, with runtime), or main (v3, with profile) schema."""
+    """Recreate a database exactly as the commit that shipped v`version` wrote it.
 
-    if version == 1:
-        extra_columns = ""
-    elif version == 2:
-        extra_columns = ",\n                runtime TEXT"
-    elif version in (3, 4):
-        extra_columns = "".join(
-            f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
-        )
-    elif version == 5:
-        extra_columns = "".join(
-            f",\n                {name} {spec}" for name, spec in PROFILE_COLUMNS.items()
-        ) + ",\n                worker_instance_id TEXT NOT NULL DEFAULT ''," \
-            "\n                last_heartbeat TEXT NOT NULL DEFAULT ''," \
-            "\n                last_progress_at TEXT"
-    else:
-        raise ValueError(f"unsupported legacy version {version}")
+    The dumps come from `scripts/dump-schema.py`, not from memory: a fixture
+    that describes history by hand drifts from it silently, which is how a
+    missing `idx_event_inbox` let #49's `DROP COLUMN consumed` pass CI and then
+    fail on every live hub.
+    """
 
+    fixture = FIXTURES / f"schema_v{version}.sql"
+    if not fixture.exists():
+        raise ValueError(f"no schema dump for legacy version {version}")
     with sqlite3.connect(path) as connection:
-        operation_table = """
-            CREATE TABLE operation (
-                actor TEXT NOT NULL,
-                operation_id TEXT NOT NULL,
-                payload_hash TEXT NOT NULL,
-                response_json TEXT NOT NULL,
-                created TEXT NOT NULL,
-                PRIMARY KEY (actor, operation_id)
-            );
-        """ if version in (4, 5) else ""
-        task_lease_duration = (
-            ",\n                lease_duration_s REAL NOT NULL DEFAULT 1800"
-            if version == 5
-            else ""
-        )
-        connection.executescript(f"""
-            CREATE TABLE workflow (
-                id TEXT PRIMARY KEY,
-                goal TEXT NOT NULL,
-                status TEXT NOT NULL,
-                policy_json TEXT NOT NULL DEFAULT '{{}}',
-                created TEXT NOT NULL
-            );
-            CREATE TABLE agent (
-                name TEXT PRIMARY KEY,
-                capabilities_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL,
-                context_id TEXT UNIQUE,
-                last_seen TEXT NOT NULL,
-                current_task_id TEXT{extra_columns}
-            );
-            CREATE TABLE task (
-                id TEXT PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                assignee TEXT,
-                role TEXT NOT NULL,
-                title TEXT NOT NULL,
-                instructions TEXT NOT NULL,
-                state TEXT NOT NULL,
-                lease_expires TEXT,
-                result_json TEXT,
-                created TEXT NOT NULL,
-                updated TEXT NOT NULL{task_lease_duration}
-            );
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT,
-                context_id TEXT NOT NULL,
-                sender TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                parts_json TEXT NOT NULL,
-                ts TEXT NOT NULL
-            );
-            CREATE TABLE event (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0, 1)),
-                ts TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_event_inbox ON event(consumed, id);
-            CREATE TABLE decision (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                rationale TEXT NOT NULL
-            );
-            {operation_table}
-            PRAGMA user_version = {version};
-        """)
+        connection.executescript(fixture.read_text())
 
 
-def _v6_database(path: Path) -> None:
-    """A database as the merged #25 left it: today's schema without `pr_head_sha`."""
+def _clauses(sql: str) -> frozenset[str]:
+    """The comma-separated clauses of a `CREATE TABLE` body, as a set.
 
-    initialize_database(path)
+    Depth-aware, so the commas inside a `CHECK (x IN ('a', 'b'))` stay put.
+    """
+
+    body = sql[sql.index("(") + 1 : sql.rindex(")")]
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for char in body:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return frozenset(
+        # A column-level UNIQUE is unreachable by `ALTER TABLE ADD COLUMN`, so
+        # `decision.key` carries it only where the table was created fresh. The
+        # partial `idx_decision_key` is what both routes enforce, and indexes
+        # are compared below, so the keyword itself is not a difference.
+        " ".join(part.replace(" UNIQUE", "").split())
+        for part in parts
+        if part.strip()
+    )
+
+
+def _schema_objects(path: Path) -> dict[str, object]:
+    """Every named schema object, normalised so only real differences show.
+
+    Tables compare as an unordered set of clauses because `ALTER TABLE ADD
+    COLUMN` appends: a migrated `event` carries `ts` in the middle and a fresh
+    one carries it last, and nothing reads a column by position. Everything
+    that a migration *can* get wrong — a missing column, a changed type or
+    default, a dropped CHECK, a stale or absent index — still shows up.
+    """
+
     with database(path) as connection:
-        connection.execute("ALTER TABLE task DROP COLUMN pr_head_sha")
-        connection.execute("PRAGMA user_version = 6")
+        rows = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master"
+            " WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    return {
+        row["name"]: _clauses(row["sql"])
+        if row["type"] == "table"
+        else " ".join(row["sql"].split())
+        for row in rows
+    }
 
 
 def _table_columns(path: Path, table: str) -> dict[str, tuple[str, int, str | None]]:
@@ -212,61 +186,7 @@ def test_migration_from_v2_carries_the_runtime_over_as_the_harness(tmp_path: Pat
 
 def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     path = tmp_path / "v2_hub.db"
-    with sqlite3.connect(path) as connection:
-        connection.executescript("""
-            CREATE TABLE workflow (
-                id TEXT PRIMARY KEY,
-                goal TEXT NOT NULL,
-                status TEXT NOT NULL,
-                policy_json TEXT NOT NULL DEFAULT '{}',
-                created TEXT NOT NULL
-            );
-            CREATE TABLE agent (
-                name TEXT PRIMARY KEY,
-                capabilities_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL,
-                context_id TEXT UNIQUE,
-                last_seen TEXT NOT NULL,
-                current_task_id TEXT,
-                runtime TEXT
-            );
-            CREATE TABLE task (
-                id TEXT PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                assignee TEXT,
-                role TEXT NOT NULL,
-                title TEXT NOT NULL,
-                instructions TEXT NOT NULL,
-                state TEXT NOT NULL,
-                lease_expires TEXT,
-                result_json TEXT,
-                created TEXT NOT NULL,
-                updated TEXT NOT NULL
-            );
-            CREATE TABLE message (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id TEXT,
-                context_id TEXT NOT NULL,
-                sender TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                parts_json TEXT NOT NULL,
-                ts TEXT NOT NULL
-            );
-            CREATE TABLE event (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0,
-                ts TEXT NOT NULL
-            );
-            CREATE TABLE decision (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                rationale TEXT NOT NULL
-            );
-            PRAGMA user_version = 2;
-        """)
+    _legacy_database(path, version=2)
 
     initialize_database(path)
 
@@ -290,8 +210,16 @@ def test_migration_from_v2_adds_operation_table(tmp_path: Path) -> None:
     assert row["created"] == "2026-09-07T00:00:00Z"
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
-def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) -> None:
+@pytest.mark.parametrize("version", SHIPPED_VERSIONS)
+def test_migrating_a_shipped_schema_reproduces_a_fresh_one(tmp_path: Path, version: int) -> None:
+    """Both routes to v{SCHEMA_VERSION} must end at the same schema.
+
+    Comparing every object, not a chosen few columns, is what catches a
+    migration and the `SCHEMA` constant disagreeing — a table that exists two
+    different ways depending on how you got there, including an index the
+    migration forgot to rebuild.
+    """
+
     fresh = tmp_path / "fresh.db"
     migrated = tmp_path / f"v{version}.db"
     initialize_database(fresh)
@@ -299,10 +227,21 @@ def test_migrated_agent_table_matches_a_fresh_one(tmp_path: Path, version: int) 
 
     initialize_database(migrated)
 
+    assert _schema_objects(migrated) == _schema_objects(fresh)
     assert _agent_columns(migrated) == _agent_columns(fresh)
     assert _table_columns(migrated, "task") == _table_columns(fresh, "task")
     assert _table_columns(migrated, "operation") == _table_columns(fresh, "operation")
     assert _table_columns(migrated, "event") == _table_columns(fresh, "event")
+
+
+def test_every_shipped_version_has_a_schema_dump() -> None:
+    """Bumping `SCHEMA_VERSION` includes dumping the version it replaces (#54).
+
+    Without the outgoing dump, the next migration is only ever tested against
+    schemas it was not written for.
+    """
+
+    assert list(range(1, SCHEMA_VERSION)) == SHIPPED_VERSIONS
 
 
 def test_migration_from_v6_leaves_existing_tasks_unbound(tmp_path: Path) -> None:
@@ -311,7 +250,7 @@ def test_migration_from_v6_leaves_existing_tasks_unbound(tmp_path: Path) -> None
     path = tmp_path / "v6_hub.db"
     fresh = tmp_path / "fresh.db"
     initialize_database(fresh)
-    _v6_database(path)
+    _legacy_database(path, 6)
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO workflow (id, goal, status, created)"

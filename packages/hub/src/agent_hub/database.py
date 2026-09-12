@@ -19,6 +19,10 @@ from agent_hub_common import (
 )
 
 # v7 is #27/#41's `task.pr_head_sha`, after #24's v5 and #25's v6.
+# Bumping this means first dumping the version it replaces:
+# `uv run python scripts/dump-schema.py` writes tests/fixtures/schema_v<N>.sql,
+# which is what the migration tests replay instead of a fixture written from
+# memory (#54).
 SCHEMA_VERSION = 7
 
 
