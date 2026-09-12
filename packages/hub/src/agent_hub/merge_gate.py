@@ -56,6 +56,14 @@ class CiStatus(StrEnum):
     NO_WORKFLOWS = "no_workflows"
 
 
+class PrState(StrEnum):
+    """Whether the PR is still open, and so still mergeable at all."""
+
+    OPEN = "open"
+    MERGED = "merged"
+    CLOSED = "closed"
+
+
 class Mergeable(StrEnum):
     """Whether the PR's head merges into its base without textual conflicts."""
 
@@ -152,6 +160,7 @@ class GateReport:
     """What the gate saw. Merge only when the §5 MERGE invariant holds on it."""
 
     pr_url: str
+    pr_state: PrState
     expected_head_sha: str
     current_head_sha: str
     head_matches: bool
@@ -188,6 +197,14 @@ def classify_checks(checks: Sequence[Check]) -> CiStatus | None:
     return CiStatus.PENDING
 
 
+def _pr_state(state: str) -> PrState:
+    """Map GitHub's PR state; anything unrecognised is treated as closed."""
+
+    if state == "OPEN":
+        return PrState.OPEN
+    return PrState.MERGED if state == "MERGED" else PrState.CLOSED
+
+
 def _mergeable(mergeable: str, merge_state_status: str) -> Mergeable:
     if mergeable == "CONFLICTING" or merge_state_status == "DIRTY":
         return Mergeable.CONFLICTING
@@ -200,7 +217,8 @@ def _settled(report: GateReport) -> bool:
     """True when waiting cannot change whether the gate passes."""
 
     if (
-        not report.head_matches
+        report.pr_state is not PrState.OPEN
+        or not report.head_matches
         or report.base_behind_main
         or report.mergeable is Mergeable.CONFLICTING
     ):
@@ -224,8 +242,8 @@ class MergeGate:
         While CI is pending, cancelled or not yet reported, or GitHub has not
         finished computing mergeability, the gate re-reads everything every
         `poll_interval_s` for up to `poll_timeout_s`. It returns at once when
-        the answer cannot improve by waiting: the head has moved, the base is
-        behind, or the PR conflicts.
+        the answer cannot improve by waiting: the PR is no longer open, the
+        head has moved, the base is behind, or the PR conflicts.
         """
 
         if not SHA_HEX_40_RE.fullmatch(expected_head_sha):
@@ -248,7 +266,7 @@ class MergeGate:
                 "view",
                 ref.url,
                 "--json",
-                "headRefOid,baseRefName,mergeable,mergeStateStatus",
+                "state,headRefOid,baseRefName,mergeable,mergeStateStatus",
             ]
         )
         head = _string(view, "headRefOid").lower()
@@ -276,6 +294,7 @@ class MergeGate:
             raise MergeGateError("gh api compare did not report behind_by")
         return GateReport(
             pr_url=ref.url,
+            pr_state=_pr_state(_string(view, "state")),
             expected_head_sha=expected,
             current_head_sha=head,
             head_matches=head == expected,

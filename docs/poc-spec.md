@@ -169,7 +169,7 @@ not an answer to resume work.
 | `release_agent` | `agent` | next `NEXT` from that worker returns release |
 | `set_workflow_status` | `status, summary` | `active/paused/done/escalated` |
 | `log_decision` | `summary, rationale, key=None` | audit trail; optional unique `key` for deduplication |
-| `check_merge_gate` | `pr_url, expected_head_sha` | reads the PR from GitHub and returns `{ current_head_sha, head_matches, ci, checks[], base_ref, base_sha, main_sha, base_behind_main, mergeable, merge_state_status, elapsed_s }` (below). Facts only: what to do with them is the §5 skill's policy |
+| `check_merge_gate` | `pr_url, expected_head_sha` | reads the PR from GitHub and returns `{ pr_state, current_head_sha, head_matches, ci, checks[], base_ref, base_sha, main_sha, base_behind_main, mergeable, merge_state_status, elapsed_s }` (below). Facts only: what to do with them is the §5 skill's policy |
 
 **State guards & mutation idempotency.** Because redelivery can cause Alice to retry actions after a crash:
 - `assign_task`: raises HTTP 409 conflict if worker is already busy or already holds an active task.
@@ -181,11 +181,12 @@ not an answer to resume work.
 No `ask_user` tool: Alice ends her turn with a question; events queue in SQLite until she resumes.
 
 **`check_merge_gate`** does in code the reading §5 used to ask Alice to do by hand, over `gh` (run with stdin closed and stdout captured, so it cannot disturb MCP framing):
+- `pr_state`: `open`, `merged` or `closed`, from `gh pr view --json state`. A PR that is not open cannot be merged, and `merged` is how Alice recognises work that already landed — a redelivered `task_completed` after a merge, say (#50).
 - `current_head_sha`, `head_matches`: the PR's head from `gh pr view --json headRefOid`, compared case-insensitively with `expected_head_sha`.
 - `ci`: from `gh pr checks --json name,bucket,link`, whose exit code is not relied on. Any `fail` bucket → `fail`. Otherwise any `cancel` → `cancelled`. Otherwise every check `pass` or `skipping` → `pass`. Anything else → `pending`. With no checks reported, `gh api repos/{owner}/{repo}/actions/workflows` tells `no_checks` (`total_count > 0`: the run has not been created yet) from `no_workflows` (`total_count == 0`: the repository has no CI). The raw checks are returned in `checks[]`.
 - `base_behind_main`, `base_sha`, `main_sha`: from `gh api repos/{owner}/{repo}/compare/<base_ref>...<head>`. `base_sha` is the merge base, `main_sha` the base branch's current tip, and the base is behind when `behind_by > 0`, that is when the base branch has commits the PR has never been tested or reviewed with. `base_ref` is the PR's base branch (`main` in this workflow).
 - `mergeable`: `conflicting` when `gh pr view --json mergeable,mergeStateStatus` reports `CONFLICTING` or `DIRTY`, `clean` for `MERGEABLE`, otherwise `unknown` (GitHub computes mergeability lazily). `merge_state_status` is passed through.
-- **Bounded polling.** While `ci` is `pending`, `cancelled` or `no_checks`, or `mergeable` is `unknown`, the tool re-reads everything every 10 s (the `--watch` default interval) for up to 60 s and returns the last reading. It returns at once when waiting cannot change the outcome: the head does not match, the base is behind, the PR conflicts, or `ci` is `pass`, `fail` or `no_workflows` with mergeability known. `elapsed_s` says how long the call took.
+- **Bounded polling.** While `ci` is `pending`, `cancelled` or `no_checks`, or `mergeable` is `unknown`, the tool re-reads everything every 10 s (the `--watch` default interval) for up to 60 s and returns the last reading. It returns at once when waiting cannot change the outcome: the PR is not open, the head does not match, the base is behind, the PR conflicts, or `ci` is `pass`, `fail` or `no_workflows` with mergeability known. `elapsed_s` says how long the call took.
 - A `gh` failure (not authenticated, PR not found, rate-limited) is a tool error, never a report. An unreadable gate is not permission to merge.
 
 No `merge` tool: Alice merges with `gh pr merge` herself (her session is a normal Claude Code session with shell access), immediately after `check_merge_gate` shows the §5 invariant holding. Hub also serves `GET /guides/{role}.md` (static files from `guides/`, located by `HUB_GUIDES_DIR` and never relative to the working directory), **authenticated with the same bearer token** as §4.1: the guides carry no secrets, but they are only ever fetched by workers that already hold a token, so requiring it costs nothing and keeps the public surface to discovery and health alone. `{role}` is a role slug (`[a-z][a-z0-9-]*`) and never a path; an unwritten guide, an unknown role and a missing guides directory are all `404`, so the route works before Step 5 supplies the content.
@@ -257,9 +258,10 @@ Task results are structured, versioned payloads validated against Pydantic model
    - `mergeable == unknown` is not a trigger: GitHub is still computing it, so call the gate again. If the base moves again during a rebase, the next gate reading says so and REBASE repeats. Each rebase goes in `log_decision`.
 6. **MERGE** — immediately before merging, Alice calls `check_merge_gate(pr_url, <approved head>)`. Earlier readings are advisory. She merges only when the invariant holds on that reading:
 
-   `verdict == approved ∧ head_matches ∧ (ci == pass ∨ (ci == no_workflows ∧ allow_no_ci)) ∧ base_behind_main == false ∧ mergeable == clean ∧ policy permits`
+   `verdict == approved ∧ pr_state == open ∧ head_matches ∧ (ci == pass ∨ (ci == no_workflows ∧ allow_no_ci)) ∧ base_behind_main == false ∧ mergeable == clean ∧ policy permits`
 
    Then she runs `gh pr merge <pr_url> --<merge_method> --delete-branch --match-head-commit <approved head>` and calls `log_decision` with the reviewed SHA, any rebase head, the merged SHA, the review URL and each check's name and bucket. When the invariant does not hold, the reading picks the next step:
+   - `pr_state == merged` → the merge already landed: this is a repeat of work that finished, such as a redelivered event after a crash (#50). Do not merge again; check the merged commit against the approved head, `log_decision`, and carry on to WRAP-UP. `pr_state == closed` → escalate, since something outside the workflow closed the PR.
    - `head_matches == false` → RE-REVIEW at `current_head_sha`, whatever the size of the diff. A `--match-head-commit` refusal at merge time (the head moved after the gate read it) is the same safe failure → RE-REVIEW.
    - `base_behind_main` or `mergeable == conflicting` → REBASE.
    - `mergeable == unknown` → pending: call the gate again.

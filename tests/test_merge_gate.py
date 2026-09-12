@@ -15,6 +15,7 @@ from agent_hub.merge_gate import (
     Mergeable,
     MergeGate,
     MergeGateError,
+    PrState,
     PullRequestRef,
     classify_checks,
     run_gh,
@@ -29,9 +30,14 @@ OLD_MAIN = "3333333333333333333333333333333333333333"
 
 
 def view(
-    head: str = HEAD, mergeable: str = "MERGEABLE", state: str = "CLEAN", base: str = "main"
+    head: str = HEAD,
+    mergeable: str = "MERGEABLE",
+    state: str = "CLEAN",
+    base: str = "main",
+    pr_state: str = "OPEN",
 ) -> GhResult:
     body = {
+        "state": pr_state,
         "headRefOid": head,
         "baseRefName": base,
         "mergeable": mergeable,
@@ -260,6 +266,34 @@ async def test_a_superseding_run_replaces_a_cancelled_one() -> None:
     assert [c.bucket for c in report.checks] == ["pass"]
 
 
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [("MERGED", PrState.MERGED), ("CLOSED", PrState.CLOSED), ("LOCKED", PrState.CLOSED)],
+)
+async def test_a_pr_that_is_no_longer_open_is_reported_without_waiting(
+    reported: str, expected: PrState
+) -> None:
+    """A merged PR answers a redelivered MERGE event: do not merge it twice (#50).
+
+    GitHub also leaves `mergeable` UNKNOWN on such a PR forever, so waiting on
+    it would burn the whole polling window for nothing.
+    """
+
+    gh = FakeGh(view=view(mergeable="UNKNOWN", state="UNKNOWN", pr_state=reported))
+    merge_gate, clock = gate(gh)
+
+    report = await merge_gate.check(PR, HEAD)
+
+    assert report.pr_state is expected
+    assert clock.now == 0
+
+
+async def test_an_open_pr_is_reported_as_open() -> None:
+    report = await gate(FakeGh())[0].check(PR, HEAD)
+
+    assert report.pr_state is PrState.OPEN
+
+
 async def test_a_head_that_moved_after_approval_fails_without_waiting() -> None:
     gh = FakeGh(view=view(head=PUSHED), checks=checks("pending"))
     merge_gate, clock = gate(gh)
@@ -334,7 +368,7 @@ async def test_gh_is_called_with_the_pr_url_and_a_bounded_compare() -> None:
         "view",
         PR,
         "--json",
-        "headRefOid,baseRefName,mergeable,mergeStateStatus",
+        "state,headRefOid,baseRefName,mergeable,mergeStateStatus",
     ]
     assert gh.calls[1] == ["pr", "checks", PR, "--json", "name,bucket,link"]
     assert gh.calls[2][:3] == [
@@ -479,6 +513,7 @@ async def test_the_mcp_tool_reports_the_gate_as_plain_json(tmp_path: Path) -> No
     assert report["ci"] == "pass"
     assert report["mergeable"] == "clean"
     assert report["base_behind_main"] is True
+    assert report["pr_state"] == "open"
     assert report["checks"] == [{"name": "check-0", "bucket": "pass", "link": "https://ci.example/0"}]
     with pytest.raises(Exception, match="validation error"):
         await server.call_tool("check_merge_gate", {"pr_url": PR, "expected_head_sha": "abc"})
