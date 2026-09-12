@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -112,7 +113,7 @@ def test_event_redelivery_after_lease_expiry(tmp_path: Path) -> None:
     assert store.lease_next_event() is None
 
 
-def test_ack_wrong_or_expired_delivery_id(tmp_path: Path) -> None:
+def test_ack_with_a_wrong_delivery_id_is_ignored(tmp_path: Path) -> None:
     db_path = tmp_path / "hub.db"
     initialize_database(db_path)
     now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -121,28 +122,68 @@ def test_ack_wrong_or_expired_delivery_id(tmp_path: Path) -> None:
     store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"})
     leased = store.lease_next_event(lease_s=5.0)
     assert leased is not None
-    delivery_id = leased.delivery_id
 
-    # Ack with wrong id is ignored
     assert store.ack_event("bogus-delivery-id") is False
     with database(db_path) as conn:
         row = conn.execute("SELECT * FROM event WHERE id = ?", (leased.id,)).fetchone()
         assert row["state"] == "delivered"
 
-    # Advance clock past lease expiry
+    assert store.ack_event(leased.delivery_id) is True
+
+
+def test_a_late_ack_still_acks_an_event_nobody_re_leased(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#50: the delivery_id proves the caller holds the latest delivery.
+
+    An action can outlive its lease — the §5 MERGE window waits on CI — and
+    redoing it afterwards is worse than acking late.
+    """
+
+    db_path = tmp_path / "hub.db"
+    initialize_database(db_path)
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    store = HubStore(db_path, clock=lambda: now)
+
+    store.append_event(EventKind.TASK_COMPLETED, {"agent": "bob"})
+    leased = store.lease_next_event(lease_s=5.0)
+    assert leased is not None
     now += timedelta(seconds=6.0)
 
-    # Ack with expired delivery_id is ignored
-    assert store.ack_event(delivery_id) is False
+    with caplog.at_level(logging.WARNING, logger="agent_hub.store"):
+        assert store.ack_event(leased.delivery_id) is True
+
+    with database(db_path) as conn:
+        row = conn.execute("SELECT * FROM event WHERE id = ?", (leased.id,)).fetchone()
+        assert row["state"] == "acked"
+    # No redelivery: the work was finished, just slowly.
+    assert store.lease_next_event() is None
+    assert "Late ack" in caplog.text and "1.0 s past" in caplog.text
+
+
+def test_an_ack_from_a_superseded_delivery_is_still_ignored(tmp_path: Path) -> None:
+    """A re-lease rotates delivery_id, so the stale holder cannot ack the new one."""
+
+    db_path = tmp_path / "hub.db"
+    initialize_database(db_path)
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    store = HubStore(db_path, clock=lambda: now)
+
+    store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"})
+    leased = store.lease_next_event(lease_s=5.0)
+    assert leased is not None
+    now += timedelta(seconds=6.0)
+    re_leased = store.lease_next_event(lease_s=5.0)
+    assert re_leased is not None
+    assert re_leased.delivery_attempts == 2
+    assert re_leased.delivery_id != leased.delivery_id
+
+    assert store.ack_event(leased.delivery_id) is False
     with database(db_path) as conn:
         row = conn.execute("SELECT * FROM event WHERE id = ?", (leased.id,)).fetchone()
         assert row["state"] == "delivered"
 
-    # Redelivery succeeds and generates fresh delivery_id
-    re_leased = store.lease_next_event(lease_s=5.0)
-    assert re_leased is not None
-    assert re_leased.delivery_attempts == 2
-    assert re_leased.delivery_id != delivery_id
+    # The current delivery is still the one that can ack it.
     assert store.ack_event(re_leased.delivery_id) is True
 
 

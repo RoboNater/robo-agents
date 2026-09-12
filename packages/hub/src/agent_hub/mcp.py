@@ -39,7 +39,12 @@ def create_mcp(store: HubStore, gate: MergeGate | None = None) -> FastMCP:
     async def wait_for_event(
         timeout_s: Timeout = 120, ack: str | None = None
     ) -> dict[str, Any]:
-        """Wait for and lease the oldest event. On event=null, call again."""
+        """Wait for and lease the oldest event. On event=null, call again.
+
+        ack: the delivery_id of the event just handled. It still acks after
+        the delivery lease has expired, so a long action — merging, say — is
+        not redone once it has finished.
+        """
         event = await store.wait_for_event(timeout_s=timeout_s, ack=ack)
         return {"event": None if event is None else asdict(event)}
 

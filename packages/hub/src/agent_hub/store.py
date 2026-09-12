@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
@@ -43,6 +44,8 @@ from agent_hub_common import (
 
 from .database import database
 from .signals import EVENT_KEY, Signals, context_key, task_key
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_GOAL = "Drive the assigned GitHub issue to a merged pull request."
 DEFAULT_LEASE_MIN = 30.0
@@ -1266,24 +1269,44 @@ class HubStore:
         return event
 
     def ack_event(self, delivery_id: str | None) -> bool:
-        """Acknowledge an active event delivery. Wrong or expired delivery_id is ignored."""
+        """Acknowledge an event delivery; an unknown or superseded id is ignored.
+
+        A matching `delivery_id` is itself the proof that the caller holds the
+        newest delivery, because every lease mints a new one. So the ack counts
+        even after the delivery lease has expired (#50): an action that outlives
+        `HUB_EVENT_LEASE_S` — the §5 MERGE window, where the gate waits on CI
+        and `gh pr merge` follows, is the long one — would otherwise be
+        redelivered and redone after it had already completed. A late ack is
+        logged, so a lease that is chronically too short stays visible.
+        """
 
         if not delivery_id:
             return False
-        now = self._now_iso()
+        now_moment = self._now()
+        now = to_iso(now_moment)
         with database(self.path) as connection:
-            cursor = connection.execute(
-                """
-                UPDATE event
-                SET state = 'acked',
-                    acked_at = ?
-                WHERE delivery_id = ?
-                  AND state = 'delivered'
-                  AND delivery_expires > ?
-                """,
-                (now, delivery_id, now),
+            row = connection.execute(
+                "SELECT id, delivery_expires, delivery_attempts FROM event"
+                " WHERE delivery_id = ? AND state = 'delivered'",
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE event SET state = 'acked', acked_at = ? WHERE delivery_id = ?"
+                " AND state = 'delivered'",
+                (now, delivery_id),
             )
-            return cursor.rowcount > 0
+        expires = row["delivery_expires"]
+        if expires is not None and expires <= now:
+            logger.warning(
+                "Late ack for event %s: %.1f s past its delivery lease, attempt %s. "
+                "Raise HUB_EVENT_LEASE_S if this repeats.",
+                row["id"],
+                (now_moment - _parse_timestamp(expires)).total_seconds(),
+                row["delivery_attempts"],
+            )
+        return True
 
     def lease_next_event(self, lease_s: float | None = None) -> EventRecord | None:
         """Lease the oldest queued or expired-delivered event, returning it with delivery_id."""
