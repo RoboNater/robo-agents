@@ -11,7 +11,7 @@ import httpx
 import pytest
 from agent_hub.database import database, initialize_database
 from agent_hub.mcp import create_mcp
-from agent_hub.store import ConflictError, HubStore
+from agent_hub.store import ConflictError, EventRecord, HubStore
 from agent_hub_common import (
     AgentProfile,
     AgentStatus,
@@ -83,7 +83,7 @@ def timed_store(settings: HubSettings, clock: FakeClock) -> HubStore:
 
 
 @pytest.fixture
-def worker(settings: HubSettings) -> WorkerSettings:
+def worker() -> WorkerSettings:
     return WorkerSettings(
         hub_url=BASE_URL,
         token=TOKEN,
@@ -543,7 +543,7 @@ def _drain(store: HubStore) -> None:
         assert store.ack_event(event.delivery_id) is True
 
 
-def _alice_acts(store: HubStore, event: Any) -> None:
+def _alice_acts(store: HubStore, event: EventRecord) -> None:
     """The mutation §5 has Alice make for this event kind.
 
     Deliberately without Alice's own recovery discipline — no reading

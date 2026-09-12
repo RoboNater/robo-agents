@@ -41,7 +41,17 @@ Verbatim what CI runs, in order. `--locked` fails instead of silently
 relocking, so an error there means `pyproject.toml` and `uv.lock` disagree —
 resolve that with uv, never by hand-editing the lockfile.
 
+Green CI is not the bar: it only covers what has tests. Before opening a PR,
+also **run every script and entry point the PR touches** at least once — `ruff`
+and `mypy` cannot see a loop whose body never executes — and **re-read each
+edited function in its final form**, not just the diff hunks. If production
+code had to change to make a new test pass, say why in the PR description.
+
 `uv run hub` starts the hub on `http://127.0.0.1:8420`.
+
+Tests that drive the app use conftest's `hub_store`, not `store`: a second
+`HubStore` on one database has its own `Signals`, so writes through one never
+wake a waiter on the other.
 
 ## Invariants
 
@@ -62,7 +72,10 @@ resolve that with uv, never by hand-editing the lockfile.
 ## Changing things
 
 Keep work scoped to the assigned task and report unrelated findings
-separately. Never commit directly to `main`. When explicitly asked to commit or
-open a PR for an issue, reference it with `Closes #N`. Only merge/delete the
-branch or update issue #2 when the task explicitly includes that action; wait
-for CI before merging and use squash merge.
+separately. An issue that changes behaviour names, under Tests, the commands a
+reviewer will run to see it work — not only the properties that must hold — so
+the implementer runs the same thing first. Never commit directly to `main`.
+When explicitly asked to commit or open a PR for an issue, reference it with
+`Closes #N`. Only merge/delete the branch or update issue #2 when the task
+explicitly includes that action; wait for CI before merging and use squash
+merge.
