@@ -27,7 +27,11 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
 
     resolved = settings or HubSettings.from_env()
     card = build_agent_card(resolved.public_url)
-    store = HubStore(path=resolved.database_path, signals=Signals())
+    store = HubStore(
+        path=resolved.database_path,
+        signals=Signals(),
+        default_event_lease_s=resolved.event_lease_s,
+    )
     protocol = A2AProtocol(store=store, settings=resolved)
 
     @asynccontextmanager

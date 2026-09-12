@@ -45,6 +45,12 @@ class EventKind(StrEnum):
     AGENT_LOST = "agent_lost"
 
 
+class EventState(StrEnum):
+    QUEUED = "queued"
+    DELIVERED = "delivered"
+    ACKED = "acked"
+
+
 SCHEMA_VERSION: int = 1
 
 SHA_HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
