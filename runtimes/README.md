@@ -39,3 +39,17 @@ For endurance runs, set `HUB_TELEMETRY_LOG` to an absolute path. `worker-mcp`
 appends JSON Lines records for MCP tool calls and outcomes, errors, HTTP retry
 attempts, and timer heartbeats. Reusing the path across a supervised restart is
 intentional: each process has a distinct `session_id` and `worker_instance_id`.
+
+Claude Code print mode may end a turn while work is still pending. For an
+endurance run, keep one streaming process and its `worker-mcp` child alive with
+the policy-free supervisor (Alice still owns every assignment and decision):
+
+```sh
+CLAUDE_MCP_CONFIG=/absolute/path/claude-code.mcp.json \
+HUB_TELEMETRY_LOG=/absolute/path/endurance-worker.jsonl \
+scripts/supervise-claude-code.sh
+```
+
+The supervisor pre-approves only literal `sleep` commands and the four worker
+coordination tools. It sends a continuation message after a premature
+end-turn, and exits only after telemetry records the hub's release response.
