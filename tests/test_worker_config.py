@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from agent_hub_common import AgentProfile, ConfigurationError, ModelSource
 from worker_mcp.config import WorkerSettings
@@ -35,6 +37,7 @@ def test_worker_settings_custom_overrides() -> None:
         "HUB_HEARTBEAT_S": "12.5",
         "HUB_MAX_RETRIES": "5",
         "HUB_BACKOFF_FACTOR_S": "1.5",
+        "HUB_TELEMETRY_LOG": "/tmp/worker-telemetry.jsonl",
     }
     settings = WorkerSettings.from_env(env)
     assert settings.hub_url == "https://hub.example.com"
@@ -51,6 +54,7 @@ def test_worker_settings_custom_overrides() -> None:
     assert settings.heartbeat_s == 12.5
     assert settings.max_retries == 5
     assert settings.backoff_factor_s == 1.5
+    assert settings.telemetry_log == Path("/tmp/worker-telemetry.jsonl")
 
 
 @pytest.mark.parametrize(
@@ -107,6 +111,15 @@ def test_worker_settings_custom_overrides() -> None:
                 "HUB_MAX_RETRIES": "xyz",
             },
             "must be an integer",
+        ),
+        (
+            {
+                "HUB_URL": "http://hub",
+                "HUB_TOKEN": "tok",
+                "AGENT_NAME": "bob",
+                "HUB_TELEMETRY_LOG": "relative.jsonl",
+            },
+            "must be an absolute path",
         ),
     ],
 )

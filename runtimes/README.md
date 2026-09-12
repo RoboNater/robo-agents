@@ -34,3 +34,8 @@ Before using a template:
    When `HUB_MODEL` is empty the agent may declare its own model through `check_in(model=...)`,
    recorded with `model_source: declared`; a value set here wins and is recorded as `env`.
    `AGENT_RUNTIME`, the Step 4 name for `HUB_HARNESS`, is still honoured when `HUB_HARNESS` is unset.
+
+For endurance runs, set `HUB_TELEMETRY_LOG` to an absolute path. `worker-mcp`
+appends JSON Lines records for MCP tool calls and outcomes, errors, HTTP retry
+attempts, and timer heartbeats. Reusing the path across a supervised restart is
+intentional: each process has a distinct `session_id` and `worker_instance_id`.

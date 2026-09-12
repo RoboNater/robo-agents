@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from collections.abc import Awaitable
+from typing import Annotated, Any, TypeVar
 
 from agent_hub_common import ImplementerResult, RebaseResult, ReviewerResult
 from mcp.server.fastmcp import FastMCP
@@ -11,6 +12,7 @@ from pydantic import Field
 from .client import WorkerHubClient
 
 Timeout = Annotated[float, Field(ge=0, le=300, allow_inf_nan=False)]
+T = TypeVar("T")
 
 
 def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
@@ -23,6 +25,16 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         ),
     )
 
+    async def invoke(tool: str, call: Awaitable[T]) -> T:
+        call_id, started = client.telemetry.start_tool(tool)
+        try:
+            result = await call
+        except BaseException as exc:
+            client.telemetry.finish_tool(tool, call_id, started, error=exc)
+            raise
+        client.telemetry.finish_tool(tool, call_id, started, result=result)
+        return result
+
     @server.tool()
     async def check_in(
         capabilities: list[str] | None = None, model: str | None = None
@@ -34,12 +46,12 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         model: your exact model ID if you know it; ignored when the launcher
         already names the model. Omit rather than guess.
         """
-        return await client.check_in(capabilities, model)
+        return await invoke("check_in", client.check_in(capabilities, model))
 
     @server.tool()
     async def get_role_guide(role: str) -> str:
         """Fetch instructions for the assigned role (e.g. 'implementer', 'reviewer')."""
-        return await client.get_role_guide(role)
+        return await invoke("get_role_guide", client.get_role_guide(role))
 
     @server.tool()
     async def await_assignment(timeout_s: Timeout | None = None) -> dict[str, Any]:
@@ -50,12 +62,12 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         On timeout, call again.
         timeout_s: Optional wait timeout in seconds (defaults to HUB_DEFAULT_WAIT_S if omitted).
         """
-        return await client.await_assignment(timeout_s)
+        return await invoke("await_assignment", client.await_assignment(timeout_s))
 
     @server.tool()
     async def report_progress(task_id: str, note: str) -> dict[str, Any]:
         """Send a non-blocking progress update note to Alice."""
-        return await client.report_progress(task_id, note)
+        return await invoke("report_progress", client.report_progress(task_id, note))
 
     @server.tool()
     async def ask_alice(
@@ -67,7 +79,7 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         On timeout, call ask_alice again to continue waiting; retries resume the pending question.
         timeout_s: Optional wait timeout in seconds (defaults to HUB_DEFAULT_WAIT_S if omitted).
         """
-        return await client.ask_alice(task_id, question, timeout_s)
+        return await invoke("ask_alice", client.ask_alice(task_id, question, timeout_s))
 
     @server.tool()
     async def submit_result(
@@ -77,6 +89,6 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         result: ImplementerResult | ReviewerResult | RebaseResult,
     ) -> dict[str, Any]:
         """Submit the final result for a task, validated against the role's schema."""
-        return await client.submit_result(task_id, result)
+        return await invoke("submit_result", client.submit_result(task_id, result))
 
     return server

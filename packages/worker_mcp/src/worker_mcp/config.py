@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from agent_hub_common import AgentProfile, ConfigurationError, profile_from_env
 
@@ -40,6 +41,16 @@ def _non_negative_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _optional_absolute_path(env: Mapping[str, str], name: str) -> Path | None:
+    raw = env.get(name, "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ConfigurationError(f"{name} must be an absolute path")
+    return path
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerSettings:
     """Settings for the worker MCP client."""
@@ -53,6 +64,7 @@ class WorkerSettings:
     heartbeat_s: float = DEFAULT_HEARTBEAT_S
     max_retries: int = DEFAULT_MAX_RETRIES
     backoff_factor_s: float = DEFAULT_BACKOFF_FACTOR_S
+    telemetry_log: Path | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> WorkerSettings:
@@ -79,6 +91,7 @@ class WorkerSettings:
         heartbeat_s = _positive_seconds(env, "HUB_HEARTBEAT_S", DEFAULT_HEARTBEAT_S)
         max_retries = _non_negative_int(env, "HUB_MAX_RETRIES", DEFAULT_MAX_RETRIES)
         backoff_factor_s = _positive_seconds(env, "HUB_BACKOFF_FACTOR_S", DEFAULT_BACKOFF_FACTOR_S)
+        telemetry_log = _optional_absolute_path(env, "HUB_TELEMETRY_LOG")
 
         return cls(
             hub_url=hub_url,
@@ -89,4 +102,5 @@ class WorkerSettings:
             heartbeat_s=heartbeat_s,
             max_retries=max_retries,
             backoff_factor_s=backoff_factor_s,
+            telemetry_log=telemetry_log,
         )
