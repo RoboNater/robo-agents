@@ -1,8 +1,12 @@
+import json
+import tomllib
 from pathlib import Path
 
 import pytest
 from agent_hub_common import AgentProfile, ConfigurationError, ModelSource
 from worker_mcp.config import WorkerSettings
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_worker_settings_parses_valid_env() -> None:
@@ -127,3 +131,26 @@ def test_worker_settings_custom_overrides(tmp_path: Path) -> None:
 def test_worker_settings_rejects_invalid_env(env: dict[str, str], match: str) -> None:
     with pytest.raises(ConfigurationError, match=match):
         WorkerSettings.from_env(env)
+
+
+def test_runtime_templates_configure_endurance_and_codex_tool_approvals() -> None:
+    codex = tomllib.loads(
+        (ROOT / "runtimes" / "codex.config.toml").read_text(encoding="utf-8")
+    )
+    hub = codex["mcp_servers"]["hub"]
+    expected_tools = {
+        "check_in",
+        "get_role_guide",
+        "await_assignment",
+        "report_progress",
+        "ask_alice",
+        "submit_result",
+    }
+    assert set(hub["tools"]) == expected_tools
+    assert {tool["approval_mode"] for tool in hub["tools"].values()} == {"approve"}
+    assert "HUB_TELEMETRY_LOG" in hub["env"]
+
+    claude = json.loads(
+        (ROOT / "runtimes" / "claude-code.mcp.json").read_text(encoding="utf-8")
+    )
+    assert "HUB_TELEMETRY_LOG" in claude["mcpServers"]["hub"]["env"]
