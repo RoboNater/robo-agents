@@ -28,25 +28,23 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 ## 2. Architecture
 
 ```
- ┌──────────────── Alice's agent session ────────────────┐
- │  LLM runtime (Claude Code)  ──stdio MCP──▶  hub        │
- │      + alice-orchestrator skill              │ SQLite   │
- └──────────────────────────────────────────────┼─────────┘
-                                                │ HTTP :8420  (A2A JSON-RPC + agent card)
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                              ▼
- ┌─ thin supervisor ─┐                                             ┌──── Charlie: Codex CLI ────┐
- │ no orchestration  │                                             │ LLM runtime                 │
- │ policy            │                                             │      │ stdio MCP              │
- └─────────┬─────────┘                                             │      ▼                      │
-           │ stream-json stdin                                     │ worker-mcp (A2A client)     │
-           ▼                                                       └─────────────────────────────┘
- ┌──────── Bob: Claude Code ────────┐
- │ LLM runtime                      │  role guides via get_role_guide(role), served by hub
- │      │ stdio MCP                 │◀─────────────────────────────────────────────────────
- │      ▼                           │
- │ worker-mcp (A2A client)          │
- └──────────────────────────────────┘
+ Alice:
+ ┌─ Claude Code LLM + alice-orchestrator skill ─┐  stdio MCP  ┌─ hub + SQLite :8420 ─┐
+ │ interactive agent session                    │─────────────▶│ HTTP A2A server       │
+ └──────────────────────────────────────────────┘              └───────────────────────┘
+
+ Bob:
+ ┌─ thin supervisor ─┐  stream-json stdin  ┌─ Claude Code LLM ─┐  stdio MCP  ┌─ worker-mcp ─┐  HTTP :8420  ┌─ same hub ─┐
+ │ no orchestration  │────────────────────▶│ worker session    │─────────────▶│ A2A client   │◀────────────▶│ A2A server │
+ │ policy            │                     └───────────────────┘              └──────────────┘              └────────────┘
+ └───────────────────┘
+
+ Charlie:
+ ┌─ Codex CLI LLM ─┐  stdio MCP  ┌─ worker-mcp ─┐  HTTP :8420  ┌─ same hub ─┐
+ │ worker session  │─────────────▶│ A2A client   │◀────────────▶│ A2A server │
+ └─────────────────┘              └──────────────┘              └────────────┘
+
+ HTTP serves A2A JSON-RPC, the agent card, and role-guide GETs.
 ```
 
 **Key design decisions**
