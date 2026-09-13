@@ -1,6 +1,6 @@
 # Plan for the sandbox repository
 
-Tracking issue: [#62](https://github.com/RoboNater/robo-agents/issues/62)  
+Tracking issue: [#62](https://github.com/RoboNater/robo-agents/issues/62)<br>
 Repository: [`RoboNater/robo-agents-sandbox`](https://github.com/RoboNater/robo-agents-sandbox)
 
 ## Purpose
