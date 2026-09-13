@@ -14,7 +14,7 @@ import pytest
 from agent_hub.database import database, initialize_database
 from agent_hub.mcp import CancellableStdout, create_mcp
 from agent_hub.store import HubStore
-from agent_hub_common import SCHEMA_VERSION, AgentProfile, MetaKeys
+from agent_hub_common import MAX_MESSAGE_PART_BYTES, SCHEMA_VERSION, AgentProfile, MetaKeys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -59,6 +59,15 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
         )
     )["id"] == initialized["id"]
     bob = store.check_in("bob", AgentProfile(capabilities=("python",)))
+    with pytest.raises(Exception, match=f"maximum is {MAX_MESSAGE_PART_BYTES} bytes"):
+        await call(
+            "assign_task",
+            agent="bob",
+            role="implementer",
+            title="Too large",
+            instructions="x" * MAX_MESSAGE_PART_BYTES,
+        )
+    assert store.tasks() == []
     pending = asyncio.create_task(store.await_assignment(bob.context_id, 1))
     await asyncio.sleep(0)
     task = await call(
