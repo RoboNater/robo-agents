@@ -16,7 +16,8 @@
         "HUB_HARNESS_VERSION": "",
         "HUB_PROVIDER": "anthropic",
         "HUB_MODEL": "",
-        "HUB_CAPABILITIES": ""
+        "HUB_CAPABILITIES": "",
+        "HUB_TELEMETRY_LOG": ""
       }
     }
   }

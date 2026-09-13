@@ -1,6 +1,12 @@
+import json
+import tomllib
+from pathlib import Path
+
 import pytest
 from agent_hub_common import AgentProfile, ConfigurationError, ModelSource
 from worker_mcp.config import WorkerSettings
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_worker_settings_parses_valid_env() -> None:
@@ -21,7 +27,8 @@ def test_worker_settings_parses_valid_env() -> None:
     assert settings.backoff_factor_s == 0.5
 
 
-def test_worker_settings_custom_overrides() -> None:
+def test_worker_settings_custom_overrides(tmp_path: Path) -> None:
+    telemetry_path = tmp_path / "worker-telemetry.jsonl"
     env = {
         "HUB_URL": "https://hub.example.com",
         "HUB_TOKEN": "token-123",
@@ -35,6 +42,7 @@ def test_worker_settings_custom_overrides() -> None:
         "HUB_HEARTBEAT_S": "12.5",
         "HUB_MAX_RETRIES": "5",
         "HUB_BACKOFF_FACTOR_S": "1.5",
+        "HUB_TELEMETRY_LOG": str(telemetry_path),
     }
     settings = WorkerSettings.from_env(env)
     assert settings.hub_url == "https://hub.example.com"
@@ -51,6 +59,7 @@ def test_worker_settings_custom_overrides() -> None:
     assert settings.heartbeat_s == 12.5
     assert settings.max_retries == 5
     assert settings.backoff_factor_s == 1.5
+    assert settings.telemetry_log == telemetry_path
 
 
 @pytest.mark.parametrize(
@@ -108,8 +117,40 @@ def test_worker_settings_custom_overrides() -> None:
             },
             "must be an integer",
         ),
+        (
+            {
+                "HUB_URL": "http://hub",
+                "HUB_TOKEN": "tok",
+                "AGENT_NAME": "bob",
+                "HUB_TELEMETRY_LOG": "relative.jsonl",
+            },
+            "must be an absolute path",
+        ),
     ],
 )
 def test_worker_settings_rejects_invalid_env(env: dict[str, str], match: str) -> None:
     with pytest.raises(ConfigurationError, match=match):
         WorkerSettings.from_env(env)
+
+
+def test_runtime_templates_configure_endurance_and_codex_tool_approvals() -> None:
+    codex = tomllib.loads(
+        (ROOT / "runtimes" / "codex.config.toml").read_text(encoding="utf-8")
+    )
+    hub = codex["mcp_servers"]["hub"]
+    expected_tools = {
+        "check_in",
+        "get_role_guide",
+        "await_assignment",
+        "report_progress",
+        "ask_alice",
+        "submit_result",
+    }
+    assert set(hub["tools"]) == expected_tools
+    assert {tool["approval_mode"] for tool in hub["tools"].values()} == {"approve"}
+    assert "HUB_TELEMETRY_LOG" in hub["env"]
+
+    claude = json.loads(
+        (ROOT / "runtimes" / "claude-code.mcp.json").read_text(encoding="utf-8")
+    )
+    assert "HUB_TELEMETRY_LOG" in claude["mcpServers"]["hub"]["env"]

@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,219 @@ spec = importlib.util.spec_from_file_location("mock_alice", script_path)
 assert spec is not None and spec.loader is not None
 mock_alice = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mock_alice)
+
+
+def test_verify_endurance_telemetry_requires_timeouts_heartbeat_and_release(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker.jsonl"
+    records = [
+        {
+            "timestamp": "2026-09-12T00:00:00Z",
+            "event": "session_started",
+            "heartbeat_s": 30,
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:00:01Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "timeout",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:00:02Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "ask_alice",
+            "outcome": "timeout",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:00:10Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "assignment",
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                "timestamp": f"2026-09-12T00:{stamp}Z",
+                "event": "heartbeat",
+                "phase": "success",
+                "accepted": True,
+                "current_task_id": "long-task",
+                "worker_instance_id": "current-worker",
+            }
+            for stamp in ("00:40", "01:10", "01:40", "02:10", "02:40", "03:10", "03:40")
+        ],
+        {
+            "timestamp": "2026-09-12T00:04:10Z",
+            "event": "tool_call",
+            "phase": "start",
+            "tool": "submit_result",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:04:11Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "release",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-11T23:00:00Z",
+            "event": "heartbeat",
+            "phase": "success",
+            "accepted": True,
+            "current_task_id": "long-task",
+            "worker_instance_id": "stale-worker",
+        },
+        {
+            "timestamp": "2026-09-11T23:00:01Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "release",
+            "worker_instance_id": "stale-worker",
+        },
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    result = mock_alice.verify_endurance_telemetry(
+        path, "long-task", "current-worker", lost_after_s=180
+    )
+
+    assert result["assignment_timeouts"] == 1
+    assert result["question_timeouts"] == 1
+    assert result["long_task_heartbeats"] == 7
+    assert result["long_work_tool_gap_s"] == 240
+    assert result["max_heartbeat_gap_s"] == 30
+    assert result["releases"] == 1
+
+
+def test_verify_endurance_telemetry_rejects_stale_worker_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "worker.jsonl"
+    records = [
+        {
+            "timestamp": "2026-09-12T00:00:00Z",
+            "event": "session_started",
+            "heartbeat_s": 30,
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                "timestamp": f"2026-09-12T00:{stamp}Z",
+                "event": "heartbeat",
+                "phase": "success",
+                "accepted": True,
+                "current_task_id": "long-task",
+                "worker_instance_id": "current-worker",
+            }
+            for stamp in ("00:30", "01:00", "01:30", "02:00", "02:30", "03:00", "03:30")
+        ],
+        {
+            "timestamp": "2026-09-12T00:00:10Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "assignment",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:04:00Z",
+            "event": "tool_call",
+            "phase": "start",
+            "tool": "submit_result",
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                "timestamp": f"2026-09-11T23:00:0{index}Z",
+                "event": "tool_call",
+                "phase": "success",
+                "tool": tool,
+                "outcome": outcome,
+                "worker_instance_id": "stale-worker",
+            }
+            for index, (tool, outcome) in enumerate(
+                (
+                    ("await_assignment", "timeout"),
+                    ("ask_alice", "timeout"),
+                    ("await_assignment", "release"),
+                )
+            )
+        ],
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no await_assignment timeout"):
+        mock_alice.verify_endurance_telemetry(
+            path, "long-task", "current-worker", lost_after_s=180
+        )
+
+
+def test_verify_endurance_telemetry_rejects_only_approximate_long_work(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker.jsonl"
+    base = {
+        "worker_instance_id": "current-worker",
+        "event": "tool_call",
+        "phase": "success",
+    }
+    records = [
+        {
+            "timestamp": "2026-09-12T00:00:00Z",
+            "event": "session_started",
+            "heartbeat_s": 30,
+            "worker_instance_id": "current-worker",
+        },
+        {
+            **base,
+            "timestamp": "2026-09-12T00:00:01Z",
+            "tool": "await_assignment",
+            "outcome": "timeout",
+        },
+        {
+            **base,
+            "timestamp": "2026-09-12T00:00:02Z",
+            "tool": "ask_alice",
+            "outcome": "timeout",
+        },
+        {
+            "timestamp": "2026-09-12T00:00:30Z",
+            "event": "heartbeat",
+            "phase": "success",
+            "accepted": True,
+            "current_task_id": "long-task",
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                **base,
+                "timestamp": f"2026-09-12T00:0{minute}:00Z",
+                "tool": "await_assignment",
+                "outcome": "timeout",
+            }
+            for minute in range(1, 4)
+        ],
+        {
+            **base,
+            "timestamp": "2026-09-12T00:04:00Z",
+            "tool": "await_assignment",
+            "outcome": "release",
+        },
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no heartbeat-covered gap"):
+        mock_alice.verify_endurance_telemetry(
+            path, "long-task", "current-worker", lost_after_s=180
+        )
 
 
 @pytest.mark.parametrize(
@@ -127,6 +341,123 @@ async def test_mock_alice_drives_worker_through_full_task(
             assert any("Assigned task" in d["summary"] for d in decisions)
 
 
+async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> None:
+    db_path = tmp_path / "endurance.db"
+    initialize_database(db_path)
+    settings = HubSettings(
+        host="127.0.0.1",
+        port=8420,
+        public_url=BASE_URL,
+        state_dir=tmp_path,
+        database_path=db_path,
+        token=TOKEN,
+        token_file=tmp_path / "token",
+        guides_dir=tmp_path / "guides",
+        default_wait_s=0.04,
+        max_wait_s=1.0,
+        lost_after_s=0.15,
+        sweep_interval_s=0.01,
+    )
+    app = create_app(settings)
+    worker_settings = WorkerSettings(
+        hub_url=BASE_URL,
+        token=TOKEN,
+        agent_name="bob",
+        profile=AgentProfile(harness="codex"),
+        default_wait_s=0.04,
+        heartbeat_s=0.02,
+        max_retries=2,
+        backoff_factor_s=0.01,
+    )
+    observed = {"assignment_timeouts": 0, "question_timeouts": 0, "cycles": 0}
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url=BASE_URL,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        ) as http_client,
+    ):
+
+        async def run_worker() -> None:
+            async with WorkerHubClient(worker_settings, http_client=http_client) as worker:
+                await worker.check_in()
+                while True:
+                    assignment = await worker.await_assignment(timeout_s=0.04)
+                    if assignment.get("timeout"):
+                        observed["assignment_timeouts"] += 1
+                        continue
+                    if assignment.get("release"):
+                        return
+
+                    observed["cycles"] += 1
+                    task_id = assignment["task_id"]
+                    if observed["cycles"] == 1:
+                        reply = await worker.ask_alice(
+                            task_id, mock_alice.ENDURANCE_QUESTION, timeout_s=0.04
+                        )
+                        if reply.get("timeout"):
+                            observed["question_timeouts"] += 1
+                            reply = await worker.ask_alice(
+                                task_id, mock_alice.ENDURANCE_QUESTION, timeout_s=0.2
+                            )
+                        assert "Approved" in reply.get("reply", "")
+                    elif observed["cycles"] == 2:
+                        await asyncio.sleep(0.2)
+
+                    await worker.submit_result(
+                        task_id,
+                        {
+                            "outcome": "completed",
+                            "summary": f"Completed cycle {observed['cycles']}",
+                            "pr_url": "https://github.com/RoboNater/robo-agents/pull/30",
+                            "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                        },
+                    )
+
+        alice_task = asyncio.create_task(
+            mock_alice.drive_endurance(
+                app.state.store,
+                "bob",
+                expected_harness="codex",
+                cycles=3,
+                min_elapsed_s=0.55,
+                assignment_delay_s=0.08,
+                cycle_gap_s=0.04,
+                worker_hold_s=0.04,
+                question_hold_s=0.04,
+                question_reply_delay_s=0.08,
+                long_work_s=0.2,
+                lost_after_s=0.15,
+                checkin_timeout_s=1.0,
+            )
+        )
+        result, _ = await asyncio.gather(alice_task, run_worker())
+
+    assert result["cycles"] == 3
+    assert result["elapsed_s"] >= 0.55
+    assert result["long_work_interval_s"] >= 0.2
+    assert result["heartbeat_advanced"] is True
+    assert result["row_counts"] == {
+        "assignments": 3,
+        "questions": 1,
+        "replies": 1,
+        "results": 3,
+    }
+    assert observed["assignment_timeouts"] >= 1
+    assert observed["question_timeouts"] == 1
+    assert observed["cycles"] == 3
+
+
+def test_endurance_gives_claude_code_a_supported_blocking_wait() -> None:
+    action = mock_alice._long_work_action("claude-code", 210.0)
+
+    assert "run_in_background=true" in action
+    assert "TaskOutput exactly once" in action
+    assert "Do not use `wait`" in action
+
+
 async def test_mock_alice_rejects_unexpected_harness(tmp_path: Path) -> None:
     db_path = tmp_path / "hub_mismatch.db"
     initialize_database(db_path)
@@ -182,6 +513,17 @@ def test_mock_alice_main_cli_parses_arguments(
 
     mock_alice.main()
     assert called is True
+
+
+def test_endurance_cli_requires_a_telemetry_log(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["mock-alice.py", "--endurance"])
+
+    with pytest.raises(SystemExit, match="2"):
+        mock_alice.main()
+
+    assert "--telemetry-log is required for an endurance run" in capsys.readouterr().err
 
 
 async def test_mock_alice_agent_already_checked_in_event_consumed(tmp_path: Path) -> None:

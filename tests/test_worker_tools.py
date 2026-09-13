@@ -1,8 +1,11 @@
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from agent_hub_common import ImplementerResult, RebaseResult
+from mcp.server.fastmcp.exceptions import ToolError
 from worker_mcp.client import WorkerHubClient
 from worker_mcp.config import WorkerSettings
 from worker_mcp.tools import create_worker_mcp
@@ -79,6 +82,31 @@ async def test_worker_mcp_tools_list_and_dispatch() -> None:
     ) == {"status": "completed", "task_id": "t1"}
 
 
+async def test_worker_mcp_tool_boundary_writes_telemetry(tmp_path: Path) -> None:
+    telemetry_path = tmp_path / "worker.jsonl"
+    settings = WorkerSettings(
+        hub_url="http://hub.example",
+        token="tok",
+        agent_name="bob",
+        telemetry_log=telemetry_path,
+    )
+    client = WorkerHubClient(settings)
+    client.await_assignment = AsyncMock(return_value={"timeout": True})  # type: ignore[method-assign]
+    server = create_worker_mcp(client)
+
+    result = await server.call_tool("await_assignment", {"timeout_s": 0.1})
+
+    assert isinstance(result, tuple)
+    records = [
+        json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+    ]
+    calls = [record for record in records if record.get("event") == "tool_call"]
+    assert [(record["phase"], record.get("outcome")) for record in calls] == [
+        ("start", None),
+        ("success", "timeout"),
+    ]
+
+
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -127,3 +155,39 @@ async def test_submit_result_keeps_a_rebase_body_whole(
     submitted = client.submit_result.call_args.args[1]
     assert type(submitted) is expected
     assert submitted.model_dump(exclude_unset=True) == body
+
+
+async def test_submit_result_telemetry_identifies_task_on_error(tmp_path: Path) -> None:
+    telemetry_path = tmp_path / "worker.jsonl"
+    settings = WorkerSettings(
+        hub_url="http://hub.example",
+        token="t",
+        agent_name="bob",
+        telemetry_log=telemetry_path,
+    )
+    client = WorkerHubClient(settings)
+    client.submit_result = AsyncMock(side_effect=RuntimeError("already completed"))  # type: ignore[method-assign]
+    server = create_worker_mcp(client)
+
+    with pytest.raises(ToolError, match="already completed"):
+        await server.call_tool(
+            "submit_result",
+            {
+                "task_id": "wrong-task-id",
+                "result": {
+                    "outcome": "completed",
+                    "pr_url": "https://github.com/org/repo/pull/1",
+                    "head_sha": SHA,
+                    "summary": "Done",
+                },
+            },
+        )
+
+    records = [
+        json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+    ]
+    calls = [record for record in records if record.get("event") == "tool_call"]
+    assert [(record["phase"], record["task_id"]) for record in calls] == [
+        ("start", "wrong-task-id"),
+        ("error", "wrong-task-id"),
+    ]

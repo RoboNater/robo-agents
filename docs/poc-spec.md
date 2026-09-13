@@ -28,23 +28,30 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 ## 2. Architecture
 
 ```
- ┌──────────────── Alice's agent session ────────────────┐
- │  LLM runtime (Claude Code)  ──stdio MCP──▶  hub        │
- │      + alice-orchestrator skill              │ SQLite   │
- └──────────────────────────────────────────────┼─────────┘
-                                                │ HTTP :8420  (A2A JSON-RPC + agent card)
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                              ▼
- ┌──── Bob: Claude Code ─────┐                                     ┌──── Charlie: Codex CLI ────┐
- │ LLM runtime ─stdio MCP─▶ worker-mcp (A2A client)               │ LLM runtime ─stdio MCP─▶ worker-mcp
- │   role guide via get_role_guide(role) ◀── served by hub ──▶    │   role guide via get_role_guide(role)
- └───────────────────────────┘                                     └────────────────────────────┘
+ Alice:
+ ┌─ Claude Code LLM + alice-orchestrator skill ─┐  stdio MCP  ┌─ hub + SQLite :8420 ─┐
+ │ interactive agent session                    │─────────────▶│ HTTP A2A server       │
+ └──────────────────────────────────────────────┘              └───────────────────────┘
+
+ Bob:
+ ┌─ thin supervisor ─┐  stream-json stdin  ┌─ Claude Code LLM ─┐  stdio MCP  ┌─ worker-mcp ─┐  HTTP :8420  ┌─ same hub ─┐
+ │ no orchestration  │────────────────────▶│ worker session    │─────────────▶│ A2A client   │◀────────────▶│ A2A server │
+ │ policy            │                     └───────────────────┘              └──────────────┘              └────────────┘
+ └───────────────────┘
+
+ Charlie:
+ ┌─ Codex CLI LLM ─┐  stdio MCP  ┌─ worker-mcp ─┐  HTTP :8420  ┌─ same hub ─┐
+ │ worker session  │─────────────▶│ A2A client   │◀────────────▶│ A2A server │
+ └─────────────────┘              └──────────────┘              └────────────┘
+
+ HTTP serves A2A JSON-RPC, the agent card, and role-guide GETs.
 ```
 
 **Key design decisions**
 - LLMs can't wait, so **the hub waits for them.** Alice's brain is a handler: `wait_for_event()` → think → act → repeat.
 - **One process for hub + Alice's MCP server.** Launched by Alice's runtime as a stdio MCP server; it also binds the HTTP port. State in SQLite so a restarted Alice resumes. (Split into a standalone service later if needed.)
 - **Only Alice is an A2A server.** Workers are A2A clients → workers need no inbound port, which is what makes networking trivial.
+- **Bob's supervisor is transport-only.** It keeps one Claude Code session and its `worker-mcp` child alive by repeating a fixed continuation prompt after a premature end-turn. It writes stream-json to Claude Code; Claude Code owns the separate stdio MCP connection to `worker-mcp`. The supervisor never sees MCP frames and holds no assignment, retry, or orchestration policy; Alice and the worker role guide remain authoritative.
 - **Runtime mix (decided):** Alice + Bob on Claude Code, Charlie on Codex CLI (`charlie`), configured via `runtimes/codex.config.toml` (settled in Step 4). Consequence: **role guidance cannot depend on Claude Code skills.** The hub serves role guides over HTTP and `worker-mcp` exposes them as a tool, so every runtime gets identical instructions. Claude Code skill files become a thin wrapper that says "call `get_role_guide`."
 - **Alice mode (decided): interactive Claude Code session.** Alice has `gh` in her env and performs the merge herself.
 - **Blocking tools with bounded timeouts** (default 120 s, under runtime MCP tool timeouts). Tool returns `{"event": null}` on timeout and the skill says "call again." No agent ever spins.
