@@ -12,6 +12,7 @@ from agent_hub.store import (
     ConflictError,
     DuplicateAgentError,
     HubStore,
+    InvalidPolicyError,
     NotFoundError,
     Released,
 )
@@ -24,6 +25,7 @@ from agent_hub_common import (
     ModelSource,
     RebaseResult,
     TaskState,
+    WorkflowStatus,
     iso_after,
     to_iso,
     utcnow,
@@ -58,6 +60,7 @@ def test_state_uses_one_read_snapshot(tmp_path: Path, monkeypatch: pytest.Monkey
     path = tmp_path / "hub.db"
     initialize_database(path)
     store = HubStore(path)
+    store.initialize_workflow()
     store.check_in("bob")
     task = store.assign_task("bob", "implementer", "Fix", "Instructions")
     changed = False
@@ -638,10 +641,12 @@ def test_superseded_heartbeat_does_not_renew_or_revive(store: HubStore) -> None:
     assert unchanged_task is not None and unchanged_task.lease_expires == original_expiry
 
 
-def test_heartbeat_lease_renewal_stops_at_cap_and_expires_once(store: HubStore) -> None:
+def test_heartbeat_lease_renewal_stops_at_cap_and_expires_once(tmp_path: Path) -> None:
     clock = FakeClock()
-    store.clock = clock
-    store.ensure_workflow(policy={"max_task_lease_min": 10})
+    path = tmp_path / "lease-cap.db"
+    initialize_database(path)
+    store = HubStore(path, clock=clock)
+    store.initialize_workflow(policy={"max_task_lease_min": 10})
     store.check_in("bob", worker_instance_id="bob-1")
     task = store.assign_task("bob", "implementer", "Task", "Work", lease_min=3)
     while store.next_event():
@@ -663,10 +668,12 @@ def test_heartbeat_lease_renewal_stops_at_cap_and_expires_once(store: HubStore) 
     assert second == []
 
 
-def test_initial_lease_is_also_bounded_by_the_workflow_cap(store: HubStore) -> None:
+def test_initial_lease_is_also_bounded_by_the_workflow_cap(tmp_path: Path) -> None:
     clock = FakeClock()
-    store.clock = clock
-    store.ensure_workflow(policy={"max_task_lease_min": 10})
+    path = tmp_path / "initial-lease-cap.db"
+    initialize_database(path)
+    store = HubStore(path, clock=clock)
+    store.initialize_workflow(policy={"max_task_lease_min": 10})
     store.check_in("bob", worker_instance_id="bob-1")
 
     task = store.assign_task("bob", "implementer", "Task", "Work", lease_min=30)
@@ -723,10 +730,50 @@ def test_initial_workflow_policy_is_immutable_durable_and_used_by_rails(
     task = restarted.assign_task("bob", "implementer", "Task", "Work", lease_min=30)
     assert task.lease_expires == to_iso(clock.now + timedelta(minutes=10))
 
-    with pytest.raises(ConflictError, match="resume the persisted workflow"):
+    with pytest.raises(ConflictError, match="fresh HUB_STATE_DIR"):
         restarted.initialize_workflow(
             "Address issue #5", {"max_task_lease_min": 20, "merge_method": "merge"}
         )
+
+
+@pytest.mark.parametrize(
+    ("policy", "field"),
+    [
+        ({"max_task_lease_min": "10"}, "max_task_lease_min"),
+        ({"max_review_round": 5}, "max_review_round"),
+        ({"merge_method": "octopus"}, "merge_method"),
+        ({"role_policy": {"reviewer_harnes_differs": True}}, "reviewer_harnes_differs"),
+    ],
+)
+def test_invalid_initial_policy_is_rejected_before_insert(
+    tmp_path: Path, policy: dict[str, object], field: str
+) -> None:
+    path = tmp_path / "invalid-policy.db"
+    initialize_database(path)
+    store = HubStore(path)
+
+    with pytest.raises(InvalidPolicyError, match=field):
+        store.initialize_workflow("Address issue #5", policy)
+
+    assert store.get_state()["workflow"] is None
+
+
+def test_assignment_and_status_require_explicit_workflow_initialization(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "uninitialized.db"
+    initialize_database(path)
+    store = HubStore(path)
+    store.check_in("bob")
+
+    with pytest.raises(ConflictError, match="initialize_workflow.*assign_task"):
+        store.assign_task("bob", "implementer", "Task", "Work")
+    with pytest.raises(ConflictError, match="initialize_workflow.*set_workflow_status"):
+        store.set_workflow_status(WorkflowStatus.DONE, "Done")
+
+    assert store.get_state()["workflow"] is None
+    store.initialize_workflow("Address issue #5", {"max_task_lease_min": 10})
+    assert store.assign_task("bob", "implementer", "Task", "Work").workflow_id
 
 
 def test_timestamps_stay_comparable_against_stored_leases(store: HubStore) -> None:

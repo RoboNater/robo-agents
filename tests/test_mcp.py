@@ -45,6 +45,15 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
 
     assert {t.name for t in await server.list_tools()} == TOOLS
     assert (await call("get_state"))["workflow"] is None
+    with pytest.raises(Exception, match="initialize_workflow.*set_workflow_status"):
+        await call("set_workflow_status", status="done", summary="Too early")
+    with pytest.raises(Exception, match="invalid workflow policy.*max_review_round"):
+        await call(
+            "initialize_workflow",
+            goal="Address issue #5",
+            policy={"max_review_round": 5},
+        )
+    assert (await call("get_state"))["workflow"] is None
     initialized = await call(
         "initialize_workflow",
         goal="Address issue #5",

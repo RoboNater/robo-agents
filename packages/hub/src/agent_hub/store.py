@@ -39,10 +39,12 @@ from agent_hub_common import (
     ReviewerVerdict,
     TaskResult,
     TaskState,
+    WorkflowPolicy,
     WorkflowStatus,
     to_iso,
     utcnow,
 )
+from pydantic import ValidationError
 
 from .database import database
 from .signals import EVENT_KEY, Signals, context_key, task_key
@@ -83,6 +85,10 @@ class DuplicateAgentError(ConflictError):
 
 class PayloadTooLargeError(StoreError):
     """Raised when transcript or typed-result data exceeds the contract cap."""
+
+
+class InvalidPolicyError(StoreError):
+    """Raised before an invalid create-once workflow policy is persisted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +321,39 @@ def text_part(text: str, metadata: Mapping[str, Any] | None = None) -> dict[str,
     return part
 
 
+def _validated_workflow_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate only supplied rails and retain their compact stored shape."""
+
+    try:
+        validated = WorkflowPolicy.model_validate(dict(policy or {}))
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(item) for item in error['loc'])}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise InvalidPolicyError(
+            f"invalid workflow policy: {details}. Correct the policy and retry "
+            "initialize_workflow before assigning work."
+        ) from exc
+    return validated.model_dump(mode="json", exclude_unset=True)
+
+
+def _result_transcript_part(summary: str, status: TaskState) -> dict[str, Any]:
+    """Keep internal transcript echoes within the part cap without shrinking results."""
+
+    metadata: dict[str, Any] = {
+        MetaKeys.KIND.value: "result",
+        MetaKeys.STATUS.value: status.value,
+    }
+    part = text_part(summary, metadata=metadata)
+    if _json_size_bytes(part) <= MAX_MESSAGE_PART_BYTES:
+        return part
+    return text_part(
+        "Typed result recorded; full summary is retained in the task result.",
+        metadata=metadata,
+    )
+
+
 @dataclass(slots=True)
 class HubStore:
     """SQLite-backed hub state, plus the waits that hold a worker's request."""
@@ -337,8 +376,9 @@ class HubStore:
     ) -> str:
         """Return the id of the single PoC workflow, creating it if needed."""
 
+        requested_policy = _validated_workflow_policy(policy)
         with database(self.path) as connection:
-            return self._ensure_workflow(connection, goal, policy)
+            return self._ensure_workflow(connection, goal, requested_policy)
 
     def initialize_workflow(
         self, goal: str = DEFAULT_GOAL, policy: Mapping[str, Any] | None = None
@@ -350,12 +390,12 @@ class HubStore:
         replace rails that existing tasks were created under.
         """
 
-        requested_policy = dict(policy or {})
+        requested_policy = _validated_workflow_policy(policy)
         encoded_policy = json.dumps(requested_policy, sort_keys=True)
         with database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT id, goal, policy_json FROM workflow ORDER BY created LIMIT 1"
+                "SELECT id, goal, status, policy_json FROM workflow ORDER BY created LIMIT 1"
             ).fetchone()
             if row is None:
                 workflow_id = uuid4().hex
@@ -374,8 +414,10 @@ class HubStore:
             stored_policy = _json_object(row["policy_json"]) or {}
             if row["goal"] != goal or stored_policy != requested_policy:
                 raise ConflictError(
-                    "workflow is already initialized with a different goal or policy; "
-                    "resume the persisted workflow returned by get_state"
+                    "workflow is already initialized with "
+                    f"status={row['status']!r}, goal={row['goal']!r}, and a different goal "
+                    "or policy; use get_state to resume it, or use a fresh HUB_STATE_DIR "
+                    "for a different workflow"
                 )
             return str(row["id"])
 
@@ -397,6 +439,15 @@ class HubStore:
             ),
         )
         return workflow_id
+
+    def _require_workflow(self, connection: Connection, operation: str) -> str:
+        row = connection.execute("SELECT id FROM workflow ORDER BY created LIMIT 1").fetchone()
+        if row is None:
+            raise ConflictError(
+                f"workflow is not initialized; call initialize_workflow(goal, policy) "
+                f"before {operation}"
+            )
+        return str(row["id"])
 
     def get_state(self) -> dict[str, Any]:
         """Return compact state without task instructions or transcripts."""
@@ -439,7 +490,7 @@ class HubStore:
     def set_workflow_status(self, status: WorkflowStatus, summary: str) -> None:
         """Persist status and its explanation atomically in the audit log."""
         with database(self.path) as connection:
-            workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            workflow_id = self._require_workflow(connection, "set_workflow_status")
             row = connection.execute(
                 "SELECT status FROM workflow WHERE id = ?", (workflow_id,)
             ).fetchone()
@@ -787,7 +838,7 @@ class HubStore:
                     f"agent {agent} is {record.status.value}, not idle; "
                     "it must check in again before it can be given work"
                 )
-            workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            workflow_id = self._require_workflow(connection, "assign_task")
             lease_cap_min = self._max_task_lease_min(connection, workflow_id)
             effective_lease_min = min(lease_min, lease_cap_min)
             task_id = uuid4().hex
@@ -1181,15 +1232,7 @@ class HubStore:
                 context_id=record.context_id,
                 sender=agent,
                 direction="to_alice",
-                parts=[
-                    text_part(
-                        result_summary,
-                        metadata={
-                            MetaKeys.KIND: "result",
-                            MetaKeys.STATUS: terminal_status.value,
-                        },
-                    )
-                ],
+                parts=[_result_transcript_part(result_summary, terminal_status)],
             )
             self._finish(connection, task.id, terminal_status, payload)
             event_payload: dict[str, Any] = {

@@ -708,7 +708,7 @@ async def test_mock_alice_backends_recover_from_every_crash_point(
 ) -> None:
     db_path = tmp_path / f"hub_crash_{backend_kind}_{crash_at}.db"
     initialize_database(db_path)
-    store = HubStore(db_path)
+    store = HubStore(db_path, default_event_lease_s=0.01)
 
     async def run_worker() -> None:
         bob = store.check_in("bob", AgentProfile(harness="claude-code"))
@@ -738,6 +738,7 @@ async def test_mock_alice_backends_recover_from_every_crash_point(
                     expected_harness="claude-code",
                     crash_at=crash_at,
                 )
+            await asyncio.sleep(0.03)
             result = await mock_alice.drive_one_task_with_backend(
                 backend=backend,
                 expected_agent="bob",
@@ -753,3 +754,7 @@ async def test_mock_alice_backends_recover_from_every_crash_point(
     assert result.get("summary") == "Recovered and finished"
     assert len(store.tasks()) == 1
     assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+    with database(store.path) as connection:
+        assert connection.execute(
+            "SELECT MAX(delivery_attempts) FROM event"
+        ).fetchone()[0] >= 2

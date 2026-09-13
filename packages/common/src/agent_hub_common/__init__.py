@@ -21,10 +21,12 @@ from .models import (
     RebaseResult,
     ReviewerResult,
     ReviewerVerdict,
+    RolePolicy,
     TaskResult,
     TaskRole,
     TaskState,
     TestResult,
+    WorkflowPolicy,
     WorkflowStatus,
 )
 from .stdio import reserve_stdout
@@ -52,6 +54,7 @@ __all__ = [
     "MetaKeys",
     "ModelSource",
     "RebaseResult",
+    "RolePolicy",
     "ReviewerResult",
     "ReviewerVerdict",
     "TaskResult",
@@ -60,6 +63,7 @@ __all__ = [
     "TestResult",
     "TokenError",
     "WorkflowStatus",
+    "WorkflowPolicy",
     "iso_after",
     "load_or_create_token",
     "profile_from_env",

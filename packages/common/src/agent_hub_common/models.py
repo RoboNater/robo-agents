@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # A profile field the adapter was not told is recorded as this, never guessed
 # (spec §4.3), so Alice can tell "not reported" apart from a real value.
@@ -17,6 +17,34 @@ class WorkflowStatus(StrEnum):
     PAUSED = "paused"
     DONE = "done"
     ESCALATED = "escalated"
+
+
+PositiveNumber = Annotated[int | float, Field(gt=0, allow_inf_nan=False)]
+
+
+class RolePolicy(BaseModel):
+    """The worker-pairing rails accepted in workflow policy (§5)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    reviewer_harness_differs: bool = True
+    reviewer_provider_differs: bool = False
+    implementer_capabilities: list[str] = Field(default_factory=list)
+    reviewer_capabilities: list[str] = Field(default_factory=list)
+
+
+class WorkflowPolicy(BaseModel):
+    """Validated create-once policy; omitted fields retain the §5 defaults."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    max_review_rounds: int = Field(default=3, gt=0)
+    merge_method: Literal["merge", "squash", "rebase"] = "squash"
+    allow_no_ci: bool = False
+    role_policy: RolePolicy = Field(default_factory=RolePolicy)
+    pairing_wait_s: PositiveNumber = 120
+    max_wall_minutes: PositiveNumber = 120
+    max_task_lease_min: PositiveNumber = 120
 
 
 class AgentStatus(StrEnum):

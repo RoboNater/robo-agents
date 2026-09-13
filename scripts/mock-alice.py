@@ -336,6 +336,8 @@ async def drive_endurance(
     if long_work_s <= lost_after_s:
         raise ValueError("long_work_s must exceed lost_after_s")
 
+    store.initialize_workflow()
+
     logger.info("Endurance Alice waiting for worker %r to check in...", expected_agent)
     checkin_deadline = monotonic() + checkin_timeout_s
     agent = store.agent_by_name(expected_agent)
@@ -535,7 +537,9 @@ class DirectStoreBackend:
         self, timeout_s: float, ack: str | None = None
     ) -> dict[str, Any]:
         # Direct database mode may be observing another process, whose Signals
-        # registry cannot wake this store instance. Keep its polling slice short.
+        # registry cannot wake this store instance. The shared driver reconciles
+        # state after an empty slice, so 50 ms deliberately polls SQLite at up to
+        # 20 Hz; that tradeoff is acceptable for this reference harness.
         event = await self.store.wait_for_event(timeout_s=min(timeout_s, 0.05), ack=ack)
         return {"event": None if event is None else asdict(event)}
 
@@ -822,6 +826,14 @@ async def drive_one_task_with_backend(
         ):
             task_finished = True
             result_data = payload
+            typed_result = payload.get("result") if isinstance(payload, dict) else None
+            typed_result = typed_result if isinstance(typed_result, dict) else {}
+            logger.info(
+                "Typed result: outcome=%s verdict=%s head_sha=%s",
+                typed_result.get("outcome"),
+                typed_result.get("verdict"),
+                typed_result.get("head_sha") or typed_result.get("reviewed_head_sha"),
+            )
             logger.info(
                 "Task %s reached terminal state: %s (summary=%r)",
                 task_id,

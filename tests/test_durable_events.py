@@ -79,7 +79,9 @@ def timed_store(settings: HubSettings, clock: FakeClock) -> HubStore:
     """A standalone store on a hand-advanced clock, for the lease arithmetic."""
 
     initialize_database(settings.database_path)
-    return HubStore(settings.database_path, clock=clock)
+    store = HubStore(settings.database_path, clock=clock)
+    store.initialize_workflow()
+    return store
 
 
 @pytest.fixture

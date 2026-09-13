@@ -89,7 +89,10 @@ every incoming A2A message (including intents it does not store), and again when
 writing any transcript message, so Alice's MCP actions obey the same rule. An
 oversized request fails before mutating task state with an error that reports the
 measured and allowed sizes and directs the agent to put work product in GitHub and
-send a compact reference.
+send a compact reference. A result summary belongs to the 32 KiB typed-result
+contract, not a second 16 KiB field: if its derived transcript echo would exceed
+the per-part cap, the hub stores a compact echo while retaining the complete
+summary in `task.result_json` and the terminal event.
 
 **Worker identity profile.** What a worker says it is, recorded so role selection (§5) is a policy Alice evaluates rather than an accident of arrival order, and so the wrap-up can say what actually ran. Observational only: the hub validates the shape and attests nothing (§1 non-goals). A string field that was not reported is `unknown` — never inferred from the host or defaulted to a plausible harness — and `get_state` shows every field per agent.
 - `harness` / `harness_version` — the agent harness (`claude-code`, `codex`, `gemini`) and its version.
@@ -187,7 +190,7 @@ not an answer to resume work.
 | Tool | Args | Behavior |
 |---|---|---|
 | `get_state` | — | workflow, agents (including separate `heartbeat_age_s` and `progress_age_s`), tasks (compact summary), `queued_events` count, and `unacked_delivered` delivered events awaiting ack or redelivery |
-| `initialize_workflow` | `goal, policy={}` | Alice's first mutating call: durably creates the single workflow from the initial prompt. Repeating the identical goal and policy is restart-safe; once created they are immutable, and a different call fails with a direction to resume the values returned by `get_state` rather than replacing rails under existing work |
+| `initialize_workflow` | `goal, policy={}` | Alice's first mutating call: validates and durably creates the single workflow from the initial prompt. Repeating the identical goal and policy is restart-safe; once created they are immutable, and a different call reports the stored goal/status with directions to resume it or select a fresh `HUB_STATE_DIR`. `assign_task` and `set_workflow_status` refuse to run before initialization, so they cannot pre-empt the durable prompt with defaults |
 | `wait_for_event` | `timeout_s=120, ack=None` | acks prior delivery if `ack` delivery ID is given; blocks until next eligible event or timeout; leases with lease duration (default 600 s). An `ack` applies whenever it names the event's **current** `delivery_id` and the event is still `delivered`, expired lease or not: every re-lease mints a new `delivery_id`, so a stale one can never ack a newer delivery, and an action that outran its lease must not be redone after it finished (#50). A late ack is logged so a lease that is chronically too short stays visible |
 | `assign_task` | `agent, role, title, instructions, lease_min=30, pr_head_sha?` | creates Task, unblocks that worker's pending `NEXT`. `role` is `implementer`, `reviewer` or `rebase`, and names both the guide the worker fetches and the result schema (§4.4). `pr_head_sha` binds a review or rebase to the PR head it was given (§5) |
 | `reply` | `task_id, text, message_id=None` | answers a `worker_question`; returns `{"ok": True, "applied": applied}`; task back to `working` |
@@ -330,12 +333,21 @@ measured and allowed sizes, and that remediation, while the task remains open.
   no new blocking finding do not count. At the cap, ask the user with two or
   three concrete options, a one-sentence recommendation, and the exact prompt
   or action Alice will take if accepted, so a one-word approval is sufficient.
+  The initial PR review is not a remediation round: a cap of 3 permits that
+  initial review plus at most 3 blocking reviews of implementer response heads.
 - `merge_method` (default `squash`), `allow_no_ci` (default `false`) — setting `allow_no_ci: true` acts as an explicit escape hatch that suppresses only the no-workflows escalation (MERGE, `ci == no_workflows`); it does not bypass a red or still-pending gate, a moved head, a stale base or a conflict
 - `role_policy` (default `{ reviewer_harness_differs: true, reviewer_provider_differs: false, implementer_capabilities: [], reviewer_capabilities: [] }`), `pairing_wait_s` (default 120). Evaluated over the §3 profiles:
   - `reviewer_harness_differs` / `reviewer_provider_differs`: the reviewer's `harness` / `provider` differs from the implementer's. A field reading `unknown` on either worker cannot be shown to differ, so it fails the rule — a launcher that does not set `HUB_HARNESS` gets an escalation, not a pairing by luck.
   - `implementer_capabilities` / `reviewer_capabilities`: every listed capability is in that worker's `capabilities[]`.
   - Two workers on the same harness with `reviewer_harness_differs: true` → escalate.
 - `max_wall_minutes`, `max_task_lease_min` (default 120)
+- Policy validation is closed and strict before the create-once insert. The
+  accepted top-level keys are exactly those listed above; durations are positive
+  finite numbers, `max_review_rounds` is a positive integer, `allow_no_ci` and
+  the two `role_policy` difference flags are booleans, `merge_method` is
+  `squash`, `merge`, or `rebase`, and each capability rule is a list of strings.
+  Unknown keys, unknown `role_policy` keys, and type coercions are refused with
+  the invalid field named so Alice can correct the initial call.
 - Parallel implementers must not share a reservable counter. A collision discovered at rebase is a defect in Alice's reservation step, not in the implementer.
 - Event delivery & implicit ack: Call `wait_for_event(ack=last_delivery_id)`. Pass the `delivery_id` of the event just processed to acknowledge it. An action that takes longer than `HUB_EVENT_LEASE_S` — MERGE, where the gate waits on CI and `gh pr merge` follows, is the long one — still acks when it finishes, so Alice never has to fit an action inside the lease or rush the gate (#50). What redelivers an event is Alice stopping, not an action running long: if she crashes before calling `wait_for_event`, the lease expires and the event is redelivered to the next `wait_for_event`, which mints a new `delivery_id` and leaves the stale one unable to ack. On restart, call `get_state` to inspect existing workflow, agents, and active tasks before taking action, resuming observation if a task is already assigned. For multi-action events, call `log_decision` first as a checkpoint with a deterministic key derived from the event (e.g. `event:{id}:<action>`) to guarantee idempotency across crash recovery.
 - Off-rails triggers: scope creep, CI red after 2 attempts, no CI workflows on repo while `allow_no_ci: false`, workflow run not created or remaining cancelled after 60 s, a rebase the implementer reports `blocked` or `failed`, no worker pair satisfying `role_policy`, reviewer/implementer disagreement, worker question Alice can't answer from issue/plan → **escalate to user** with the options, Alice's one-sentence recommendation, and the ready prompt/action that recommendation would execute; end the turn with that concrete question
@@ -436,8 +448,8 @@ Alice acceptance demo against the sandbox repository.
 | Second runtime | Codex CLI (`charlie`, `HUB_HARNESS=codex`), settled in Step 4. **Observed MCP tool-timeout limit: 300 s** by default (Codex CLI 0.154.0, no `tool_timeout_sec` set: a 150 s call completed, a 330 s call failed with `timed out awaiting tools/call after 300s`); the per-server `tool_timeout_sec` overrides it (20 s set → 20 s observed). The 120 s default hold fits, but a worker may request up to `HUB_MAX_WAIT_S` (300 s) and its client waits 15 s past the hold, so `runtimes/codex.config.toml` sets `tool_timeout_sec = 330` |
 | allow_no_ci | Renamed from `require_ci_green` (default `false`), semantics unchanged: setting `allow_no_ci: true` acts as an explicit escape hatch that suppresses escalation when no CI workflows are configured on the repo; it never permits merging on red or pending CI |
 | role_policy defaults | Default policy in `policy_json`: `role_policy = { reviewer_harness_differs: true, reviewer_provider_differs: false, implementer_capabilities: [], reviewer_capabilities: [] }` with `pairing_wait_s: 120`. Enforces multi-harness diversity between implementer and reviewer based on declared worker identity profiles (§3); an `unknown` field never satisfies a "differs" rule. Alice evaluates it (§5) — the hub records and exposes profiles but does not pair workers. No permission-claim taxonomy (`repo_write`, …): permissions are configured out of band (GitHub issue #28) |
-| Workflow initialization | The initial prompt's goal and policy are persisted create-once through `initialize_workflow`; identical retries confirm them after restart, while different values are refused. Alice and hub-side rails read the durable `workflow.policy_json` |
-| Payload caps | A message part is at most 16 KiB and a typed result body at most 32 KiB, measured as compact key-sorted UTF-8 JSON. Oversized payloads are rejected before state mutation with a GitHub-reference remediation |
+| Workflow initialization | The initial prompt's goal and strictly validated policy are persisted create-once through `initialize_workflow`; identical retries confirm them after restart, while different values are refused with stored-workflow and fresh-state guidance. `assign_task` and `set_workflow_status` require this initialization. Alice and hub-side rails read the durable `workflow.policy_json` |
+| Payload caps | A message part is at most 16 KiB and a typed result body at most 32 KiB, measured as compact key-sorted UTF-8 JSON. Oversized payloads are rejected before state mutation with a GitHub-reference remediation. A result summary is governed by the result cap; if its derived transcript echo would exceed the part cap, only that echo is compacted and the full result remains authoritative |
 | Alice mode | Interactive (PoC); headless deferred |
 | Merge authority | Alice merges when `check_merge_gate`, read immediately before merging, shows the §5 invariant: approval of the current head, CI green (or approval alone when `allow_no_ci: true` and the repo has no workflows), base not behind, no conflicts. `gh pr merge --match-head-commit` binds the merge to the approved head; `squash` default |
 | Review authority | All PoC agents share one GitHub account, so the reviewer posts a comment rather than native approval. The typed reviewer result and its `reviewed_head_sha` are authoritative; `check_merge_gate` does not consult GitHub review state. Per-agent identities are post-PoC |
