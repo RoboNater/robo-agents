@@ -46,6 +46,8 @@ from a2a.types import (
 from a2a.types import Message as A2AMessage
 from a2a.types import TaskState as A2ATaskState
 from agent_hub_common import (
+    MAX_MESSAGE_PART_BYTES,
+    MAX_TYPED_RESULT_BYTES,
     UNKNOWN,
     AgentProfile,
     HubSettings,
@@ -70,8 +72,10 @@ from .store import (
     IdempotencyConflictError,
     MessageRecord,
     NotFoundError,
+    PayloadTooLargeError,
     Released,
     TaskRecord,
+    _json_size_bytes,
     _normalize_part,
 )
 
@@ -223,6 +227,20 @@ def _text(message: A2AMessage) -> str:
 
 def _metadata(message: A2AMessage) -> dict[str, Any]:
     return dict(message.metadata or {})
+
+
+def _check_message_part_sizes(message: A2AMessage) -> None:
+    """Reject every oversized A2A part, including intents not persisted."""
+
+    for index, part in enumerate(message.parts, start=1):
+        value = part.root.model_dump(mode="json", by_alias=True, exclude_none=True)
+        part_size = _json_size_bytes(value)
+        if part_size > MAX_MESSAGE_PART_BYTES:
+            raise PayloadTooLargeError(
+                f"message part {index} is {part_size} bytes; maximum is "
+                f"{MAX_MESSAGE_PART_BYTES} bytes. Store work product in GitHub and "
+                "send a URL or compact reference instead."
+            )
 
 
 def _string_list(value: Any, field: str) -> list[str]:
@@ -409,8 +427,14 @@ class A2AProtocol:
             ResultValidationError,
             UnsupportedSchemaVersionError,
             MissingRequiredFieldError,
+            PayloadTooLargeError,
         ) as exc:
-            return _error_response(request_id, exc.error, status_code=400)
+            error = (
+                exc.error
+                if isinstance(exc, ProtocolError)
+                else InvalidParamsError(message=str(exc))
+            )
+            return _error_response(request_id, error, status_code=400)
         except (DuplicateAgentError, IdempotencyConflictError) as exc:
             return _error_response(
                 request_id, InvalidRequestError(message=str(exc)), status_code=409
@@ -428,9 +452,11 @@ class A2AProtocol:
     async def _dispatch(self, method: str, payload: Any, request_id: RequestId) -> Response:
         if method == "message/send":
             params = _validate(SendMessageRequest, payload).params
+            _check_message_part_sizes(params.message)
             return JSONResponse(_success_body(request_id, self._send(params)))
         if method == "message/stream":
             params = _validate(SendStreamingMessageRequest, payload).params
+            _check_message_part_sizes(params.message)
             return self._stream(request_id, params)
         if method == "tasks/get":
             query = _validate(GetTaskRequest, payload).params
@@ -569,6 +595,13 @@ class A2AProtocol:
         _require_schema_version(metadata)
         operation_id = _require_operation_id(metadata)
         result_dict = _require_result(metadata)
+        result_size = _json_size_bytes(result_dict)
+        if result_size > MAX_TYPED_RESULT_BYTES:
+            raise PayloadTooLargeError(
+                f"typed result is {result_size} bytes; maximum is "
+                f"{MAX_TYPED_RESULT_BYTES} bytes. Store work product in GitHub and "
+                "submit only references and compact metadata."
+            )
 
         if not result_dict.get("summary") and summary:
             result_dict["summary"] = summary

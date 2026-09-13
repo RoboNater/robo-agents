@@ -2,7 +2,7 @@
 
 from .clock import iso_after, to_iso, utcnow, utcnow_iso
 from .config import DEFAULT_EVENT_LEASE_S, ConfigurationError, HubSettings, profile_from_env
-from .constants import MetaKeys
+from .constants import MAX_MESSAGE_PART_BYTES, MAX_TYPED_RESULT_BYTES, MetaKeys
 from .models import (
     IMPLEMENTER_RESULT_SCHEMA,
     REBASE_RESULT_SCHEMA,
@@ -47,6 +47,8 @@ __all__ = [
     "HubSettings",
     "ImplementerOutcome",
     "ImplementerResult",
+    "MAX_MESSAGE_PART_BYTES",
+    "MAX_TYPED_RESULT_BYTES",
     "MetaKeys",
     "ModelSource",
     "RebaseResult",

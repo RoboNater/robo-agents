@@ -36,6 +36,20 @@ def create_mcp(store: HubStore, gate: MergeGate | None = None) -> FastMCP:
         return store.get_state()
 
     @server.tool()
+    async def initialize_workflow(
+        goal: str, policy: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Persist the initial prompt's goal and policy, or confirm them on restart.
+
+        This must be Alice's first mutating call. Goal and policy are immutable;
+        use get_state to resume the stored workflow after a restart.
+        """
+
+        workflow_id = store.initialize_workflow(goal, policy)
+        workflow = store.get_state()["workflow"]
+        return {"id": workflow_id, "goal": workflow["goal"], "policy": workflow["policy"]}
+
+    @server.tool()
     async def wait_for_event(
         timeout_s: Timeout = 120, ack: str | None = None
     ) -> dict[str, Any]:

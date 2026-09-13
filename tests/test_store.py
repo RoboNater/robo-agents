@@ -705,6 +705,30 @@ def test_the_single_workflow_is_created_once(store: HubStore) -> None:
     assert task is not None and task.workflow_id == first
 
 
+def test_initial_workflow_policy_is_immutable_durable_and_used_by_rails(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "policy.db"
+    initialize_database(path)
+    clock = FakeClock()
+    first_store = HubStore(path, clock=clock)
+    policy = {"max_task_lease_min": 10, "merge_method": "merge"}
+
+    workflow_id = first_store.initialize_workflow("Address issue #5", policy)
+    restarted = HubStore(path, clock=clock)
+
+    assert restarted.initialize_workflow("Address issue #5", policy) == workflow_id
+    assert restarted.get_state()["workflow"]["policy"] == policy
+    restarted.check_in("bob", worker_instance_id="bob-1")
+    task = restarted.assign_task("bob", "implementer", "Task", "Work", lease_min=30)
+    assert task.lease_expires == to_iso(clock.now + timedelta(minutes=10))
+
+    with pytest.raises(ConflictError, match="resume the persisted workflow"):
+        restarted.initialize_workflow(
+            "Address issue #5", {"max_task_lease_min": 20, "merge_method": "merge"}
+        )
+
+
 def test_timestamps_stay_comparable_against_stored_leases(store: HubStore) -> None:
     # Leases are compared lexically in SQL, so both sides must share a format.
     assert to_iso(utcnow()) < iso_after(60)

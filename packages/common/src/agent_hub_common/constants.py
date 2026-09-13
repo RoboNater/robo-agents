@@ -2,6 +2,11 @@
 
 from enum import StrEnum
 
+# Operational payload limits from spec §3. They are byte limits, not character
+# limits, so non-ASCII text cannot bypass them through UTF-8 expansion.
+MAX_MESSAGE_PART_BYTES = 16 * 1024
+MAX_TYPED_RESULT_BYTES = 32 * 1024
+
 
 class MetaKeys(StrEnum):
     """Hub-specific metadata keys namespaced with `hub.` (spec §4.0)."""

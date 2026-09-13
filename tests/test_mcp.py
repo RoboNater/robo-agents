@@ -20,6 +20,7 @@ from mcp.client.stdio import stdio_client
 
 TOOLS = {
     "get_state",
+    "initialize_workflow",
     "wait_for_event",
     "assign_task",
     "reply",
@@ -44,6 +45,19 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
 
     assert {t.name for t in await server.list_tools()} == TOOLS
     assert (await call("get_state"))["workflow"] is None
+    initialized = await call(
+        "initialize_workflow",
+        goal="Address issue #5",
+        policy={"max_task_lease_min": 10},
+    )
+    assert initialized["policy"] == {"max_task_lease_min": 10}
+    assert (
+        await call(
+            "initialize_workflow",
+            goal="Address issue #5",
+            policy={"max_task_lease_min": 10},
+        )
+    )["id"] == initialized["id"]
     bob = store.check_in("bob", AgentProfile(capabilities=("python",)))
     pending = asyncio.create_task(store.await_assignment(bob.context_id, 1))
     await asyncio.sleep(0)
