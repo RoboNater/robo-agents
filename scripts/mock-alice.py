@@ -715,7 +715,6 @@ async def drive_one_task_with_backend(
             existing_task.get("state"),
         )
         if existing_task.get("state") in (TaskState.COMPLETED.value, TaskState.FAILED.value):
-            task_finished = True
             result_data = existing_task.get("result") or {}
     else:
         agent_name = None
@@ -773,7 +772,15 @@ async def drive_one_task_with_backend(
         if crash_at == "before_ack" and last_delivery_id:
             raise AliceCrashError("Simulated Alice crash before ack")
 
-        delivered = await backend.wait_for_event(5.0, last_delivery_id)
+        terminal_recovery = (
+            existing_task is not None
+            and existing_task.get("state")
+            in (TaskState.COMPLETED.value, TaskState.FAILED.value)
+        )
+        delivered = await backend.wait_for_event(
+            0.05 if terminal_recovery else 5.0,
+            last_delivery_id,
+        )
         event = delivered.get("event") if isinstance(delivered, dict) else None
         if not isinstance(event, dict):
             current = _find_task(await backend.get_state(), expected_agent)
