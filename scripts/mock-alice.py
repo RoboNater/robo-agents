@@ -29,6 +29,8 @@ import logging
 import os
 import shlex
 import sys
+from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Any
@@ -156,13 +158,37 @@ def _verify_endurance_rows(
     return totals
 
 
-def verify_endurance_telemetry(path: Path, long_task_id: str) -> dict[str, int]:
-    """Check the worker log for required timeout retries and timer heartbeats."""
+def _telemetry_time(record: dict[str, Any]) -> float:
+    value = record.get("timestamp")
+    if not isinstance(value, str):
+        raise RuntimeError("Telemetry record has no timestamp")
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise RuntimeError(f"Telemetry record has invalid timestamp {value!r}") from exc
+
+
+def verify_endurance_telemetry(
+    path: Path,
+    long_task_id: str,
+    worker_instance_id: str,
+    lost_after_s: float,
+) -> dict[str, int | float]:
+    """Check current-worker telemetry for retries and heartbeat-covered long work."""
 
     try:
-        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        decoded = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Could not read endurance telemetry {path}: {exc}") from exc
+    records = [
+        record
+        for record in decoded
+        if isinstance(record, dict) and record.get("worker_instance_id") == worker_instance_id
+    ]
+    if not records:
+        raise RuntimeError(
+            f"Telemetry has no records for worker instance {worker_instance_id!r}"
+        )
 
     successful = [
         record
@@ -184,6 +210,39 @@ def verify_endurance_telemetry(path: Path, long_task_id: str) -> dict[str, int]:
         and record.get("current_task_id") == long_task_id
         for record in records
     )
+    session_records = [record for record in records if record.get("event") == "session_started"]
+    heartbeat_s = session_records[0].get("heartbeat_s") if session_records else None
+    if not isinstance(heartbeat_s, (int, float)) or heartbeat_s <= 0:
+        raise RuntimeError("Telemetry has no valid heartbeat interval for the current worker")
+    tool_times = sorted(
+        _telemetry_time(record)
+        for record in records
+        if record.get("event") == "tool_call"
+    )
+    heartbeat_times = sorted(
+        _telemetry_time(record)
+        for record in records
+        if record.get("event") == "heartbeat"
+        and record.get("phase") == "success"
+        and record.get("accepted") is True
+        and record.get("current_task_id") == long_task_id
+    )
+    long_work_tool_gap_s = 0.0
+    max_heartbeat_gap_s = 0.0
+    for before, after in pairwise(tool_times):
+        tool_gap_s = after - before
+        if tool_gap_s <= lost_after_s:
+            continue
+        covering = [timestamp for timestamp in heartbeat_times if before < timestamp < after]
+        if len(covering) < 2:
+            continue
+        heartbeat_gaps = [
+            right - left for left, right in pairwise([before, *covering, after])
+        ]
+        coverage_gap_s = max(heartbeat_gaps)
+        if coverage_gap_s <= heartbeat_s * 2:
+            long_work_tool_gap_s = max(long_work_tool_gap_s, tool_gap_s)
+            max_heartbeat_gap_s = max(max_heartbeat_gap_s, coverage_gap_s)
     releases = sum(
         record.get("tool") == "await_assignment" and record.get("outcome") == "release"
         for record in successful
@@ -194,12 +253,19 @@ def verify_endurance_telemetry(path: Path, long_task_id: str) -> dict[str, int]:
         raise RuntimeError("Telemetry has no ask_alice timeout/retry evidence")
     if long_task_heartbeats < 1:
         raise RuntimeError("Telemetry has no accepted heartbeat during the long work interval")
+    if long_work_tool_gap_s <= lost_after_s:
+        raise RuntimeError(
+            "Telemetry has no heartbeat-covered gap between worker tool calls longer than "
+            f"HUB_LOST_AFTER_S={lost_after_s:g}"
+        )
     if releases < 1:
         raise RuntimeError("Telemetry has no clean release acknowledgement")
     return {
         "assignment_timeouts": assignment_timeouts,
         "question_timeouts": question_timeouts,
         "long_task_heartbeats": long_task_heartbeats,
+        "long_work_tool_gap_s": round(long_work_tool_gap_s, 3),
+        "max_heartbeat_gap_s": round(max_heartbeat_gap_s, 3),
         "releases": releases,
         "tool_errors": sum(
             record.get("event") == "tool_call" and record.get("phase") == "error"
@@ -210,15 +276,21 @@ def verify_endurance_telemetry(path: Path, long_task_id: str) -> dict[str, int]:
 
 
 def wait_for_endurance_telemetry(
-    path: Path, long_task_id: str, timeout_s: float
-) -> dict[str, int]:
+    path: Path,
+    long_task_id: str,
+    worker_instance_id: str,
+    lost_after_s: float,
+    timeout_s: float,
+) -> dict[str, int | float]:
     """Wait for the released worker's final telemetry record, then verify it."""
 
     deadline = monotonic() + timeout_s
     last_error: RuntimeError | None = None
     while monotonic() < deadline:
         try:
-            return verify_endurance_telemetry(path, long_task_id)
+            return verify_endurance_telemetry(
+                path, long_task_id, worker_instance_id, lost_after_s
+            )
         except RuntimeError as exc:
             last_error = exc
             sleep(0.5)
@@ -267,6 +339,9 @@ async def drive_endurance(
             f"Worker {expected_agent!r} checked in with harness {agent.harness!r}, "
             f"expected {expected_harness!r}"
         )
+    if not agent.worker_instance_id:
+        raise RuntimeError(f"Worker {expected_agent!r} has no worker instance ID")
+    worker_instance_id = agent.worker_instance_id
 
     started = monotonic()
     prior_task_ids = {task.id for task in store.tasks() if task.assignee == expected_agent}
@@ -390,6 +465,7 @@ async def drive_endurance(
     return {
         "agent": expected_agent,
         "harness": agent.harness,
+        "worker_instance_id": worker_instance_id,
         "elapsed_s": round(elapsed_s, 3),
         "cycles": cycles,
         "task_ids": task_ids,
@@ -941,13 +1017,14 @@ def main() -> None:
                     checkin_timeout_s=args.timeout,
                 )
             )
-            if args.telemetry_log is not None:
-                telemetry = wait_for_endurance_telemetry(
-                    args.telemetry_log.resolve(),
-                    result["task_ids"][1],
-                    args.worker_hold_s + 30.0,
-                )
-                result["telemetry"] = telemetry
+            telemetry = wait_for_endurance_telemetry(
+                args.telemetry_log.resolve(),
+                result["task_ids"][1],
+                result["worker_instance_id"],
+                lost_after_s,
+                args.worker_hold_s + 30.0,
+            )
+            result["telemetry"] = telemetry
         elif args.mcp:
             cmd_parts = _parse_cmd(args.hub_cmd)
             params = StdioServerParameters(

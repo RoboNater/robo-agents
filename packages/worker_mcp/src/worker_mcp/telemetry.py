@@ -39,7 +39,12 @@ class TelemetryLog:
         self.worker_instance_id = worker_instance_id
         self.session_id = uuid4().hex
         if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                logger.exception("Could not create worker telemetry directory %s", path.parent)
+                self.path = None
+                return
             self.emit("session_started", **dict(session_fields or {}))
 
     def emit(self, event: str, **fields: Any) -> None:
@@ -59,9 +64,12 @@ class TelemetryLog:
         except OSError:
             logger.exception("Could not append worker telemetry to %s", self.path)
 
-    def start_tool(self, tool: str) -> tuple[str, float]:
+    def start_tool(self, tool: str, *, task_id: str | None = None) -> tuple[str, float]:
         call_id = uuid4().hex
-        self.emit("tool_call", phase="start", tool=tool, call_id=call_id)
+        fields = {"phase": "start", "tool": tool, "call_id": call_id}
+        if task_id is not None:
+            fields["task_id"] = task_id[:128]
+        self.emit("tool_call", **fields)
         return call_id, monotonic()
 
     def finish_tool(
@@ -72,12 +80,17 @@ class TelemetryLog:
         *,
         result: Any | None = None,
         error: BaseException | None = None,
+        task_id: str | None = None,
     ) -> None:
         common = {
             "tool": tool,
             "call_id": call_id,
             "duration_s": round(monotonic() - started, 3),
         }
+        result_task_id = result.get("task_id") if isinstance(result, dict) else None
+        logged_task_id = task_id if task_id is not None else result_task_id
+        if isinstance(logged_task_id, str):
+            common["task_id"] = logged_task_id[:128]
         if error is not None:
             self.emit(
                 "tool_call",

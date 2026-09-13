@@ -15,6 +15,10 @@ def test_supervisor_reprompts_one_persistent_session_until_release(tmp_path: Pat
     fake_claude = tmp_path / "fake-claude"
     input_log = tmp_path / "inputs.jsonl"
     telemetry = tmp_path / "worker.jsonl"
+    telemetry.write_text(
+        '{"event":"tool_call","phase":"success","outcome": "release"}\n',
+        encoding="utf-8",
+    )
     mcp_config = tmp_path / "mcp.json"
     mcp_config.write_text("{}", encoding="utf-8")
     fake_claude.write_text(

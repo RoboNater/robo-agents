@@ -61,3 +61,16 @@ def test_telemetry_records_tool_errors_without_raising(tmp_path: Path) -> None:
     assert error["phase"] == "error"
     assert error["error_type"] == "RuntimeError"
     assert error["error"] == "guide unavailable"
+
+
+def test_telemetry_directory_failure_does_not_break_worker(tmp_path: Path) -> None:
+    blocking_file = tmp_path / "not-a-directory"
+    blocking_file.write_text("occupied", encoding="utf-8")
+
+    telemetry = TelemetryLog(
+        blocking_file / "worker.jsonl",
+        agent="bob",
+        worker_instance_id="worker-1",
+    )
+
+    assert telemetry.path is None

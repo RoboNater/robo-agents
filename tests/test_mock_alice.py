@@ -30,33 +30,211 @@ def test_verify_endurance_telemetry_requires_timeouts_heartbeat_and_release(
     path = tmp_path / "worker.jsonl"
     records = [
         {
+            "timestamp": "2026-09-12T00:00:00Z",
+            "event": "session_started",
+            "heartbeat_s": 30,
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:00:01Z",
             "event": "tool_call",
             "phase": "success",
             "tool": "await_assignment",
             "outcome": "timeout",
+            "worker_instance_id": "current-worker",
         },
-        {"event": "tool_call", "phase": "success", "tool": "ask_alice", "outcome": "timeout"},
         {
+            "timestamp": "2026-09-12T00:00:02Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "ask_alice",
+            "outcome": "timeout",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:00:10Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "assignment",
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                "timestamp": f"2026-09-12T00:{stamp}Z",
+                "event": "heartbeat",
+                "phase": "success",
+                "accepted": True,
+                "current_task_id": "long-task",
+                "worker_instance_id": "current-worker",
+            }
+            for stamp in ("00:40", "01:10", "01:40", "02:10", "02:40", "03:10", "03:40")
+        ],
+        {
+            "timestamp": "2026-09-12T00:04:10Z",
+            "event": "tool_call",
+            "phase": "start",
+            "tool": "submit_result",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:04:11Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "release",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-11T23:00:00Z",
             "event": "heartbeat",
             "phase": "success",
             "accepted": True,
             "current_task_id": "long-task",
+            "worker_instance_id": "stale-worker",
         },
         {
+            "timestamp": "2026-09-11T23:00:01Z",
             "event": "tool_call",
             "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "release",
+            "worker_instance_id": "stale-worker",
+        },
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    result = mock_alice.verify_endurance_telemetry(
+        path, "long-task", "current-worker", lost_after_s=180
+    )
+
+    assert result["assignment_timeouts"] == 1
+    assert result["question_timeouts"] == 1
+    assert result["long_task_heartbeats"] == 7
+    assert result["long_work_tool_gap_s"] == 240
+    assert result["max_heartbeat_gap_s"] == 30
+    assert result["releases"] == 1
+
+
+def test_verify_endurance_telemetry_rejects_stale_worker_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "worker.jsonl"
+    records = [
+        {
+            "timestamp": "2026-09-12T00:00:00Z",
+            "event": "session_started",
+            "heartbeat_s": 30,
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                "timestamp": f"2026-09-12T00:{stamp}Z",
+                "event": "heartbeat",
+                "phase": "success",
+                "accepted": True,
+                "current_task_id": "long-task",
+                "worker_instance_id": "current-worker",
+            }
+            for stamp in ("00:30", "01:00", "01:30", "02:00", "02:30", "03:00", "03:30")
+        ],
+        {
+            "timestamp": "2026-09-12T00:00:10Z",
+            "event": "tool_call",
+            "phase": "success",
+            "tool": "await_assignment",
+            "outcome": "assignment",
+            "worker_instance_id": "current-worker",
+        },
+        {
+            "timestamp": "2026-09-12T00:04:00Z",
+            "event": "tool_call",
+            "phase": "start",
+            "tool": "submit_result",
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                "timestamp": f"2026-09-11T23:00:0{index}Z",
+                "event": "tool_call",
+                "phase": "success",
+                "tool": tool,
+                "outcome": outcome,
+                "worker_instance_id": "stale-worker",
+            }
+            for index, (tool, outcome) in enumerate(
+                (
+                    ("await_assignment", "timeout"),
+                    ("ask_alice", "timeout"),
+                    ("await_assignment", "release"),
+                )
+            )
+        ],
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="no await_assignment timeout"):
+        mock_alice.verify_endurance_telemetry(
+            path, "long-task", "current-worker", lost_after_s=180
+        )
+
+
+def test_verify_endurance_telemetry_rejects_only_approximate_long_work(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worker.jsonl"
+    base = {
+        "worker_instance_id": "current-worker",
+        "event": "tool_call",
+        "phase": "success",
+    }
+    records = [
+        {
+            "timestamp": "2026-09-12T00:00:00Z",
+            "event": "session_started",
+            "heartbeat_s": 30,
+            "worker_instance_id": "current-worker",
+        },
+        {
+            **base,
+            "timestamp": "2026-09-12T00:00:01Z",
+            "tool": "await_assignment",
+            "outcome": "timeout",
+        },
+        {
+            **base,
+            "timestamp": "2026-09-12T00:00:02Z",
+            "tool": "ask_alice",
+            "outcome": "timeout",
+        },
+        {
+            "timestamp": "2026-09-12T00:00:30Z",
+            "event": "heartbeat",
+            "phase": "success",
+            "accepted": True,
+            "current_task_id": "long-task",
+            "worker_instance_id": "current-worker",
+        },
+        *[
+            {
+                **base,
+                "timestamp": f"2026-09-12T00:0{minute}:00Z",
+                "tool": "await_assignment",
+                "outcome": "timeout",
+            }
+            for minute in range(1, 4)
+        ],
+        {
+            **base,
+            "timestamp": "2026-09-12T00:04:00Z",
             "tool": "await_assignment",
             "outcome": "release",
         },
     ]
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
-    result = mock_alice.verify_endurance_telemetry(path, "long-task")
-
-    assert result["assignment_timeouts"] == 1
-    assert result["question_timeouts"] == 1
-    assert result["long_task_heartbeats"] == 1
-    assert result["releases"] == 1
+    with pytest.raises(RuntimeError, match="no heartbeat-covered gap"):
+        mock_alice.verify_endurance_telemetry(
+            path, "long-task", "current-worker", lost_after_s=180
+        )
 
 
 @pytest.mark.parametrize(

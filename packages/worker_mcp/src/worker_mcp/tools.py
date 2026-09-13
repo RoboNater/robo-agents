@@ -25,14 +25,14 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         ),
     )
 
-    async def invoke(tool: str, call: Awaitable[T]) -> T:
-        call_id, started = client.telemetry.start_tool(tool)
+    async def invoke(tool: str, call: Awaitable[T], *, task_id: str | None = None) -> T:
+        call_id, started = client.telemetry.start_tool(tool, task_id=task_id)
         try:
             result = await call
         except BaseException as exc:
-            client.telemetry.finish_tool(tool, call_id, started, error=exc)
+            client.telemetry.finish_tool(tool, call_id, started, error=exc, task_id=task_id)
             raise
-        client.telemetry.finish_tool(tool, call_id, started, result=result)
+        client.telemetry.finish_tool(tool, call_id, started, result=result, task_id=task_id)
         return result
 
     @server.tool()
@@ -67,7 +67,9 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
     @server.tool()
     async def report_progress(task_id: str, note: str) -> dict[str, Any]:
         """Send a non-blocking progress update note to Alice."""
-        return await invoke("report_progress", client.report_progress(task_id, note))
+        return await invoke(
+            "report_progress", client.report_progress(task_id, note), task_id=task_id
+        )
 
     @server.tool()
     async def ask_alice(
@@ -79,7 +81,9 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         On timeout, call ask_alice again to continue waiting; retries resume the pending question.
         timeout_s: Optional wait timeout in seconds (defaults to HUB_DEFAULT_WAIT_S if omitted).
         """
-        return await invoke("ask_alice", client.ask_alice(task_id, question, timeout_s))
+        return await invoke(
+            "ask_alice", client.ask_alice(task_id, question, timeout_s), task_id=task_id
+        )
 
     @server.tool()
     async def submit_result(
@@ -89,6 +93,8 @@ def create_worker_mcp(client: WorkerHubClient) -> FastMCP:
         result: ImplementerResult | ReviewerResult | RebaseResult,
     ) -> dict[str, Any]:
         """Submit the final result for a task, validated against the role's schema."""
-        return await invoke("submit_result", client.submit_result(task_id, result))
+        return await invoke(
+            "submit_result", client.submit_result(task_id, result), task_id=task_id
+        )
 
     return server
