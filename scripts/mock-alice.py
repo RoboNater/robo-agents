@@ -11,6 +11,13 @@ Usage:
     # (spec §2: Alice MCP tools run in-process with the hub). Use lower HUB_DEFAULT_WAIT_S
     # or stdio MCP mode for responsive handoffs.
     python scripts/mock-alice.py --db /path/to/hub.db --agent bob --harness claude-code
+
+    # 3. Step 4B endurance mode against a separately running HTTP hub/worker.
+    # Production guardrails require >=3 cycles and >=30 minutes. Point both
+    # --telemetry-log here and HUB_TELEMETRY_LOG in the worker at the same file.
+    python scripts/mock-alice.py --db /path/to/hub.db --agent bob \
+        --harness claude-code --timeout 300 --endurance \
+        --telemetry-log /absolute/path/endurance-worker.jsonl
 """
 
 from __future__ import annotations
@@ -22,7 +29,10 @@ import logging
 import os
 import shlex
 import sys
+from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any
 
 from agent_hub.database import database, initialize_database
@@ -76,6 +86,393 @@ async def _call(
 
 class AliceCrashError(RuntimeError):
     """Raised to simulate Alice crashing."""
+
+
+ENDURANCE_QUESTION = "May I continue the endurance probe?"
+
+
+def _long_work_action(harness: str | None, duration_s: float) -> str:
+    if harness == "claude-code":
+        return (
+            f"Run exactly `sleep {duration_s}` once with Bash using "
+            "run_in_background=true, then immediately call TaskOutput exactly once for that "
+            "task with block=true and a timeout higher than the sleep duration. Do not use "
+            "`wait`, Read, a polling loop, or another sleep. Call no hub MCP tool until "
+            "TaskOutput reports completion; the worker-mcp timer must keep you alive "
+            "independently."
+        )
+    return (
+        f"Run exactly `sleep {duration_s}` as one foreground shell command, setting the "
+        "shell-tool timeout higher than the sleep duration. Do not background it and do not "
+        "use a polling loop. Call no hub MCP tool until it finishes; the worker-mcp timer must "
+        "keep you alive independently."
+    )
+
+
+def _part_kind(part: dict[str, Any]) -> Any:
+    root = part.get("root")
+    normalized = root if isinstance(root, dict) else part
+    metadata = normalized.get("metadata")
+    return metadata.get("hub.kind") if isinstance(metadata, dict) else None
+
+
+def _verify_endurance_rows(
+    store: HubStore,
+    expected_agent: str,
+    task_ids: list[str],
+    prior_task_ids: set[str],
+) -> dict[str, int]:
+    """Prove retries did not duplicate durable assignments or mutations."""
+
+    current_ids = {task.id for task in store.tasks() if task.assignee == expected_agent}
+    new_ids = current_ids - prior_task_ids
+    if new_ids != set(task_ids):
+        raise RuntimeError(
+            f"Expected exactly {len(task_ids)} new tasks, found {len(new_ids)}: {new_ids}"
+        )
+
+    totals = {"assignments": 0, "questions": 0, "replies": 0, "results": 0}
+    for cycle, task_id in enumerate(task_ids):
+        counts = {key: 0 for key in totals}
+        for message in store.task_history(task_id):
+            kinds = [_part_kind(part) for part in message.parts if isinstance(part, dict)]
+            if message.direction == "from_alice" and "assignment" in kinds:
+                counts["assignments"] += 1
+            if message.direction == "to_alice" and "question" in kinds:
+                counts["questions"] += 1
+            if message.direction == "from_alice" and "reply" in kinds:
+                counts["replies"] += 1
+            if message.direction == "to_alice" and "result" in kinds:
+                counts["results"] += 1
+
+        expected = {
+            "assignments": 1,
+            "questions": 1 if cycle == 0 else 0,
+            "replies": 1 if cycle == 0 else 0,
+            "results": 1,
+        }
+        if counts != expected:
+            raise RuntimeError(f"Duplicate-row check failed for cycle {cycle + 1}: {counts}")
+        for key, count in counts.items():
+            totals[key] += count
+    return totals
+
+
+def _telemetry_time(record: dict[str, Any]) -> float:
+    value = record.get("timestamp")
+    if not isinstance(value, str):
+        raise RuntimeError("Telemetry record has no timestamp")
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise RuntimeError(f"Telemetry record has invalid timestamp {value!r}") from exc
+
+
+def verify_endurance_telemetry(
+    path: Path,
+    long_task_id: str,
+    worker_instance_id: str,
+    lost_after_s: float,
+) -> dict[str, int | float]:
+    """Check current-worker telemetry for retries and heartbeat-covered long work."""
+
+    try:
+        decoded = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read endurance telemetry {path}: {exc}") from exc
+    records = [
+        record
+        for record in decoded
+        if isinstance(record, dict) and record.get("worker_instance_id") == worker_instance_id
+    ]
+    if not records:
+        raise RuntimeError(
+            f"Telemetry has no records for worker instance {worker_instance_id!r}"
+        )
+
+    successful = [
+        record
+        for record in records
+        if record.get("event") == "tool_call" and record.get("phase") == "success"
+    ]
+    assignment_timeouts = sum(
+        record.get("tool") == "await_assignment" and record.get("outcome") == "timeout"
+        for record in successful
+    )
+    question_timeouts = sum(
+        record.get("tool") == "ask_alice" and record.get("outcome") == "timeout"
+        for record in successful
+    )
+    long_task_heartbeats = sum(
+        record.get("event") == "heartbeat"
+        and record.get("phase") == "success"
+        and record.get("accepted") is True
+        and record.get("current_task_id") == long_task_id
+        for record in records
+    )
+    session_records = [record for record in records if record.get("event") == "session_started"]
+    heartbeat_s = session_records[0].get("heartbeat_s") if session_records else None
+    if not isinstance(heartbeat_s, (int, float)) or heartbeat_s <= 0:
+        raise RuntimeError("Telemetry has no valid heartbeat interval for the current worker")
+    tool_times = sorted(
+        _telemetry_time(record)
+        for record in records
+        if record.get("event") == "tool_call"
+    )
+    heartbeat_times = sorted(
+        _telemetry_time(record)
+        for record in records
+        if record.get("event") == "heartbeat"
+        and record.get("phase") == "success"
+        and record.get("accepted") is True
+        and record.get("current_task_id") == long_task_id
+    )
+    long_work_tool_gap_s = 0.0
+    max_heartbeat_gap_s = 0.0
+    for before, after in pairwise(tool_times):
+        tool_gap_s = after - before
+        if tool_gap_s <= lost_after_s:
+            continue
+        covering = [timestamp for timestamp in heartbeat_times if before < timestamp < after]
+        if len(covering) < 2:
+            continue
+        heartbeat_gaps = [
+            right - left for left, right in pairwise([before, *covering, after])
+        ]
+        coverage_gap_s = max(heartbeat_gaps)
+        if coverage_gap_s <= heartbeat_s * 2:
+            long_work_tool_gap_s = max(long_work_tool_gap_s, tool_gap_s)
+            max_heartbeat_gap_s = max(max_heartbeat_gap_s, coverage_gap_s)
+    releases = sum(
+        record.get("tool") == "await_assignment" and record.get("outcome") == "release"
+        for record in successful
+    )
+    if assignment_timeouts < 1:
+        raise RuntimeError("Telemetry has no await_assignment timeout/retry evidence")
+    if question_timeouts < 1:
+        raise RuntimeError("Telemetry has no ask_alice timeout/retry evidence")
+    if long_task_heartbeats < 1:
+        raise RuntimeError("Telemetry has no accepted heartbeat during the long work interval")
+    if long_work_tool_gap_s <= lost_after_s:
+        raise RuntimeError(
+            "Telemetry has no heartbeat-covered gap between worker tool calls longer than "
+            f"HUB_LOST_AFTER_S={lost_after_s:g}"
+        )
+    if releases < 1:
+        raise RuntimeError("Telemetry has no clean release acknowledgement")
+    return {
+        "assignment_timeouts": assignment_timeouts,
+        "question_timeouts": question_timeouts,
+        "long_task_heartbeats": long_task_heartbeats,
+        "long_work_tool_gap_s": round(long_work_tool_gap_s, 3),
+        "max_heartbeat_gap_s": round(max_heartbeat_gap_s, 3),
+        "releases": releases,
+        "tool_errors": sum(
+            record.get("event") == "tool_call" and record.get("phase") == "error"
+            for record in records
+        ),
+        "transport_retries": sum(record.get("event") == "retry" for record in records),
+    }
+
+
+def wait_for_endurance_telemetry(
+    path: Path,
+    long_task_id: str,
+    worker_instance_id: str,
+    lost_after_s: float,
+    timeout_s: float,
+) -> dict[str, int | float]:
+    """Wait for the released worker's final telemetry record, then verify it."""
+
+    deadline = monotonic() + timeout_s
+    last_error: RuntimeError | None = None
+    while monotonic() < deadline:
+        try:
+            return verify_endurance_telemetry(
+                path, long_task_id, worker_instance_id, lost_after_s
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            sleep(0.5)
+    raise last_error or RuntimeError(f"No endurance telemetry appeared at {path}")
+
+
+async def drive_endurance(
+    store: HubStore,
+    expected_agent: str,
+    *,
+    expected_harness: str | None = None,
+    cycles: int = 3,
+    min_elapsed_s: float = 1800.0,
+    assignment_delay_s: float = 45.0,
+    cycle_gap_s: float = 480.0,
+    worker_hold_s: float = 20.0,
+    question_hold_s: float = 20.0,
+    question_reply_delay_s: float = 30.0,
+    long_work_s: float = 210.0,
+    lost_after_s: float = 180.0,
+    checkin_timeout_s: float = 300.0,
+) -> dict[str, Any]:
+    """Drive the Step 4B multi-cycle, long-running worker scenario."""
+
+    if cycles < 3:
+        raise ValueError("Endurance scenario requires at least 3 cycles")
+    if assignment_delay_s <= worker_hold_s:
+        raise ValueError("assignment_delay_s must exceed worker_hold_s")
+    if question_reply_delay_s <= question_hold_s:
+        raise ValueError("question_reply_delay_s must exceed question_hold_s")
+    if long_work_s <= lost_after_s:
+        raise ValueError("long_work_s must exceed lost_after_s")
+
+    logger.info("Endurance Alice waiting for worker %r to check in...", expected_agent)
+    checkin_deadline = monotonic() + checkin_timeout_s
+    agent = store.agent_by_name(expected_agent)
+    while (
+        agent is None or agent.status == AgentStatus.RELEASED
+    ) and monotonic() < checkin_deadline:
+        await asyncio.sleep(0.1)
+        agent = store.agent_by_name(expected_agent)
+    if agent is None or agent.status == AgentStatus.RELEASED:
+        raise TimeoutError(f"Worker {expected_agent!r} did not check in")
+    if expected_harness is not None and agent.harness != expected_harness:
+        raise ValueError(
+            f"Worker {expected_agent!r} checked in with harness {agent.harness!r}, "
+            f"expected {expected_harness!r}"
+        )
+    if not agent.worker_instance_id:
+        raise RuntimeError(f"Worker {expected_agent!r} has no worker instance ID")
+    worker_instance_id = agent.worker_instance_id
+
+    started = monotonic()
+    prior_task_ids = {task.id for task in store.tasks() if task.assignee == expected_agent}
+    logger.info(
+        "Worker checked in; delaying first assignment %.1fs to force an await timeout",
+        assignment_delay_s,
+    )
+    await asyncio.sleep(assignment_delay_s)
+
+    task_ids: list[str] = []
+    long_interval_s = 0.0
+    heartbeat_before = ""
+    heartbeat_after = ""
+    last_delivery_id: str | None = None
+    per_task_timeout_s = max(300.0, long_work_s + question_reply_delay_s + 120.0)
+
+    for cycle in range(cycles):
+        if cycle:
+            logger.info(
+                "Cycle %d complete; waiting %.1fs before the next assignment", cycle, cycle_gap_s
+            )
+            await asyncio.sleep(cycle_gap_s)
+
+        if cycle == 0:
+            action = (
+                f"Call ask_alice for this task with the exact question {ENDURANCE_QUESTION!r} "
+                f"and timeout_s={question_hold_s}. When it times out, call ask_alice again "
+                "with the identical question until Alice replies."
+            )
+        elif cycle == 1:
+            action = _long_work_action(expected_harness, long_work_s)
+        else:
+            action = "Complete this cycle immediately."
+        instructions = (
+            f"Endurance probe cycle {cycle + 1} of {cycles}. Do not edit repository files. "
+            f"{action} Then call submit_result once with an ImplementerResult whose outcome is "
+            "completed, summary names this cycle, pr_url is "
+            "https://github.com/RoboNater/robo-agents/pull/30, and head_sha is "
+            "0123456789abcdef0123456789abcdef01234567. After completion, keep looping on "
+            f"await_assignment(timeout_s={worker_hold_s}); retry every timeout until release."
+        )
+        task = store.assign_task(
+            expected_agent,
+            "implementer",
+            f"Endurance cycle {cycle + 1}",
+            instructions,
+            lease_min=max(30.0, (long_work_s + 300.0) / 60.0),
+        )
+        task_ids.append(task.id)
+        assigned_at = monotonic()
+        if cycle == 1:
+            current = store.agent_by_name(expected_agent)
+            heartbeat_before = current.last_heartbeat if current is not None else ""
+        logger.info("Assigned endurance cycle %d: %s", cycle + 1, task.id)
+
+        replied = False
+        task_deadline = monotonic() + per_task_timeout_s
+        finished = False
+        while monotonic() < task_deadline:
+            event = await store.wait_for_event(timeout_s=0.5, ack=last_delivery_id)
+            last_delivery_id = None
+            if event is None:
+                continue
+            last_delivery_id = event.delivery_id
+            if event.kind == EventKind.WORKER_QUESTION and event.payload.get("task_id") == task.id:
+                if cycle != 0:
+                    raise RuntimeError(f"Unexpected question during cycle {cycle + 1}")
+                if not replied:
+                    logger.info(
+                        "Holding question reply %.1fs to force ask_alice timeout/retry",
+                        question_reply_delay_s,
+                    )
+                    await asyncio.sleep(question_reply_delay_s)
+                    applied = store.reply(
+                        task.id,
+                        "Approved. Continue the endurance probe.",
+                        message_id=event.payload.get("message_id"),
+                    )
+                    if not applied:
+                        raise RuntimeError("Endurance question reply was not applied")
+                    replied = True
+            elif (
+                event.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED)
+                and event.payload.get("task_id") == task.id
+            ):
+                if event.kind is EventKind.TASK_FAILED:
+                    raise RuntimeError(f"Endurance cycle {cycle + 1} failed: {event.payload}")
+                finished = True
+                break
+        if not finished:
+            raise TimeoutError(f"Endurance cycle {cycle + 1} did not finish")
+        if cycle == 0 and not replied:
+            raise RuntimeError("Worker completed cycle 1 without the required question")
+        if cycle == 1:
+            long_interval_s = monotonic() - assigned_at
+            current = store.agent_by_name(expected_agent)
+            heartbeat_after = current.last_heartbeat if current is not None else ""
+            if long_interval_s < long_work_s:
+                raise RuntimeError(
+                    f"Long work interval lasted {long_interval_s:.1f}s, "
+                    f"expected >= {long_work_s:.1f}s"
+                )
+            if not heartbeat_before or heartbeat_after <= heartbeat_before:
+                raise RuntimeError("Worker heartbeat did not advance during the long work interval")
+
+    remaining = min_elapsed_s - (monotonic() - started)
+    if remaining > 0:
+        logger.info("Holding release %.1fs so the run reaches its minimum duration", remaining)
+        await asyncio.sleep(remaining)
+    if last_delivery_id:
+        store.ack_event(last_delivery_id)
+
+    elapsed_s = monotonic() - started
+    store.release_agent(expected_agent)
+    store.set_workflow_status(
+        WorkflowStatus.DONE,
+        f"Endurance scenario completed {cycles} cycles in {elapsed_s:.1f}s",
+    )
+    row_counts = _verify_endurance_rows(store, expected_agent, task_ids, prior_task_ids)
+    logger.info("Endurance scenario complete; database duplicate checks passed: %s", row_counts)
+    return {
+        "agent": expected_agent,
+        "harness": agent.harness,
+        "worker_instance_id": worker_instance_id,
+        "elapsed_s": round(elapsed_s, 3),
+        "cycles": cycles,
+        "task_ids": task_ids,
+        "long_work_interval_s": round(long_interval_s, 3),
+        "heartbeat_advanced": heartbeat_after > heartbeat_before,
+        "row_counts": row_counts,
+    }
 
 
 async def drive_one_task_mcp(
@@ -539,11 +936,96 @@ def main() -> None:
         default=f'"{sys.executable}" -m agent_hub.main',
         help="Command to launch hub when running with --mcp (parsed quote-aware)",
     )
+    parser.add_argument(
+        "--endurance",
+        action="store_true",
+        help="Run the Step 4B multi-cycle scenario (direct database mode only)",
+    )
+    parser.add_argument("--cycles", type=int, default=3, help="Endurance assignment cycles")
+    parser.add_argument(
+        "--min-elapsed-s", type=float, default=1800.0, help="Minimum endurance run duration"
+    )
+    parser.add_argument(
+        "--assignment-delay-s",
+        type=float,
+        default=45.0,
+        help="Delay before cycle 1; must exceed the worker hold timeout",
+    )
+    parser.add_argument(
+        "--cycle-gap-s", type=float, default=480.0, help="Delay between completed cycles"
+    )
+    parser.add_argument(
+        "--worker-hold-s", type=float, default=20.0, help="Hold requested by worker instructions"
+    )
+    parser.add_argument(
+        "--question-hold-s", type=float, default=20.0, help="Question hold in cycle 1"
+    )
+    parser.add_argument(
+        "--question-reply-delay-s",
+        type=float,
+        default=30.0,
+        help="Alice reply delay; must exceed the question hold",
+    )
+    parser.add_argument(
+        "--long-work-s",
+        type=float,
+        default=None,
+        help="No-tool work interval; defaults to HUB_LOST_AFTER_S + 30",
+    )
+    parser.add_argument(
+        "--telemetry-log",
+        type=Path,
+        default=None,
+        help="Worker JSONL telemetry to verify after an endurance run",
+    )
 
     args = parser.parse_args()
 
     try:
-        if args.mcp:
+        if args.endurance:
+            if args.mcp:
+                parser.error("--endurance cannot be combined with --mcp")
+            if args.cycles < 3:
+                parser.error("--cycles must be at least 3")
+            if args.min_elapsed_s < 1800:
+                parser.error("--min-elapsed-s must be at least 1800 for an endurance run")
+            if args.telemetry_log is None:
+                parser.error("--telemetry-log is required for an endurance run")
+            if not args.telemetry_log.is_absolute():
+                parser.error("--telemetry-log must be an absolute path")
+            db_path = Path(args.db).resolve()
+            initialize_database(db_path)
+            store = HubStore(db_path)
+            lost_after_s = HubSettings.from_env().lost_after_s
+            long_work_s = (
+                lost_after_s + 30.0 if args.long_work_s is None else args.long_work_s
+            )
+            result = asyncio.run(
+                drive_endurance(
+                    store,
+                    args.agent,
+                    expected_harness=args.harness,
+                    cycles=args.cycles,
+                    min_elapsed_s=args.min_elapsed_s,
+                    assignment_delay_s=args.assignment_delay_s,
+                    cycle_gap_s=args.cycle_gap_s,
+                    worker_hold_s=args.worker_hold_s,
+                    question_hold_s=args.question_hold_s,
+                    question_reply_delay_s=args.question_reply_delay_s,
+                    long_work_s=long_work_s,
+                    lost_after_s=lost_after_s,
+                    checkin_timeout_s=args.timeout,
+                )
+            )
+            telemetry = wait_for_endurance_telemetry(
+                args.telemetry_log.resolve(),
+                result["task_ids"][1],
+                result["worker_instance_id"],
+                lost_after_s,
+                args.worker_hold_s + 30.0,
+            )
+            result["telemetry"] = telemetry
+        elif args.mcp:
             cmd_parts = _parse_cmd(args.hub_cmd)
             params = StdioServerParameters(
                 command=cmd_parts[0],

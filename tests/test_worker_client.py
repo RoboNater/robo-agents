@@ -1,5 +1,7 @@
 import asyncio
+import json
 from dataclasses import replace
+from pathlib import Path
 
 import httpx
 import pytest
@@ -369,7 +371,7 @@ async def test_stream_rpc_json_error_raises_protocol_error(
 
 
 async def test_retry_on_503(
-    worker_settings: WorkerSettings,
+    worker_settings: WorkerSettings, tmp_path: Path
 ) -> None:
     attempts = 0
 
@@ -384,10 +386,19 @@ async def test_retry_on_503(
     async with httpx.AsyncClient(
         transport=transport, base_url=worker_settings.hub_url
     ) as mock_client:
-        worker = WorkerHubClient(worker_settings, http_client=mock_client)
+        telemetry_path = tmp_path / "retry.jsonl"
+        configured = replace(worker_settings, telemetry_log=telemetry_path)
+        worker = WorkerHubClient(configured, http_client=mock_client)
         resp = await worker._request_with_retry("GET", "/healthz")
         assert resp.status_code == 200
         assert attempts == 2
+        records = [
+            json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+        ]
+        retries = [record for record in records if record.get("event") == "retry"]
+        assert len(retries) == 1
+        assert retries[0]["attempt"] == 1
+        assert retries[0]["reason"] == "http_503"
 
 
 async def test_worker_submit_typed_implementer_result(

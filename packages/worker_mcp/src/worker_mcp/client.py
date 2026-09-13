@@ -24,6 +24,7 @@ from agent_hub_common import (
 )
 
 from .config import WorkerSettings
+from .telemetry import TelemetryLog
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,20 @@ class WorkerHubClient:
         self._client: httpx.AsyncClient | None = http_client
         self.context_id: str | None = None
         self.worker_instance_id = uuid4().hex
+        self.telemetry = TelemetryLog(
+            settings.telemetry_log,
+            agent=settings.agent_name,
+            worker_instance_id=self.worker_instance_id,
+            session_fields={
+                "harness": settings.profile.harness,
+                "harness_version": settings.profile.harness_version,
+                "provider": settings.profile.provider,
+                "model": settings.profile.model,
+                "model_source": settings.profile.model_source.value,
+                "heartbeat_s": settings.heartbeat_s,
+                "max_retries": settings.max_retries,
+            },
+        )
         self.current_task_id: str | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         # Active pending question (question_text, message_id) per task (§4.1)
@@ -81,6 +96,7 @@ class WorkerHubClient:
         if self._external_client is None and self._client is not None:
             await self._client.aclose()
             self._client = None
+        self.telemetry.emit("session_stopped")
 
     def start_heartbeat(self) -> None:
         """Start the process-level heartbeat timer once."""
@@ -105,10 +121,23 @@ class WorkerHubClient:
             if self.context_id is None:
                 continue
             try:
-                await self.heartbeat()
-            except Exception:
+                accepted = await self.heartbeat()
+                self.telemetry.emit(
+                    "heartbeat",
+                    phase="success",
+                    accepted=accepted,
+                    current_task_id=self.current_task_id,
+                )
+            except Exception as exc:
                 # The normal request retry policy has already been exhausted;
                 # keep worker MCP alive so the next timer tick can recover.
+                self.telemetry.emit(
+                    "heartbeat",
+                    phase="error",
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                    current_task_id=self.current_task_id,
+                )
                 logger.exception("Background heartbeat failed")
 
     async def heartbeat(self) -> bool:
@@ -174,6 +203,14 @@ class WorkerHubClient:
                 if retryable:
                     attempts += 1
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                    self.telemetry.emit(
+                        "retry",
+                        operation=f"{method} {path}",
+                        attempt=attempts,
+                        max_retries=self.settings.max_retries,
+                        reason=f"http_{response.status_code}",
+                        delay_s=delay,
+                    )
                     logger.warning(
                         "Hub returned %s on %s %s; retrying in %.2fs (attempt %d/%d)",
                         response.status_code,
@@ -190,6 +227,14 @@ class WorkerHubClient:
                 if attempts < self.settings.max_retries:
                     attempts += 1
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                    self.telemetry.emit(
+                        "retry",
+                        operation=f"{method} {path}",
+                        attempt=attempts,
+                        max_retries=self.settings.max_retries,
+                        reason=type(exc).__name__,
+                        delay_s=delay,
+                    )
                     logger.warning(
                         "Transport or timeout error (%s) on %s %s; retrying in %.2fs "
                         "(attempt %d/%d)",
@@ -273,6 +318,14 @@ class WorkerHubClient:
                     if retryable:
                         attempts += 1
                         delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                        self.telemetry.emit(
+                            "retry",
+                            operation=method,
+                            attempt=attempts,
+                            max_retries=self.settings.max_retries,
+                            reason=f"http_{response.status_code}",
+                            delay_s=delay,
+                        )
                         logger.warning(
                             "Hub returned %s on stream; retrying in %.2fs (attempt %d/%d)",
                             response.status_code,
@@ -350,6 +403,14 @@ class WorkerHubClient:
                 if attempts < self.settings.max_retries:
                     attempts += 1
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
+                    self.telemetry.emit(
+                        "retry",
+                        operation=method,
+                        attempt=attempts,
+                        max_retries=self.settings.max_retries,
+                        reason=type(exc).__name__,
+                        delay_s=delay,
+                    )
                     logger.warning(
                         "Transport or timeout error (%s) on stream; retrying in %.2fs "
                         "(attempt %d/%d)",

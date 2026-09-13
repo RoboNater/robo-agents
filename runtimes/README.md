@@ -34,3 +34,32 @@ Before using a template:
    When `HUB_MODEL` is empty the agent may declare its own model through `check_in(model=...)`,
    recorded with `model_source: declared`; a value set here wins and is recorded as `env`.
    `AGENT_RUNTIME`, the Step 4 name for `HUB_HARNESS`, is still honoured when `HUB_HARNESS` is unset.
+
+For endurance runs, replace the empty `HUB_TELEMETRY_LOG` in the runtime's MCP
+configuration with an absolute path. `worker-mcp` appends JSON Lines records
+for MCP tool calls and outcomes, errors, HTTP retry attempts, and timer
+heartbeats. Reusing the path across a supervised restart is intentional: each
+process has a distinct `session_id` and `worker_instance_id`.
+The endurance verifier selects only the checked-in worker instance, and the
+supervisor considers only records appended after it launches, so older records
+at the same path cannot satisfy the current run.
+
+Claude Code print mode may end a turn while work is still pending. For an
+endurance run, keep one streaming process and its `worker-mcp` child alive with
+the policy-free supervisor (Alice still owns every assignment and decision):
+
+```sh
+CLAUDE_MCP_CONFIG=/absolute/path/claude-code.mcp.json \
+HUB_TELEMETRY_LOG=/absolute/path/endurance-worker.jsonl \
+scripts/supervise-claude-code.sh
+```
+
+The `HUB_TELEMETRY_LOG` above and the value in `claude-code.mcp.json` must name
+the same file.
+
+This launcher is specific to the Step 4B endurance scenario, not the general
+Step 5 worker launcher. It pre-approves only literal `sleep` commands, the
+blocking background-task wait that Claude Code requires for long sleeps, and
+the four worker coordination tools. It sends a continuation message after a
+premature end-turn, and exits only after telemetry records the hub's release
+response.
