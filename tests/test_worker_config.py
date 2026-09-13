@@ -23,7 +23,8 @@ def test_worker_settings_parses_valid_env() -> None:
     assert settings.backoff_factor_s == 0.5
 
 
-def test_worker_settings_custom_overrides() -> None:
+def test_worker_settings_custom_overrides(tmp_path: Path) -> None:
+    telemetry_path = tmp_path / "worker-telemetry.jsonl"
     env = {
         "HUB_URL": "https://hub.example.com",
         "HUB_TOKEN": "token-123",
@@ -37,7 +38,7 @@ def test_worker_settings_custom_overrides() -> None:
         "HUB_HEARTBEAT_S": "12.5",
         "HUB_MAX_RETRIES": "5",
         "HUB_BACKOFF_FACTOR_S": "1.5",
-        "HUB_TELEMETRY_LOG": "/tmp/worker-telemetry.jsonl",
+        "HUB_TELEMETRY_LOG": str(telemetry_path),
     }
     settings = WorkerSettings.from_env(env)
     assert settings.hub_url == "https://hub.example.com"
@@ -54,7 +55,7 @@ def test_worker_settings_custom_overrides() -> None:
     assert settings.heartbeat_s == 12.5
     assert settings.max_retries == 5
     assert settings.backoff_factor_s == 1.5
-    assert settings.telemetry_log == Path("/tmp/worker-telemetry.jsonl")
+    assert settings.telemetry_log == telemetry_path
 
 
 @pytest.mark.parametrize(

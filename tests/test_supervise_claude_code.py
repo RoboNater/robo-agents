@@ -1,8 +1,16 @@
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX bash supervisor is not supported on Windows",
+)
 def test_supervisor_reprompts_one_persistent_session_until_release(tmp_path: Path) -> None:
     fake_claude = tmp_path / "fake-claude"
     input_log = tmp_path / "inputs.jsonl"
@@ -53,5 +61,7 @@ done
     assert "release observed after 1 supervisor reprompt" in completed.stderr
     messages = input_log.read_text(encoding="utf-8").splitlines()
     assert len(messages) == 2
-    assert "unattended worker" in messages[0]
-    assert "Continue the unattended worker loop" in messages[1]
+    prompts = [json.loads(message)["message"]["content"][0]["text"] for message in messages]
+    assert "unattended worker" in prompts[0]
+    assert "Continue the unattended worker loop" in prompts[1]
+    assert "path/URL" in prompts[1]

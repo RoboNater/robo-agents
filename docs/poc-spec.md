@@ -35,16 +35,18 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
                                                 │ HTTP :8420  (A2A JSON-RPC + agent card)
                  ┌──────────────────────────────┴──────────────────────────────┐
                  ▼                                                              ▼
- ┌──── Bob: Claude Code ─────┐                                     ┌──── Charlie: Codex CLI ────┐
- │ LLM runtime ─stdio MCP─▶ worker-mcp (A2A client)               │ LLM runtime ─stdio MCP─▶ worker-mcp
+ ┌────────────── Bob: Claude Code ──────────────┐                  ┌──── Charlie: Codex CLI ────┐
+ │ LLM runtime ─▶ thin supervisor ─stdio MCP─▶ worker-mcp         │ LLM runtime ─stdio MCP─▶ worker-mcp
+ │                 (no orchestration policy)     (A2A client)      │                         (A2A client)
  │   role guide via get_role_guide(role) ◀── served by hub ──▶    │   role guide via get_role_guide(role)
- └───────────────────────────┘                                     └────────────────────────────┘
+ └──────────────────────────────────────────────┘                  └────────────────────────────┘
 ```
 
 **Key design decisions**
 - LLMs can't wait, so **the hub waits for them.** Alice's brain is a handler: `wait_for_event()` → think → act → repeat.
 - **One process for hub + Alice's MCP server.** Launched by Alice's runtime as a stdio MCP server; it also binds the HTTP port. State in SQLite so a restarted Alice resumes. (Split into a standalone service later if needed.)
 - **Only Alice is an A2A server.** Workers are A2A clients → workers need no inbound port, which is what makes networking trivial.
+- **Bob's supervisor is transport-only.** It keeps one Claude Code session and its `worker-mcp` child alive by repeating a fixed continuation prompt after a premature end-turn. It holds no assignment, retry, or orchestration policy; Alice and the worker role guide remain authoritative.
 - **Runtime mix (decided):** Alice + Bob on Claude Code, Charlie on Codex CLI (`charlie`), configured via `runtimes/codex.config.toml` (settled in Step 4). Consequence: **role guidance cannot depend on Claude Code skills.** The hub serves role guides over HTTP and `worker-mcp` exposes them as a tool, so every runtime gets identical instructions. Claude Code skill files become a thin wrapper that says "call `get_role_guide`."
 - **Alice mode (decided): interactive Claude Code session.** Alice has `gh` in her env and performs the merge herself.
 - **Blocking tools with bounded timeouts** (default 120 s, under runtime MCP tool timeouts). Tool returns `{"event": null}` on timeout and the skill says "call again." No agent ever spins.
