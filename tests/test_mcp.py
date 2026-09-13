@@ -14,12 +14,13 @@ import pytest
 from agent_hub.database import database, initialize_database
 from agent_hub.mcp import CancellableStdout, create_mcp
 from agent_hub.store import HubStore
-from agent_hub_common import SCHEMA_VERSION, AgentProfile, MetaKeys
+from agent_hub_common import MAX_MESSAGE_PART_BYTES, SCHEMA_VERSION, AgentProfile, MetaKeys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 TOOLS = {
     "get_state",
+    "initialize_workflow",
     "wait_for_event",
     "assign_task",
     "reply",
@@ -44,7 +45,38 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
 
     assert {t.name for t in await server.list_tools()} == TOOLS
     assert (await call("get_state"))["workflow"] is None
+    with pytest.raises(Exception, match="initialize_workflow.*set_workflow_status"):
+        await call("set_workflow_status", status="done", summary="Too early")
+    with pytest.raises(Exception, match="invalid workflow policy.*max_review_round"):
+        await call(
+            "initialize_workflow",
+            goal="Address issue #5",
+            policy={"max_review_round": 5},
+        )
+    assert (await call("get_state"))["workflow"] is None
+    initialized = await call(
+        "initialize_workflow",
+        goal="Address issue #5",
+        policy={"max_task_lease_min": 10},
+    )
+    assert initialized["policy"] == {"max_task_lease_min": 10}
+    assert (
+        await call(
+            "initialize_workflow",
+            goal="Address issue #5",
+            policy={"max_task_lease_min": 10},
+        )
+    )["id"] == initialized["id"]
     bob = store.check_in("bob", AgentProfile(capabilities=("python",)))
+    with pytest.raises(Exception, match=f"maximum is {MAX_MESSAGE_PART_BYTES} bytes"):
+        await call(
+            "assign_task",
+            agent="bob",
+            role="implementer",
+            title="Too large",
+            instructions="x" * MAX_MESSAGE_PART_BYTES,
+        )
+    assert store.tasks() == []
     pending = asyncio.create_task(store.await_assignment(bob.context_id, 1))
     await asyncio.sleep(0)
     task = await call(

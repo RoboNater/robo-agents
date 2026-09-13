@@ -29,14 +29,15 @@ import logging
 import os
 import shlex
 import sys
+from dataclasses import asdict
 from datetime import datetime
 from itertools import pairwise
 from pathlib import Path
 from time import monotonic, sleep
-from typing import Any
+from typing import Any, Protocol
 
-from agent_hub.database import database, initialize_database
-from agent_hub.store import HubStore
+from agent_hub.database import initialize_database
+from agent_hub.store import DEFAULT_GOAL, HubStore
 from agent_hub_common import (
     AgentStatus,
     ConfigurationError,
@@ -82,6 +83,17 @@ async def _call(
             )
         raise RuntimeError(f"Tool {name} failed: {error_msg or result}")
     return _extract_tool_data(result)
+
+
+async def _call_dict(
+    session: ClientSession,
+    name: str,
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = await _call(session, name, arguments)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Tool {name} returned {type(data).__name__}, expected an object")
+    return data
 
 
 class AliceCrashError(RuntimeError):
@@ -324,6 +336,8 @@ async def drive_endurance(
     if long_work_s <= lost_after_s:
         raise ValueError("long_work_s must exceed lost_after_s")
 
+    store.initialize_workflow()
+
     logger.info("Endurance Alice waiting for worker %r to check in...", expected_agent)
     checkin_deadline = monotonic() + checkin_timeout_s
     agent = store.agent_by_name(expected_agent)
@@ -475,6 +489,370 @@ async def drive_endurance(
     }
 
 
+class AliceBackend(Protocol):
+    """The small Alice tool surface used by the reference lifecycle."""
+
+    label: str
+
+    async def initialize_workflow(self, goal: str, policy: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def get_state(self) -> dict[str, Any]: ...
+
+    async def wait_for_event(
+        self, timeout_s: float, ack: str | None = None
+    ) -> dict[str, Any]: ...
+
+    async def assign_task(
+        self, agent: str, role: str, title: str, instructions: str
+    ) -> dict[str, Any]: ...
+
+    async def reply(self, task_id: str, text: str, message_id: int | None) -> dict[str, Any]: ...
+
+    async def release_agent(self, agent: str) -> dict[str, Any]: ...
+
+    async def set_workflow_status(self, status: str, summary: str) -> dict[str, Any]: ...
+
+    async def log_decision(
+        self, summary: str, rationale: str, key: str | None
+    ) -> dict[str, Any]: ...
+
+
+class DirectStoreBackend:
+    """Alice backend using direct HubStore calls."""
+
+    label = "direct store"
+
+    def __init__(self, store: HubStore) -> None:
+        self.store = store
+
+    async def initialize_workflow(self, goal: str, policy: dict[str, Any]) -> dict[str, Any]:
+        workflow_id = self.store.initialize_workflow(goal, policy)
+        workflow = self.store.get_state()["workflow"]
+        return {"id": workflow_id, "goal": workflow["goal"], "policy": workflow["policy"]}
+
+    async def get_state(self) -> dict[str, Any]:
+        return self.store.get_state()
+
+    async def wait_for_event(
+        self, timeout_s: float, ack: str | None = None
+    ) -> dict[str, Any]:
+        # Direct database mode may be observing another process, whose Signals
+        # registry cannot wake this store instance. The shared driver reconciles
+        # state after an empty slice, so 50 ms deliberately polls SQLite at up to
+        # 20 Hz; that tradeoff is acceptable for this reference harness.
+        event = await self.store.wait_for_event(timeout_s=min(timeout_s, 0.05), ack=ack)
+        return {"event": None if event is None else asdict(event)}
+
+    async def assign_task(
+        self, agent: str, role: str, title: str, instructions: str
+    ) -> dict[str, Any]:
+        task = asdict(self.store.assign_task(agent, role, title, instructions))
+        await asyncio.sleep(0)
+        return task
+
+    async def reply(self, task_id: str, text: str, message_id: int | None) -> dict[str, Any]:
+        applied = self.store.reply(task_id, text, message_id)
+        await asyncio.sleep(0)
+        return {"ok": True, "applied": applied}
+
+    async def release_agent(self, agent: str) -> dict[str, Any]:
+        released = asdict(self.store.release_agent(agent))
+        await asyncio.sleep(0)
+        return released
+
+    async def set_workflow_status(self, status: str, summary: str) -> dict[str, Any]:
+        self.store.set_workflow_status(WorkflowStatus(status), summary)
+        return {"ok": True}
+
+    async def log_decision(
+        self, summary: str, rationale: str, key: str | None
+    ) -> dict[str, Any]:
+        return {"id": self.store.log_decision(summary, rationale, key=key)}
+
+
+class McpBackend:
+    """Alice backend using the public MCP tools."""
+
+    label = "MCP"
+
+    def __init__(self, session: ClientSession) -> None:
+        self.session = session
+
+    async def initialize_workflow(self, goal: str, policy: dict[str, Any]) -> dict[str, Any]:
+        return await _call_dict(
+            self.session, "initialize_workflow", {"goal": goal, "policy": policy}
+        )
+
+    async def get_state(self) -> dict[str, Any]:
+        return await _call_dict(self.session, "get_state")
+
+    async def wait_for_event(
+        self, timeout_s: float, ack: str | None = None
+    ) -> dict[str, Any]:
+        arguments: dict[str, Any] = {"timeout_s": timeout_s}
+        if ack is not None:
+            arguments["ack"] = ack
+        return await _call_dict(self.session, "wait_for_event", arguments)
+
+    async def assign_task(
+        self, agent: str, role: str, title: str, instructions: str
+    ) -> dict[str, Any]:
+        return await _call_dict(
+            self.session,
+            "assign_task",
+            {"agent": agent, "role": role, "title": title, "instructions": instructions},
+        )
+
+    async def reply(self, task_id: str, text: str, message_id: int | None) -> dict[str, Any]:
+        return await _call_dict(
+            self.session,
+            "reply",
+            {"task_id": task_id, "text": text, "message_id": message_id},
+        )
+
+    async def release_agent(self, agent: str) -> dict[str, Any]:
+        return await _call_dict(self.session, "release_agent", {"agent": agent})
+
+    async def set_workflow_status(self, status: str, summary: str) -> dict[str, Any]:
+        return await _call_dict(
+            self.session,
+            "set_workflow_status",
+            {"status": status, "summary": summary},
+        )
+
+    async def log_decision(
+        self, summary: str, rationale: str, key: str | None
+    ) -> dict[str, Any]:
+        return await _call_dict(
+            self.session,
+            "log_decision",
+            {"summary": summary, "rationale": rationale, "key": key},
+        )
+
+
+def _find_agent(state: dict[str, Any], name: str) -> dict[str, Any] | None:
+    return next(
+        (
+            agent
+            for agent in state.get("agents") or []
+            if isinstance(agent, dict)
+            and agent.get("name") == name
+            and agent.get("status") != AgentStatus.RELEASED.value
+        ),
+        None,
+    )
+
+
+def _find_task(state: dict[str, Any], assignee: str) -> dict[str, Any] | None:
+    active_states = {
+        TaskState.WORKING.value,
+        TaskState.SUBMITTED.value,
+        TaskState.INPUT_REQUIRED.value,
+        TaskState.COMPLETED.value,
+        TaskState.FAILED.value,
+    }
+    return next(
+        (
+            task
+            for task in state.get("tasks") or []
+            if isinstance(task, dict)
+            and task.get("assignee") == assignee
+            and task.get("state") in active_states
+        ),
+        None,
+    )
+
+
+def _check_harness(
+    agent_name: str, checked_in_harness: Any, expected_harness: str | None
+) -> None:
+    if expected_harness is not None and checked_in_harness != expected_harness:
+        raise ValueError(
+            f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
+            f"expected {expected_harness!r}"
+        )
+    if expected_harness is not None:
+        logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
+
+
+async def drive_one_task_with_backend(
+    backend: AliceBackend,
+    expected_agent: str,
+    role: str = "implementer",
+    title: str = "Fix issue #1",
+    instructions: str = "Implement the requested changes and add tests.",
+    timeout_s: float = 60.0,
+    expected_harness: str | None = None,
+    crash_at: str | None = None,
+    workflow_goal: str = DEFAULT_GOAL,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Drive the lifecycle once over either Alice backend, including recovery."""
+
+    await backend.initialize_workflow(workflow_goal, dict(policy or {}))
+    logger.info(
+        "Alice (%s) is ready. Waiting for worker %r to check in...",
+        backend.label,
+        expected_agent,
+    )
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    last_delivery_id: str | None = None
+    state = await backend.get_state()
+    existing_task = _find_task(state, expected_agent)
+    known_agent = _find_agent(state, expected_agent)
+    agent_name: str | None
+    task_finished = False
+    result_data: dict[str, Any] = {}
+
+    if existing_task is not None:
+        agent_name = expected_agent
+        task_id = str(existing_task.get("id") or "")
+        _check_harness(
+            agent_name,
+            None if known_agent is None else known_agent.get("harness"),
+            expected_harness,
+        )
+        logger.info(
+            "Worker %r already has task %s (state=%s), resuming...",
+            agent_name,
+            task_id,
+            existing_task.get("state"),
+        )
+        if existing_task.get("state") in (TaskState.COMPLETED.value, TaskState.FAILED.value):
+            result_data = existing_task.get("result") or {}
+    else:
+        agent_name = None
+        checked_in_harness: Any = None
+        checkin_event_id: Any = None
+        while agent_name is None and asyncio.get_running_loop().time() < deadline:
+            if crash_at == "before_ack" and last_delivery_id:
+                raise AliceCrashError("Simulated Alice crash before ack")
+
+            state = await backend.get_state()
+            known_agent = _find_agent(state, expected_agent)
+            timeout_to_use = (
+                0.05
+                if known_agent is not None and last_delivery_id is None
+                else max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
+            )
+            delivered = await backend.wait_for_event(timeout_to_use, last_delivery_id)
+            event = delivered.get("event") if isinstance(delivered, dict) else None
+            if not isinstance(event, dict):
+                if known_agent is not None:
+                    agent_name = expected_agent
+                    checked_in_harness = known_agent.get("harness")
+                continue
+
+            last_delivery_id = event.get("delivery_id")
+            if crash_at == "delivery":
+                raise AliceCrashError("Simulated Alice crash at delivery")
+            payload = event.get("payload") or {}
+            if event.get("kind") == EventKind.AGENT_CHECKED_IN.value and (
+                isinstance(payload, dict) and payload.get("agent") == expected_agent
+            ):
+                agent_name = expected_agent
+                checked_in_harness = payload.get("harness")
+                checkin_event_id = event.get("id")
+
+        if agent_name is None:
+            raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
+        _check_harness(agent_name, checked_in_harness, expected_harness)
+
+        checkpoint_source = (
+            f"event:{checkin_event_id}" if checkin_event_id is not None else f"agent:{agent_name}"
+        )
+        await backend.log_decision(
+            f"Assigned task to {agent_name} for role {role}",
+            f"Initial assignment for role {role}",
+            f"{checkpoint_source}:assign",
+        )
+        task = await backend.assign_task(agent_name, role, title, instructions)
+        task_id = str(task.get("id") or "")
+        logger.info("Task assigned: id=%s title=%r", task_id, title)
+        if crash_at == "after_action":
+            raise AliceCrashError("Simulated Alice crash after action")
+
+    while not task_finished and asyncio.get_running_loop().time() < deadline:
+        if crash_at == "before_ack" and last_delivery_id:
+            raise AliceCrashError("Simulated Alice crash before ack")
+
+        terminal_recovery = (
+            existing_task is not None
+            and existing_task.get("state")
+            in (TaskState.COMPLETED.value, TaskState.FAILED.value)
+        )
+        delivered = await backend.wait_for_event(
+            0.05 if terminal_recovery else 5.0,
+            last_delivery_id,
+        )
+        event = delivered.get("event") if isinstance(delivered, dict) else None
+        if not isinstance(event, dict):
+            current = _find_task(await backend.get_state(), expected_agent)
+            if current is not None and current.get("id") == task_id and current.get("state") in (
+                TaskState.COMPLETED.value,
+                TaskState.FAILED.value,
+            ):
+                task_finished = True
+                result_data = current.get("result") or {}
+            continue
+
+        last_delivery_id = event.get("delivery_id")
+        if crash_at == "delivery":
+            raise AliceCrashError("Simulated Alice crash at delivery")
+
+        kind = event.get("kind")
+        payload = event.get("payload") or {}
+        logger.info("Observed event: %s", kind)
+        if kind == EventKind.TASK_PROGRESS.value:
+            logger.info("Progress reported: %s", payload.get("note"))
+        elif kind == EventKind.WORKER_QUESTION.value:
+            question_task_id = str(payload.get("task_id") or "")
+            message_id = payload.get("message_id")
+            logger.info(
+                "Worker asked question on %s: %r",
+                question_task_id,
+                payload.get("question"),
+            )
+            await backend.reply(
+                question_task_id,
+                "Approved. Proceed with the proposed design.",
+                message_id if isinstance(message_id, int) else None,
+            )
+            logger.info("Alice replied to question on %s", question_task_id)
+            if crash_at in ("after_action", "after_reply"):
+                raise AliceCrashError("Simulated Alice crash after reply")
+        elif kind in (EventKind.TASK_COMPLETED.value, EventKind.TASK_FAILED.value) and (
+            payload.get("task_id") == task_id
+        ):
+            task_finished = True
+            result_data = payload
+            typed_result = payload.get("result") if isinstance(payload, dict) else None
+            typed_result = typed_result if isinstance(typed_result, dict) else {}
+            logger.info(
+                "Typed result: outcome=%s verdict=%s head_sha=%s",
+                typed_result.get("outcome"),
+                typed_result.get("verdict"),
+                typed_result.get("head_sha") or typed_result.get("reviewed_head_sha"),
+            )
+            logger.info(
+                "Task %s reached terminal state: %s (summary=%r)",
+                task_id,
+                kind,
+                payload.get("summary"),
+            )
+
+    if not task_finished:
+        raise TimeoutError(f"Task {task_id} did not finish within {timeout_s}s")
+    if last_delivery_id:
+        await backend.wait_for_event(0.05, last_delivery_id)
+
+    logger.info("Releasing worker %r...", agent_name)
+    await backend.release_agent(agent_name)
+    await backend.set_workflow_status("done", f"Task {task_id} finished successfully")
+    logger.info("Workflow marked DONE. Mock Alice session complete.")
+    return result_data
+
+
 async def drive_one_task_mcp(
     session: ClientSession,
     expected_agent: str,
@@ -485,208 +863,18 @@ async def drive_one_task_mcp(
     expected_harness: str | None = None,
     crash_at: str | None = None,
 ) -> dict[str, Any]:
-    """Drive one worker using Alice's MCP tools over stdio."""
-    logger.info("Alice (MCP) is ready. Waiting for worker %r to check in...", expected_agent)
+    """Compatibility wrapper for the shared lifecycle over MCP."""
 
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    agent_name: str | None = None
-    checked_in_harness: str | None = None
-    last_delivery_id: str | None = None
-
-    active_states = (
-        TaskState.WORKING.value,
-        TaskState.SUBMITTED.value,
-        TaskState.INPUT_REQUIRED.value,
-        TaskState.COMPLETED.value,
-        TaskState.FAILED.value,
+    return await drive_one_task_with_backend(
+        McpBackend(session),
+        expected_agent,
+        role,
+        title,
+        instructions,
+        timeout_s,
+        expected_harness,
+        crash_at,
     )
-    existing_task = None
-    state_data = await _call(session, "get_state", {})
-    state_tasks = state_data.get("tasks") if isinstance(state_data, dict) else []
-    for t in state_tasks or []:
-        if (
-            isinstance(t, dict)
-            and t.get("assignee") == expected_agent
-            and t.get("state") in active_states
-        ):
-            existing_task = t
-            break
-
-    task_finished = False
-    result_data: dict[str, Any] = {}
-
-    if existing_task:
-        agent_name = expected_agent
-        task_id = existing_task.get("id") or ""
-        logger.info(
-            "Worker %r already has task %s (state=%s), resuming...",
-            agent_name,
-            task_id,
-            existing_task.get("state"),
-        )
-    else:
-        checkin_event_id: Any = None
-        while not agent_name and asyncio.get_running_loop().time() < deadline:
-            if crash_at == "before_ack" and last_delivery_id:
-                raise AliceCrashError("Simulated Alice crash before ack")
-
-            state_data = await _call(session, "get_state", {})
-            known_ag = next(
-                (
-                    ag
-                    for ag in (state_data.get("agents") or [])
-                    if isinstance(ag, dict)
-                    and ag.get("name") == expected_agent
-                    and ag.get("status") != AgentStatus.RELEASED.value
-                ),
-                None,
-            )
-            timeout_to_use = (
-                0.05
-                if (known_ag is not None and not last_delivery_id)
-                else max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
-            )
-            wait_args: dict[str, Any] = {"timeout_s": timeout_to_use}
-            if last_delivery_id:
-                wait_args["ack"] = last_delivery_id
-            data = await _call(session, "wait_for_event", wait_args)
-            event = data.get("event") if isinstance(data, dict) else None
-            if event is None:
-                if known_ag is not None:
-                    agent_name = expected_agent
-                    checked_in_harness = known_ag.get("harness")
-                    break
-                continue
-
-            last_delivery_id = event.get("delivery_id")
-            if crash_at == "delivery":
-                raise AliceCrashError("Simulated Alice crash at delivery")
-
-            if (
-                isinstance(event, dict)
-                and event.get("kind") == "agent_checked_in"
-                and (event.get("payload") or {}).get("agent") == expected_agent
-            ):
-                agent_name = expected_agent
-                payload = event.get("payload") or {}
-                checked_in_harness = payload.get("harness")
-                checkin_event_id = event.get("id")
-                break
-
-        if not agent_name:
-            raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
-
-        if expected_harness is not None:
-            if checked_in_harness != expected_harness:
-                raise ValueError(
-                    f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
-                    f"expected {expected_harness!r}"
-                )
-            logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
-
-        logger.info("Worker %r checked in! Assigning task...", agent_name)
-        checkpoint_key = f"event:{checkin_event_id}:assign"
-        await _call(
-            session,
-            "log_decision",
-            {
-                "summary": f"Assigned task to {agent_name} for role {role}",
-                "rationale": f"Initial assignment for role {role}",
-                "key": checkpoint_key,
-            },
-        )
-        assign_data = await _call(
-            session,
-            "assign_task",
-            {"agent": agent_name, "role": role, "title": title, "instructions": instructions},
-        )
-        task_id = assign_data.get("id") if isinstance(assign_data, dict) else ""
-        logger.info("Task assigned: id=%s title=%r", task_id, title)
-
-        if crash_at == "after_action":
-            raise AliceCrashError("Simulated Alice crash after action")
-
-    while not task_finished and asyncio.get_running_loop().time() < deadline:
-        if crash_at == "before_ack" and last_delivery_id:
-            raise AliceCrashError("Simulated Alice crash before ack")
-
-        wait_args = {"timeout_s": 5.0}
-        if last_delivery_id:
-            wait_args["ack"] = last_delivery_id
-        data = await _call(session, "wait_for_event", wait_args)
-        event = data.get("event") if isinstance(data, dict) else None
-        if not event or not isinstance(event, dict):
-            if existing_task and existing_task.get("state") in ("completed", "failed"):
-                task_finished = True
-                result_data = existing_task.get("result") or {}
-                break
-            continue
-
-        last_delivery_id = event.get("delivery_id")
-        if crash_at == "delivery":
-            raise AliceCrashError("Simulated Alice crash at delivery")
-
-        kind = event.get("kind")
-        payload = event.get("payload") or {}
-        logger.info("Observed event: %s", kind)
-
-        if kind == "agent_checked_in":
-            continue
-        elif kind == "task_progress":
-            logger.info("Progress reported: %s", payload.get("note"))
-        elif kind == "worker_question":
-            q_task_id = payload.get("task_id")
-            q_msg_id = payload.get("message_id")
-            logger.info("Worker asked question on %s: %r", q_task_id, payload.get("question"))
-            await _call(
-                session,
-                "reply",
-                {
-                    "task_id": q_task_id,
-                    "text": "Approved. Proceed with the proposed design.",
-                    "message_id": q_msg_id,
-                },
-            )
-            logger.info("Alice replied to question on %s", q_task_id)
-            if crash_at in ("after_action", "after_reply"):
-                raise AliceCrashError("Simulated Alice crash after reply")
-        elif (
-            kind in ("task_completed", "task_failed")
-            and payload.get("task_id") == task_id
-        ):
-            task_finished = True
-            result_data = payload
-            logger.info(
-                "Task %s reached terminal state: %s (summary=%r)",
-                task_id,
-                kind,
-                payload.get("summary"),
-            )
-            result_payload = payload.get("result")
-            if isinstance(result_payload, dict):
-                logger.info(
-                    "Typed result: outcome=%s verdict=%s pr_url=%s head_sha=%s",
-                    result_payload.get("outcome"),
-                    result_payload.get("verdict"),
-                    result_payload.get("pr_url"),
-                    result_payload.get("head_sha") or result_payload.get("reviewed_head_sha"),
-                )
-
-    if not task_finished:
-        raise TimeoutError(f"Task {task_id} did not finish within {timeout_s}s")
-
-    if last_delivery_id:
-        await _call(session, "wait_for_event", {"timeout_s": 0.05, "ack": last_delivery_id})
-
-    logger.info("Releasing worker %r...", agent_name)
-    await _call(session, "release_agent", {"agent": agent_name})
-    await _call(
-        session,
-        "set_workflow_status",
-        {"status": "done", "summary": f"Task {task_id} finished successfully"},
-    )
-    logger.info("Workflow marked DONE. Mock Alice session complete.")
-    return result_data
 
 
 async def drive_one_task(
@@ -699,194 +887,18 @@ async def drive_one_task(
     expected_harness: str | None = None,
     crash_at: str | None = None,
 ) -> dict[str, Any]:
-    """Drive one worker through the full lifecycle using HubStore directly:
+    """Compatibility wrapper for the shared lifecycle over the direct store."""
 
-    check_in -> assignment -> progress -> question & reply -> completed -> release
-    """
-    logger.info("Alice is ready. Waiting for worker %r to check in...", expected_agent)
-
-    # 1. Wait for agent check-in
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    agent_name: str | None = None
-    checked_in_harness: str | None = None
-    last_delivery_id: str | None = None
-
-    active_states = (
-        TaskState.WORKING.value,
-        TaskState.SUBMITTED.value,
-        TaskState.INPUT_REQUIRED.value,
-        TaskState.COMPLETED.value,
-        TaskState.FAILED.value,
+    return await drive_one_task_with_backend(
+        DirectStoreBackend(store),
+        expected_agent,
+        role,
+        title,
+        instructions,
+        timeout_s,
+        expected_harness,
+        crash_at,
     )
-    existing_task = None
-    for t in store.get_state()["tasks"]:
-        if t["assignee"] == expected_agent and t["state"] in active_states:
-            existing_task = t
-            break
-
-    task_finished = False
-    result_data: dict[str, Any] = {}
-
-    if existing_task:
-        agent_name = expected_agent
-        task_record = store.get_task(existing_task["id"])
-        assert task_record is not None
-        task = task_record
-        logger.info(
-            "Worker %r already has task %s (state=%s), resuming...",
-            agent_name,
-            task.id,
-            existing_task["state"],
-        )
-    else:
-        checkin_event_id: int | None = None
-        while asyncio.get_running_loop().time() < deadline:
-            if crash_at == "before_ack" and last_delivery_id:
-                raise AliceCrashError("Simulated Alice crash before ack")
-
-            known_agent = store.agent_by_name(expected_agent)
-            timeout_to_use = (
-                0.05
-                if known_agent is not None and known_agent.status != AgentStatus.RELEASED
-                else max(0.05, min(2.0, deadline - asyncio.get_running_loop().time()))
-            )
-            event = await store.wait_for_event(timeout_s=timeout_to_use, ack=last_delivery_id)
-            if event is None:
-                if known_agent is not None and known_agent.status != AgentStatus.RELEASED:
-                    agent_name = known_agent.name
-                    checked_in_harness = known_agent.harness
-                    break
-                continue
-            last_delivery_id = event.delivery_id
-            if crash_at == "delivery":
-                raise AliceCrashError("Simulated Alice crash at delivery")
-
-            matched = (
-                event.kind == EventKind.AGENT_CHECKED_IN
-                and event.payload.get("agent") == expected_agent
-            )
-            if matched:
-                agent_name = expected_agent
-                checked_in_harness = event.payload.get("harness")
-                checkin_event_id = event.id
-                break
-
-        if not agent_name:
-            raise TimeoutError(f"Worker {expected_agent!r} did not check in within {timeout_s}s")
-
-        if expected_harness is not None:
-            if checked_in_harness != expected_harness:
-                raise ValueError(
-                    f"Worker {agent_name!r} checked in with harness {checked_in_harness!r}, "
-                    f"expected {expected_harness!r}"
-                )
-            logger.info("Worker %r harness verified: %s", agent_name, checked_in_harness)
-
-        logger.info("Worker %r checked in! Assigning task...", agent_name)
-        if checkin_event_id is None:
-            with database(store.path) as connection:
-                query = (
-                    "SELECT id FROM event WHERE kind = ? AND "
-                    "json_extract(payload_json, '$.agent') = ? "
-                    "ORDER BY id DESC LIMIT 1"
-                )
-                row = connection.execute(
-                    query, (EventKind.AGENT_CHECKED_IN.value, agent_name)
-                ).fetchone()
-                if row:
-                    checkin_event_id = row["id"]
-        checkpoint_key = f"event:{checkin_event_id}:assign"
-        store.log_decision(
-            f"Assigned task to {agent_name} for role {role}",
-            f"Initial assignment for role {role}",
-            key=checkpoint_key,
-        )
-        # 2. Assign task
-        task = store.assign_task(
-            agent=agent_name,
-            role=role,
-            title=title,
-            instructions=instructions,
-            lease_min=30,
-        )
-        logger.info("Task assigned: id=%s title=%r", task.id, title)
-
-        if crash_at == "after_action":
-            raise AliceCrashError("Simulated Alice crash after action")
-
-    # 3. Wait for progress / question / completion
-    while not task_finished and asyncio.get_running_loop().time() < deadline:
-        if crash_at == "before_ack" and last_delivery_id:
-            raise AliceCrashError("Simulated Alice crash before ack")
-
-        event = await store.wait_for_event(timeout_s=5.0, ack=last_delivery_id)
-        if event is None:
-            if existing_task and existing_task.get("state") in ("completed", "failed"):
-                task_finished = True
-                result_data = existing_task.get("result") or {}
-                break
-            continue
-        last_delivery_id = event.delivery_id
-        if crash_at == "delivery":
-            raise AliceCrashError("Simulated Alice crash at delivery")
-
-        logger.info("Observed event: %s", event.kind)
-
-        if event.kind == EventKind.AGENT_CHECKED_IN:
-            continue
-        elif event.kind == EventKind.TASK_PROGRESS:
-            logger.info("Progress reported by worker: %s", event.payload.get("note"))
-
-        elif event.kind == EventKind.WORKER_QUESTION:
-            q_task_id = event.payload.get("task_id")
-            question = event.payload.get("question")
-            q_msg_id = event.payload.get("message_id")
-            logger.info("Worker asked question on %s: %r", q_task_id, question)
-            store.reply(
-                q_task_id,
-                "Approved. Proceed with the proposed design.",
-                message_id=q_msg_id,
-            )
-            logger.info("Alice replied to question on %s", q_task_id)
-            if crash_at in ("after_action", "after_reply"):
-                raise AliceCrashError("Simulated Alice crash after reply")
-
-        elif event.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
-            completed_id = event.payload.get("task_id")
-            if completed_id == task.id:
-                task_finished = True
-                result_data = event.payload
-                logger.info(
-                    "Task %s reached terminal state: %s (summary=%r)",
-                    completed_id,
-                    event.kind,
-                    event.payload.get("summary"),
-                )
-                result_payload = event.payload.get("result")
-                if isinstance(result_payload, dict):
-                    logger.info(
-                        "Typed result: outcome=%s verdict=%s pr_url=%s head_sha=%s",
-                        result_payload.get("outcome"),
-                        result_payload.get("verdict"),
-                        result_payload.get("pr_url"),
-                        result_payload.get("head_sha") or result_payload.get("reviewed_head_sha"),
-                    )
-                if crash_at == "after_action":
-                    raise AliceCrashError("Simulated Alice crash after action")
-
-    if not task_finished:
-        raise TimeoutError(f"Task {task.id} did not finish within {timeout_s}s")
-
-    if last_delivery_id:
-        store.ack_event(last_delivery_id)
-
-    # 4. Release worker
-    logger.info("Releasing worker %r...", agent_name)
-    store.release_agent(agent_name)
-    store.set_workflow_status(WorkflowStatus.DONE, f"Task {task.id} finished successfully")
-    logger.info("Workflow marked DONE. Mock Alice session complete.")
-
-    return result_data
 
 
 def _parse_cmd(cmd: str) -> list[str]:

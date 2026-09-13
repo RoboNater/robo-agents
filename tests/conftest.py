@@ -45,7 +45,9 @@ def settings(tmp_path: Path) -> HubSettings:
 @pytest.fixture
 def store(settings: HubSettings) -> HubStore:
     initialize_database(settings.database_path)
-    return HubStore(path=settings.database_path)
+    hub_store = HubStore(path=settings.database_path)
+    hub_store.initialize_workflow()
+    return hub_store
 
 
 @pytest.fixture
@@ -57,7 +59,10 @@ def app(settings: HubSettings) -> FastAPI:
 def hub_store(app: FastAPI) -> HubStore:
     """The store the running app writes to — the tests stand in for Alice."""
 
-    return cast(HubStore, app.state.store)
+    store = cast(HubStore, app.state.store)
+    initialize_database(store.path)
+    store.initialize_workflow()
+    return store
 
 
 @pytest_asyncio.fixture

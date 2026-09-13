@@ -40,6 +40,7 @@ async def test_mock_worker_implements_task_end_to_end(tmp_path: Path) -> None:
     )
     app = create_app(settings)
     store = app.state.store
+    store.initialize_workflow()
 
     worker_settings = WorkerSettings(
         hub_url=BASE_URL,
@@ -119,6 +120,7 @@ async def test_mock_worker_reviewer_task(tmp_path: Path) -> None:
     )
     app = create_app(settings)
     store = app.state.store
+    store.initialize_workflow()
 
     worker_settings = WorkerSettings(
         hub_url=BASE_URL,

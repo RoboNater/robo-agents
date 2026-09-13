@@ -4,7 +4,15 @@ from typing import Any
 import httpx
 import pytest
 from agent_hub.store import HubStore
-from agent_hub_common import UNKNOWN, EventKind, MetaKeys, ModelSource, TaskState
+from agent_hub_common import (
+    MAX_MESSAGE_PART_BYTES,
+    MAX_TYPED_RESULT_BYTES,
+    UNKNOWN,
+    EventKind,
+    MetaKeys,
+    ModelSource,
+    TaskState,
+)
 from conftest import check_in, message, rpc, sse_results
 
 
@@ -444,6 +452,33 @@ async def test_a_streaming_call_on_a_task_must_be_a_question(
     assert body["error"]["code"] == -32602
 
 
+async def test_an_oversized_message_part_is_rejected_with_a_reference_hint(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    context_id, task_id = await assigned_context(client, hub_store)
+
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "x" * MAX_MESSAGE_PART_BYTES,
+            context_id=context_id,
+            task_id=task_id,
+            metadata={
+                MetaKeys.KIND: "progress",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-oversized-part",
+            },
+        ),
+        status_code=400,
+    )
+
+    assert body["error"]["code"] == -32602
+    assert f"maximum is {MAX_MESSAGE_PART_BYTES} bytes" in body["error"]["message"]
+    assert "GitHub" in body["error"]["message"]
+    assert hub_store.get_task(task_id).state is TaskState.WORKING  # type: ignore[union-attr]
+
+
 async def test_a_result_ends_the_task_and_carries_its_artifacts(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
@@ -478,6 +513,76 @@ async def test_a_result_ends_the_task_and_carries_its_artifacts(
     assert "https://example.test/pr/1" in result["artifacts"][0]["parts"][0]["text"]
     assert event is not None and event.kind is EventKind.TASK_COMPLETED
     assert event.payload["summary"] == "PR ready for review"
+
+
+async def test_an_oversized_typed_result_is_rejected_with_a_compaction_hint(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    context_id, task_id = await assigned_context(client, hub_store)
+
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "done",
+            context_id=context_id,
+            task_id=task_id,
+            metadata={
+                MetaKeys.KIND: "result",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-oversized-result",
+                MetaKeys.RESULT: {
+                    "outcome": "completed",
+                    "summary": "Done",
+                    "pr_url": "https://example.test/pr/1",
+                    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                    "commits": ["x" * MAX_TYPED_RESULT_BYTES],
+                },
+            },
+        ),
+        status_code=400,
+    )
+
+    assert body["error"]["code"] == -32602
+    assert f"maximum is {MAX_TYPED_RESULT_BYTES} bytes" in body["error"]["message"]
+    assert "compact metadata" in body["error"]["message"]
+    assert hub_store.get_task(task_id).state is TaskState.WORKING  # type: ignore[union-attr]
+
+
+async def test_a_result_between_part_and_result_caps_keeps_its_full_summary(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    context_id, task_id = await assigned_context(client, hub_store)
+    summary = "x" * (MAX_MESSAGE_PART_BYTES + 1024)
+
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "done",
+            context_id=context_id,
+            task_id=task_id,
+            metadata={
+                MetaKeys.KIND: "result",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-result-large-summary",
+                MetaKeys.RESULT: {
+                    "outcome": "completed",
+                    "summary": summary,
+                    "pr_url": "https://example.test/pr/1",
+                    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                },
+            },
+        ),
+    )
+
+    assert body["result"]["status"]["state"] == "completed"
+    task = hub_store.get_task(task_id)
+    assert task is not None and task.result is not None
+    assert task.result["summary"] == summary
+    assert hub_store.task_history(task_id)[-1].parts[0]["text"].startswith(
+        "Typed result recorded"
+    )
 
 
 async def test_a_failed_result_is_reported_as_such(

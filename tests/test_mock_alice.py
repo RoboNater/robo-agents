@@ -2,7 +2,10 @@ import asyncio
 import importlib.util
 import json
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import anyio
 import httpx
@@ -22,6 +25,30 @@ spec = importlib.util.spec_from_file_location("mock_alice", script_path)
 assert spec is not None and spec.loader is not None
 mock_alice = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mock_alice)
+
+
+@asynccontextmanager
+async def alice_backend(kind: str, store: HubStore) -> AsyncIterator[Any]:
+    """Yield either adapter while keeping the MCP transport lifecycle out of tests."""
+
+    if kind == "direct":
+        yield mock_alice.DirectStoreBackend(store)
+        return
+
+    mcp_server = create_mcp(store)
+    client_send, server_receive = anyio.create_memory_object_stream(10)
+    server_send, client_receive = anyio.create_memory_object_stream(10)
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(
+            mcp_server._mcp_server.run,
+            server_receive,
+            server_send,
+            mcp_server._mcp_server.create_initialization_options(),
+        )
+        async with ClientSession(client_receive, client_send) as session:
+            await session.initialize()
+            yield mock_alice.McpBackend(session)
+        task_group.cancel_scope.cancel()
 
 
 def test_verify_endurance_telemetry_requires_timeouts_heartbeat_and_release(
@@ -238,13 +265,15 @@ def test_verify_endurance_telemetry_rejects_only_approximate_long_work(
 
 
 @pytest.mark.parametrize(
-    ("agent_name", "harness"),
+    ("backend_kind", "agent_name", "harness"),
     [
-        ("bob", "claude-code"),
-        ("charlie", "codex"),
+        (backend_kind, agent_name, harness)
+        for backend_kind in ("direct", "mcp")
+        for agent_name, harness in (("bob", "claude-code"), ("charlie", "codex"))
     ],
 )
 async def test_mock_alice_drives_worker_through_full_task(
+    backend_kind: str,
     agent_name: str,
     harness: str,
     tmp_path: Path,
@@ -319,23 +348,26 @@ async def test_mock_alice_drives_worker_through_full_task(
             rel = await worker.await_assignment(timeout_s=2.0)
             assert rel == {"release": True}
 
-        alice_task = asyncio.create_task(
-            mock_alice.drive_one_task(
-                store=store,
-                expected_agent=agent_name,
-                role="implementer",
-                title="Test Issue",
-                instructions="Please fix the issue.",
-                timeout_s=5.0,
-                expected_harness=harness,
+        async with alice_backend(backend_kind, store) as backend:
+            alice_task = asyncio.create_task(
+                mock_alice.drive_one_task_with_backend(
+                    backend=backend,
+                    expected_agent=agent_name,
+                    role="implementer",
+                    title="Test Issue",
+                    instructions="Please fix the issue.",
+                    timeout_s=5.0,
+                    expected_harness=harness,
+                    policy={"max_task_lease_min": 45},
+                )
             )
-        )
-        worker_task = asyncio.create_task(run_worker())
+            worker_task = asyncio.create_task(run_worker())
 
-        alice_res, _ = await asyncio.gather(alice_task, worker_task)
+            alice_res, _ = await asyncio.gather(alice_task, worker_task)
 
         assert alice_res["task_id"] is not None
         assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+        assert store.get_state()["workflow"]["policy"] == {"max_task_lease_min": 45}
         with database(store.path) as connection:
             decisions = connection.execute("SELECT * FROM decision ORDER BY id").fetchall()
             assert any("Assigned task" in d["summary"] for d in decisions)
@@ -526,7 +558,10 @@ def test_endurance_cli_requires_a_telemetry_log(
     assert "--telemetry-log is required for an endurance run" in capsys.readouterr().err
 
 
-async def test_mock_alice_agent_already_checked_in_event_consumed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend_kind", ["direct", "mcp"])
+async def test_mock_alice_agent_already_checked_in_event_consumed(
+    backend_kind: str, tmp_path: Path
+) -> None:
     db_path = tmp_path / "already_checked_in.db"
     initialize_database(db_path)
     store = HubStore(db_path)
@@ -553,16 +588,17 @@ async def test_mock_alice_agent_already_checked_in_event_consumed(tmp_path: Path
                 break
             await asyncio.sleep(0.01)
 
-    drive_fut = asyncio.create_task(
-        mock_alice.drive_one_task(
-            store=store,
-            expected_agent="bob",
-            timeout_s=2.0,
-            expected_harness="codex",
+    async with alice_backend(backend_kind, store) as backend:
+        drive_fut = asyncio.create_task(
+            mock_alice.drive_one_task_with_backend(
+                backend=backend,
+                expected_agent="bob",
+                timeout_s=2.0,
+                expected_harness="codex",
+            )
         )
-    )
-    finish_fut = asyncio.create_task(finish_task())
-    res, _ = await asyncio.gather(drive_fut, finish_fut)
+        finish_fut = asyncio.create_task(finish_task())
+        res, _ = await asyncio.gather(drive_fut, finish_fut)
     assert res.get("summary") == "Done"
 
 
@@ -654,113 +690,71 @@ def test_mock_alice_main_cli_mcp_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     assert called_mcp is True
 
 
-async def test_mock_alice_drives_worker_mcp_session(tmp_path: Path) -> None:
-    db_path = tmp_path / "hub_mcp.db"
-    initialize_database(db_path)
-    store = HubStore(db_path)
-    mcp_server = create_mcp(store)
-
-    client_send, server_receive = anyio.create_memory_object_stream(10)
-    server_send, client_receive = anyio.create_memory_object_stream(10)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(
-            mcp_server._mcp_server.run,
-            server_receive,
-            server_send,
-            mcp_server._mcp_server.create_initialization_options(),
-        )
-        async with ClientSession(client_receive, client_send) as session:
-            await session.initialize()
-
-            async def run_worker() -> None:
-                bob = store.check_in("bob", AgentProfile(harness="claude-code"))
-                task = await store.await_assignment(bob.context_id, timeout_s=2.0)
-                assert isinstance(task, TaskRecord)
-                task_id = task.id
-                store.record_progress(task_id, "bob", "Making progress...")
-                q_id = store.open_question(task_id, "bob", "Confirm design?", "q-1")
-                reply = await store.await_reply(task_id, q_id, timeout_s=2.0)
-                assert reply is not None
-                assert "Approved" in reply.parts[0]["text"]
-                store.submit_result(
-                    task_id,
-                    "bob",
-                    TaskState.COMPLETED,
-                    "Feature implemented and tested",
-                    artifacts=[{"name": "pr", "url": "https://github.com/repo/pull/1"}],
-                )
-
-            worker_fut = asyncio.create_task(run_worker())
-            alice_fut = asyncio.create_task(
-                mock_alice.drive_one_task_mcp(
-                    session=session,
-                    expected_agent="bob",
-                    role="implementer",
-                    title="MCP Issue",
-                    instructions="Implement via MCP.",
-                    timeout_s=5.0,
-                    expected_harness="claude-code",
-                )
-            )
-            alice_res, _ = await asyncio.gather(alice_fut, worker_fut)
-            assert alice_res.get("summary") == "Feature implemented and tested"
-            assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
-            with database(db_path) as conn:
-                decisions = conn.execute("SELECT * FROM decision ORDER BY id").fetchall()
-                assert any(
-                    d["key"] and d["key"].startswith("event:") and d["key"].endswith(":assign")
-                    for d in decisions
-                )
-            tg.cancel_scope.cancel()
-
-
 @pytest.mark.parametrize(
-    ("crash_at", "match"),
+    ("backend_kind", "crash_at", "match"),
     [
-        ("delivery", "crash at delivery"),
-        ("after_action", "crash after action"),
-        # Restored in #49's last commit and never covered: the one crash point
-        # that fires between handling an event and acking it (#55).
-        ("before_ack", "crash before ack"),
-        ("after_reply", "crash after reply"),
+        (backend_kind, crash_at, match)
+        for backend_kind in ("direct", "mcp")
+        for crash_at, match in (
+            ("delivery", "crash at delivery"),
+            ("after_action", "crash after action"),
+            ("before_ack", "crash before ack"),
+            ("after_reply", "crash after reply"),
+        )
     ],
 )
-async def test_mock_alice_mcp_crash_points(crash_at: str, match: str, tmp_path: Path) -> None:
-    db_path = tmp_path / f"hub_crash_{crash_at}.db"
+async def test_mock_alice_backends_recover_from_every_crash_point(
+    backend_kind: str, crash_at: str, match: str, tmp_path: Path
+) -> None:
+    db_path = tmp_path / f"hub_crash_{backend_kind}_{crash_at}.db"
     initialize_database(db_path)
-    store = HubStore(db_path)
-    mcp_server = create_mcp(store)
+    store = HubStore(db_path, default_event_lease_s=0.01)
 
-    client_send, server_receive = anyio.create_memory_object_stream(10)
-    server_send, client_receive = anyio.create_memory_object_stream(10)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(
-            mcp_server._mcp_server.run,
-            server_receive,
-            server_send,
-            mcp_server._mcp_server.create_initialization_options(),
+    async def run_worker() -> None:
+        bob = store.check_in("bob", AgentProfile(harness="claude-code"))
+        task = await store.await_assignment(bob.context_id, timeout_s=4.0)
+        assert isinstance(task, TaskRecord)
+        question_id = store.open_question(task.id, "bob", "Proceed?", "q-1")
+        reply = await store.await_reply(task.id, question_id, timeout_s=4.0)
+        assert reply is not None
+        store.submit_result(
+            task.id,
+            "bob",
+            TaskState.COMPLETED,
+            "Recovered and finished",
         )
-        async with ClientSession(client_receive, client_send) as session:
-            await session.initialize()
+        release = await store.await_assignment(bob.context_id, timeout_s=4.0)
+        assert release is not None
 
-            async def run_worker() -> None:
-                bob = store.check_in("bob", AgentProfile(harness="claude-code"))
-                task = await store.await_assignment(bob.context_id, timeout_s=2.0)
-                if isinstance(task, TaskRecord):
-                    q_id = store.open_question(task.id, "bob", "Proceed?", "q-1")
-                    await store.await_reply(task.id, q_id, timeout_s=0.5)
-
-            worker_fut = asyncio.create_task(run_worker())
+    async with alice_backend(backend_kind, store) as backend:
+        worker_fut = asyncio.create_task(run_worker())
+        try:
             with pytest.raises(mock_alice.AliceCrashError, match=match):
-                await mock_alice.drive_one_task_mcp(
-                    session=session,
+                await mock_alice.drive_one_task_with_backend(
+                    backend=backend,
                     expected_agent="bob",
                     role="implementer",
                     timeout_s=5.0,
                     expected_harness="claude-code",
                     crash_at=crash_at,
                 )
-            worker_fut.cancel()
-            tg.cancel_scope.cancel()
+            await asyncio.sleep(0.03)
+            result = await mock_alice.drive_one_task_with_backend(
+                backend=backend,
+                expected_agent="bob",
+                role="implementer",
+                timeout_s=5.0,
+                expected_harness="claude-code",
+            )
+            await worker_fut
+        finally:
+            if not worker_fut.done():
+                worker_fut.cancel()
+
+    assert result.get("summary") == "Recovered and finished"
+    assert len(store.tasks()) == 1
+    assert store.get_state()["workflow"]["status"] == WorkflowStatus.DONE.value
+    with database(store.path) as connection:
+        assert connection.execute(
+            "SELECT MAX(delivery_attempts) FROM event"
+        ).fetchone()[0] >= 2

@@ -166,6 +166,7 @@ async def test_wire_fixtures_dispatch(tmp_path: Path) -> None:
         guides_dir=tmp_path / "guides",
     )
     store = HubStore(db_path)
+    store.initialize_workflow()
     protocol = A2AProtocol(store, settings)
 
     # 1. message/send check-in fixture
@@ -233,6 +234,7 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
         guides_dir=tmp_path / "guides",
     )
     store = HubStore(db_path)
+    store.initialize_workflow()
     protocol = A2AProtocol(store, settings)
 
     store.check_in("bob", AgentProfile(harness="claude-code", capabilities=("python",)))

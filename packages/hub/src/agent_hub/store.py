@@ -22,6 +22,8 @@ from uuid import uuid4
 
 from agent_hub_common import (
     DEFAULT_EVENT_LEASE_S,
+    MAX_MESSAGE_PART_BYTES,
+    MAX_TYPED_RESULT_BYTES,
     SHA_HEX_40_RE,
     UNKNOWN,
     AgentProfile,
@@ -37,10 +39,12 @@ from agent_hub_common import (
     ReviewerVerdict,
     TaskResult,
     TaskState,
+    WorkflowPolicy,
     WorkflowStatus,
     to_iso,
     utcnow,
 )
+from pydantic import ValidationError
 
 from .database import database
 from .signals import EVENT_KEY, Signals, context_key, task_key
@@ -77,6 +81,14 @@ class IdempotencyConflictError(ConflictError):
 
 class DuplicateAgentError(ConflictError):
     """Raised when a second live worker claims an existing agent name."""
+
+
+class PayloadTooLargeError(StoreError):
+    """Raised when transcript or typed-result data exceeds the contract cap."""
+
+
+class InvalidPolicyError(StoreError):
+    """Raised before an invalid create-once workflow policy is persisted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +166,18 @@ def _json_object(raw: str | None) -> dict[str, Any] | None:
         return None
     loaded: Any = json.loads(raw)
     return loaded if isinstance(loaded, dict) else None
+
+
+def _json_size_bytes(value: Any) -> int:
+    """Return the compact UTF-8 JSON size used by the wire payload caps."""
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return len(encoded)
 
 
 def _agent(row: Row) -> AgentRecord:
@@ -297,6 +321,39 @@ def text_part(text: str, metadata: Mapping[str, Any] | None = None) -> dict[str,
     return part
 
 
+def _validated_workflow_policy(policy: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate only supplied rails and retain their compact stored shape."""
+
+    try:
+        validated = WorkflowPolicy.model_validate(dict(policy or {}))
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(item) for item in error['loc'])}: {error['msg']}"
+            for error in exc.errors()
+        )
+        raise InvalidPolicyError(
+            f"invalid workflow policy: {details}. Correct the policy and retry "
+            "initialize_workflow before assigning work."
+        ) from exc
+    return validated.model_dump(mode="json", exclude_unset=True)
+
+
+def _result_transcript_part(summary: str, status: TaskState) -> dict[str, Any]:
+    """Keep internal transcript echoes within the part cap without shrinking results."""
+
+    metadata: dict[str, Any] = {
+        MetaKeys.KIND.value: "result",
+        MetaKeys.STATUS.value: status.value,
+    }
+    part = text_part(summary, metadata=metadata)
+    if _json_size_bytes(part) <= MAX_MESSAGE_PART_BYTES:
+        return part
+    return text_part(
+        "Typed result recorded; full summary is retained in the task result.",
+        metadata=metadata,
+    )
+
+
 @dataclass(slots=True)
 class HubStore:
     """SQLite-backed hub state, plus the waits that hold a worker's request."""
@@ -319,8 +376,50 @@ class HubStore:
     ) -> str:
         """Return the id of the single PoC workflow, creating it if needed."""
 
+        requested_policy = _validated_workflow_policy(policy)
         with database(self.path) as connection:
-            return self._ensure_workflow(connection, goal, policy)
+            return self._ensure_workflow(connection, goal, requested_policy)
+
+    def initialize_workflow(
+        self, goal: str = DEFAULT_GOAL, policy: Mapping[str, Any] | None = None
+    ) -> str:
+        """Create the workflow once, or confirm the durable initial prompt.
+
+        Goal and policy are immutable workflow inputs. A restarted Alice repeats
+        this call with the same values; a different prompt must not silently
+        replace rails that existing tasks were created under.
+        """
+
+        requested_policy = _validated_workflow_policy(policy)
+        encoded_policy = json.dumps(requested_policy, sort_keys=True)
+        with database(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT id, goal, status, policy_json FROM workflow ORDER BY created LIMIT 1"
+            ).fetchone()
+            if row is None:
+                workflow_id = uuid4().hex
+                connection.execute(
+                    "INSERT INTO workflow (id, goal, status, policy_json, created) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        workflow_id,
+                        goal,
+                        WorkflowStatus.ACTIVE.value,
+                        encoded_policy,
+                        self._now_iso(),
+                    ),
+                )
+                return workflow_id
+            stored_policy = _json_object(row["policy_json"]) or {}
+            if row["goal"] != goal or stored_policy != requested_policy:
+                raise ConflictError(
+                    "workflow is already initialized with "
+                    f"status={row['status']!r}, goal={row['goal']!r}, and a different goal "
+                    "or policy; use get_state to resume it, or use a fresh HUB_STATE_DIR "
+                    "for a different workflow"
+                )
+            return str(row["id"])
 
     def _ensure_workflow(
         self, connection: Connection, goal: str, policy: Mapping[str, Any] | None
@@ -340,6 +439,15 @@ class HubStore:
             ),
         )
         return workflow_id
+
+    def _require_workflow(self, connection: Connection, operation: str) -> str:
+        row = connection.execute("SELECT id FROM workflow ORDER BY created LIMIT 1").fetchone()
+        if row is None:
+            raise ConflictError(
+                f"workflow is not initialized; call initialize_workflow(goal, policy) "
+                f"before {operation}"
+            )
+        return str(row["id"])
 
     def get_state(self) -> dict[str, Any]:
         """Return compact state without task instructions or transcripts."""
@@ -382,7 +490,7 @@ class HubStore:
     def set_workflow_status(self, status: WorkflowStatus, summary: str) -> None:
         """Persist status and its explanation atomically in the audit log."""
         with database(self.path) as connection:
-            workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            workflow_id = self._require_workflow(connection, "set_workflow_status")
             row = connection.execute(
                 "SELECT status FROM workflow WHERE id = ?", (workflow_id,)
             ).fetchone()
@@ -730,7 +838,7 @@ class HubStore:
                     f"agent {agent} is {record.status.value}, not idle; "
                     "it must check in again before it can be given work"
                 )
-            workflow_id = self._ensure_workflow(connection, DEFAULT_GOAL, None)
+            workflow_id = self._require_workflow(connection, "assign_task")
             lease_cap_min = self._max_task_lease_min(connection, workflow_id)
             effective_lease_min = min(lease_min, lease_cap_min)
             task_id = uuid4().hex
@@ -1025,6 +1133,14 @@ class HubStore:
         actual_result = result if result is not None else status
         if actual_result is None:
             raise ConflictError("submit_result requires result or status")
+        if isinstance(actual_result, Mapping):
+            raw_result_size = _json_size_bytes(dict(actual_result))
+            if raw_result_size > MAX_TYPED_RESULT_BYTES:
+                raise PayloadTooLargeError(
+                    f"typed result is {raw_result_size} bytes; maximum is "
+                    f"{MAX_TYPED_RESULT_BYTES} bytes. Store work product in GitHub and "
+                    "submit only references and compact metadata."
+                )
 
         if isinstance(actual_result, (ImplementerResult, RebaseResult)):
             terminal_status = (
@@ -1085,6 +1201,14 @@ class HubStore:
         else:
             raise ConflictError(f"unsupported result type: {type(actual_result)}")
 
+        result_size = _json_size_bytes(payload)
+        if result_size > MAX_TYPED_RESULT_BYTES:
+            raise PayloadTooLargeError(
+                f"typed result is {result_size} bytes; maximum is "
+                f"{MAX_TYPED_RESULT_BYTES} bytes. Store work product in GitHub and "
+                "submit only references and compact metadata."
+            )
+
         with database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             if operation_id is not None and payload_hash is not None:
@@ -1108,15 +1232,7 @@ class HubStore:
                 context_id=record.context_id,
                 sender=agent,
                 direction="to_alice",
-                parts=[
-                    text_part(
-                        result_summary,
-                        metadata={
-                            MetaKeys.KIND: "result",
-                            MetaKeys.STATUS: terminal_status.value,
-                        },
-                    )
-                ],
+                parts=[_result_transcript_part(result_summary, terminal_status)],
             )
             self._finish(connection, task.id, terminal_status, payload)
             event_payload: dict[str, Any] = {
@@ -1242,6 +1358,14 @@ class HubStore:
         direction: str,
         parts: list[dict[str, Any]],
     ) -> int:
+        for index, part in enumerate(parts, start=1):
+            part_size = _json_size_bytes(part)
+            if part_size > MAX_MESSAGE_PART_BYTES:
+                raise PayloadTooLargeError(
+                    f"message part {index} is {part_size} bytes; maximum is "
+                    f"{MAX_MESSAGE_PART_BYTES} bytes. Store work product in GitHub and "
+                    "send a URL or compact reference instead."
+                )
         cursor = connection.execute(
             "INSERT INTO message (task_id, context_id, sender, direction, parts_json, ts)"
             " VALUES (?, ?, ?, ?, ?, ?)",
