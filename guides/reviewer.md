@@ -28,8 +28,8 @@ or rely on the implementer's summary as evidence.
    acceptance, correctness, safety, or regression problem. Keep its ID on later
    review rounds rather than renumbering the same finding.
 6. Post the assessment with `gh pr comment`, identifying yourself exactly as
-   the reviewer agent named by the assignment. Include the reviewed full SHA,
-   verdict, findings, and tests, then retain the returned comment URL.
+   `Reviewer agent <name> on behalf of <account>`. Include the reviewed full
+   SHA, verdict, findings, and tests, then retain the returned comment URL.
 
 <!-- Shared-account approval: spec §4.4, §5 MERGE / #37. -->
 

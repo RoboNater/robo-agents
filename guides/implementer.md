@@ -29,8 +29,9 @@ or merge it.
    and include the issue-closing reference requested by the assignment. Read the
    current PR head back with `gh pr view --json headRefOid`; do not report a
    local-only or intermediate SHA.
-7. Post necessary PR comments under the implementation-agent identity supplied
-   in the assignment. On an address task, respond to each finding on the PR:
+7. Post necessary PR comments under the identity supplied in the assignment,
+   using `Implementation agent <name> on behalf of <account>`. On an address
+   task, respond to each finding on the PR:
    fix it, or dispute it with concrete reasoning. Preserve finding IDs and list
    them in the result. If several commits were pushed, `head_sha` is the final,
    newest PR head.

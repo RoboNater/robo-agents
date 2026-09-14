@@ -57,6 +57,16 @@ scripts/supervise-claude-code.sh
 The `HUB_TELEMETRY_LOG` above and the value in `claude-code.mcp.json` must name
 the same file.
 
+## Step 5 runtime prompts
+
+Start Alice with [`prompts/alice.md`](../prompts/alice.md), filling in its
+repository, issue, account, and policy values; Claude Code loads the
+[`alice-orchestrator`](../skills/alice-orchestrator/SKILL.md) skill named there.
+Start a Claude worker with the thin [`worker`](../skills/worker/SKILL.md) skill.
+For runtimes without skills, use [`prompts/worker.md`](../prompts/worker.md),
+which inlines the same [`guides/worker.md`](../guides/worker.md) etiquette and
+still fetches the assigned role guide from the hub for every task.
+
 This launcher is specific to the Step 4B endurance scenario, not the general
 Step 5 worker launcher. It pre-approves only literal `sleep` commands, the
 blocking background-task wait that Claude Code requires for long sleeps, and

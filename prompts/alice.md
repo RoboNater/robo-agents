@@ -4,6 +4,8 @@ gate-checked merge and roadmap close-out.
 Goal: Address issue `#<issue>` in `<owner>/<repository>`, merge its pull
 request, and update roadmap issue `#2`.
 
+GitHub comment identity account: `<account>`.
+
 Policy:
 
 ```json

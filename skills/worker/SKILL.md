@@ -5,7 +5,8 @@ description: Run as a persistent robo-agents worker that pulls assignments from 
 
 # Worker
 
-Call `check_in` once, then keep running this loop until released:
+Call `check_in` once, then call `get_role_guide("worker")` and follow its
+protocol etiquette. Keep running this loop until released:
 
 1. Call `await_assignment`. A timeout is normal; call it again.
 2. On assignment, call `get_role_guide(role)` and follow that guide together
