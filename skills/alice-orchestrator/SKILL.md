@@ -22,8 +22,10 @@ the workflow.
 <!-- Initialization contract: spec §4.2, §5 PLAN; Step 5A PR #64 and #65. -->
 
 1. Parse the initial operator prompt into an exact `goal` and `policy`. The goal
-   identifies one repository, one implementation issue, the roadmap issue, and
-   the required outcome. Do not add scope.
+   identifies one repository, one implementation issue, the required outcome,
+   and either a repository-qualified roadmap target or an explicit statement
+   that this throwaway run has no roadmap target. Never infer issue `#2` in the
+   implementation repository. Do not add scope.
 2. Call `get_state` before taking action.
    - With no stored workflow, call `initialize_workflow(goal, policy)` before
      any other mutating hub tool.
@@ -51,6 +53,8 @@ adding facts Alice can verify:
 Please address <issue URL>. Work on your own branch, commit as you go, and open
 a PR when done. Identify yourself in PR comments as "Implementation agent
 <name> on behalf of <account>".
+Include "Closes <issue owner>/<issue repository>#<issue>" in the PR
+description.
 Acceptance criteria: <criteria>
 Reserved counters: <values, only when relevant and absent from the issue>
 ```
@@ -66,20 +70,23 @@ Read `get_state.workflow.policy` and apply these defaults for omitted values:
 
 ```json
 {
+  "max_review_rounds": 3,
+  "merge_method": "squash",
+  "allow_no_ci": false,
   "role_policy": {
     "reviewer_harness_differs": true,
     "reviewer_provider_differs": false,
     "implementer_capabilities": [],
     "reviewer_capabilities": []
   },
-  "pairing_wait_s": 120
+  "pairing_wait_s": 120,
+  "max_wall_minutes": 120,
+  "max_task_lease_min": 120
 }
 ```
 
-The other omitted defaults are `max_review_rounds: 3`,
-`merge_method: "squash"`, `allow_no_ci: false`, `max_wall_minutes: 120`,
-and `max_task_lease_min: 120`. Initialization has already rejected unknown
-keys, invalid types, and unsupported merge methods; do not reinterpret them.
+Initialization has already rejected unknown keys, invalid types, and
+unsupported merge methods; do not reinterpret them.
 
 Role selection is policy-driven, never arrival-order-driven:
 
@@ -88,16 +95,28 @@ Role selection is policy-driven, never arrival-order-driven:
   different worker from the implementer.
 - When a difference flag is true, the corresponding reviewer and implementer
   values must be known and unequal. `unknown` never proves a difference.
-- Evaluate all registered, non-lost workers, and assign only an idle one. Log
-  the selected pair and the result of every rule.
+- Evaluate registered workers whose status is neither `lost` nor `released`,
+  and assign only an idle one. Log the selected pair and the result of every
+  rule.
 - Prefer selecting both roles before assignment. If only one eligible worker
   is registered after `pairing_wait_s`, it may start as implementer and
   reviewer selection is deferred. If there is no eligible implementer or no
   valid reviewer pair when REVIEW begins, escalate and name the failed rule.
 
-Checkpoint the decision, then call `assign_task` with `role="implementer"`, the
-KICKOFF instructions, and no `pr_head_sha`. Leave the reviewer idle. Never
-assign a second active task to the same worker.
+Before every `assign_task`, inspect every item in `get_state.tasks`, including
+terminal tasks. Match the intended phase/title, role, PR URL from the stored
+result when present, and `pr_head_sha` (including an absent SHA for initial
+implementation).
+If a matching task already exists, route its current state/result instead of
+creating another. This task list is the evidence that an assignment happened;
+a repeated `log_decision` call is only a deduplicated audit record and does not
+say whether its associated action ran. Use stable phase-prefixed task titles so
+the comparison survives restart.
+
+Checkpoint the decision, then call `assign_task` with `role="implementer"`, a
+title prefixed `IMPLEMENT:`, the KICKOFF instructions, and no `pr_head_sha`.
+Leave the reviewer idle. Never assign a second task for a completed or active
+phase.
 
 ## Durable event loop
 
@@ -118,7 +137,8 @@ ack a newer delivery.
 Handle events as follows:
 
 - `agent_checked_in`: re-evaluate pairing. Do not derive a duplicate assignment
-  from a redelivered check-in; inspect agents and active tasks first.
+  from a redelivered check-in; inspect agents and every task first, including
+  completed, failed, and canceled tasks.
 - `task_progress`: record useful status and keep waiting; progress is not
   liveness evidence.
 - `worker_question`: answer only from the issue, acceptance criteria, repository
@@ -127,9 +147,10 @@ Handle events as follows:
   determined there, escalate to the operator instead of inventing one.
 - `task_completed` or `task_failed`: read the typed result from the event and
   confirm it in `get_state` before routing it.
-- `agent_lost` or `lease_expired`: inspect the terminal task and worker state.
-  Reassign only when the remaining work and qualified worker are unambiguous;
-  otherwise escalate. Never infer liveness from progress messages.
+- `agent_lost` or `lease_expired`: inspect all prior tasks and worker state.
+  Reassign only when no matching replacement task exists and the remaining work
+  and qualified worker are unambiguous; otherwise escalate. Never infer
+  liveness from progress messages.
 
 ### On resume
 
@@ -171,7 +192,11 @@ not route a result by prose in its summary; use its typed fields.
 - `approved`: require no blocking findings and a full `reviewed_head_sha` equal
   to the assigned/current PR head. That SHA becomes the approved head.
 - `changes_requested`: route the blocking findings to ADDRESS.
-- `blocked` or `failed`: escalate.
+- `blocked`: independently read the current head. When it differs from the
+  review task's `pr_head_sha`, assign RE-REVIEW at that verified newest head;
+  this moved-head pass does not count as a remediation round. Escalate any
+  other blocked result.
+- `failed`: escalate.
 
 Require a canonical PR URL and an agent-identified review-comment URL. If the
 reviewer omitted its PR comment, assign a same-head correction telling it to
@@ -190,7 +215,9 @@ approval.
 
 <!-- Comment approval: #37. Newest-head and round behavior: spec §5 / #42. -->
 
-For REVIEW, independently verify the PR URL and head, then call `assign_task`
+For REVIEW, independently verify the PR URL and head, choose the next unused
+finding ID prefix `r<number>-`, and use it in a stable `REVIEW r<number>:` task
+title. Then call `assign_task`
 for the policy-selected reviewer with `role="reviewer"` and
 `pr_head_sha=<verified current head>`. Include the issue URL, PR URL,
 acceptance criteria, and:
@@ -199,7 +226,13 @@ acceptance criteria, and:
 Please review and comment on <PR URL> at <full head SHA>. Identify yourself in
 the PR comment as "Reviewer agent <name> on behalf of <account>". Use a PR
 comment, not native approval.
+Use finding IDs beginning with <assigned r<number>- prefix>.
 ```
+
+The finding-prefix number is a monotonically increasing review-task sequence,
+including confirmation and rebase passes. It is separate from the remediation
+round count below, so a reviewer never has to infer that count and IDs remain
+unique.
 
 All PoC workers share one GitHub account, so `gh pr review --approve` cannot be
 the approval record. The typed `ReviewerResult.verdict` plus
@@ -210,6 +243,9 @@ For `changes_requested`, assign the implementer an ADDRESS task containing the
 PR URL, verified current head, acceptance criteria, and the blocking finding
 IDs/text. Tell the implementer to adjudicate each item, respond on the PR, push
 any fixes, and return the newest head. Do not tell it which findings to accept.
+If the implementer identifies a valid out-of-scope finding, tell it to open a
+follow-up issue and reference that issue in the PR rather than expanding the
+current change.
 After a completed address task, verify the current head and assign RE-REVIEW
 bound to that newest SHA. If there was a response but no commit, say so and
 review the same head.
@@ -260,13 +296,9 @@ Immediately before merge call
 are advisory. Merge only when this invariant holds on that final reading:
 
 ```text
-reviewer verdict == approved
-and pr_state == open
-and head_matches
-and (ci == pass or (ci == no_workflows and allow_no_ci == true))
-and base_behind_main == false
-and mergeable == clean
-and policy permits
+verdict == approved ∧ pr_state == open ∧ head_matches ∧
+(ci == pass ∨ (ci == no_workflows ∧ allow_no_ci)) ∧
+base_behind_main == false ∧ mergeable == clean ∧ policy permits
 ```
 
 Route every failed term rather than weakening the invariant:
@@ -290,7 +322,7 @@ Route every failed term rather than weakening the invariant:
 When the invariant holds, checkpoint the event/action and run:
 
 ```text
-gh pr merge <pr_url> --<merge_method> --delete-branch --match-head-commit <approved-head>
+gh pr merge <pr_url> --<merge_method> --delete-branch --match-head-commit <approved head>
 ```
 
 Then read the PR back from GitHub. Log the reviewed SHA, any rebase head, merged
@@ -318,14 +350,17 @@ the workflow active before executing the named action.
 
 <!-- Ownership and closure: spec §5 WRAP-UP, roadmap issue #2, and #42. -->
 
-After a verified merge, assign the implementer a close-out task to update the
-roadmap issue's status and any reservation line. Include the merged PR URL and
-final SHA. Alice does not edit ordinary completion status herself; she edits
-the roadmap only for reservations and sequencing.
+After a verified merge, follow the close-out target from the durable goal. When
+it names a repository-qualified roadmap issue, assign the implementer a
+close-out task to update that issue's status and any reservation line. Include
+the merged PR URL and final SHA. Alice does not edit ordinary completion status
+herself; she edits the roadmap only for reservations and sequencing.
 
-Verify the update directly with `gh issue view <roadmap>`. If it is missing,
-send one correction task: `Please update the roadmap in issue #<roadmap> with
-current status and any reservation line.` Verify again.
+Verify the update directly with
+`gh issue view <number> --repo <owner>/<repository>`. If it is missing, send one
+correction task naming that same repository-qualified issue and verify again.
+When the goal explicitly says a throwaway run has no roadmap target, do not
+invent or edit an issue; record close-out only in the workflow summary.
 
 When no task remains active, release both selected workers, set workflow status
 to `done`, and report a compact summary containing the issue and merged PR,

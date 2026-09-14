@@ -59,10 +59,19 @@ the same file.
 
 ## Step 5 runtime prompts
 
-Start Alice with [`prompts/alice.md`](../prompts/alice.md), filling in its
-repository, issue, account, and policy values; Claude Code loads the
-[`alice-orchestrator`](../skills/alice-orchestrator/SKILL.md) skill named there.
-Start a Claude worker with the thin [`worker`](../skills/worker/SKILL.md) skill.
+Before launch, expose the checked-in skills to Claude Code by copying or
+symlinking each required directory into `.claude/skills/` in that runtime's
+workspace (or into `~/.claude/skills/` for a user-wide installation). Step 5C's
+launch scripts will automate this. For example, Alice needs
+`skills/alice-orchestrator/` installed as
+`.claude/skills/alice-orchestrator/`, while a Claude worker needs
+`skills/worker/` installed as `.claude/skills/worker/`.
+
+Start Alice with [`prompts/alice.md`](../prompts/alice.md), filling in every
+repository, issue, account, close-out, and policy value; Claude Code then loads
+the [`alice-orchestrator`](../skills/alice-orchestrator/SKILL.md) skill named
+there. Start a Claude worker with the thin
+[`worker`](../skills/worker/SKILL.md) skill.
 For runtimes without skills, use [`prompts/worker.md`](../prompts/worker.md),
 which inlines the same [`guides/worker.md`](../guides/worker.md) etiquette and
 still fetches the assigned role guide from the hub for every task.

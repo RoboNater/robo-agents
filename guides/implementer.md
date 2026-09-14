@@ -38,7 +38,8 @@ or merge it.
 
 If a requested change is outside the issue, would expand scope, or contradicts
 the acceptance criteria, ask Alice. Do not silently accept or reject a review
-finding on Alice's behalf.
+finding on Alice's behalf. For a valid out-of-scope finding, open a follow-up
+issue and reference it in the PR rather than expanding the current change.
 
 ## Close-out
 

@@ -23,10 +23,11 @@ or rely on the implementer's summary as evidence.
 4. Run the issue's acceptance commands, the relevant repository validation,
    and any touched entry point needed to evaluate the change. Do not alter,
    commit, or push production files. Record exact commands and outcomes.
-5. Give each finding a stable ID of the form `r<round>-<number>` and classify it
-   as blocking or nonblocking. A blocking finding must explain a concrete
-   acceptance, correctness, safety, or regression problem. Keep its ID on later
-   review rounds rather than renumbering the same finding.
+5. Alice supplies an `r<number>-` prefix for this review task. Append a finding
+   number to give each finding a stable ID, and classify it as blocking or
+   nonblocking. A blocking finding must explain a concrete acceptance,
+   correctness, safety, or regression problem. Keep its ID on later review
+   rounds rather than renumbering the same finding.
 6. Post the assessment with `gh pr comment`, identifying yourself exactly as
    `Reviewer agent <name> on behalf of <account>`. Include the reviewed full
    SHA, verdict, findings, and tests, then retain the returned comment URL.

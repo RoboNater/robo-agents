@@ -71,8 +71,8 @@ needs stdin to stay open; EOF before MCP initialization is an error and exits
 nonzero so detached launches cannot silently appear healthy.
 
 Alice gets `get_state`, `initialize_workflow`, `wait_for_event`, `assign_task`,
-`reply`, `set_task_state`, `release_agent`, `set_workflow_status`, and
-`log_decision`.
+`check_merge_gate`, `reply`, `set_task_state`, `release_agent`,
+`set_workflow_status`, and `log_decision`.
 Her first mutating call must be `initialize_workflow(goal, policy)`, using the
 goal and policy from the initial operator prompt. On restart, call `get_state`
 first and resume the stored workflow; repeat `initialize_workflow` only with
