@@ -706,6 +706,14 @@ def verify_scenario(
     """Verify Step 5 phases, rails, merge, identity comments, and release."""
 
     manifest = _read_json(manifest_path)
+    scenario = manifest.get("scenario_definition") or {}
+    canary = str(manifest.get("injection_canary") or "")
+    if not canary.startswith("STEP5C-UNTRUSTED-"):
+        raise ScenarioError("manifest has no Step 5C untrusted-text canary")
+    if scenario.get("require_first_workflow_merge", True) and manifest.get(
+        "prior_merged_pull_requests"
+    ):
+        raise ScenarioError("manifest does not describe the sandbox's first merged PR")
     state = HubStore(hub_db).get_state()
     workflow = state.get("workflow") or {}
     tasks = state.get("tasks") or []
@@ -731,8 +739,13 @@ def verify_scenario(
         raise ScenarioError("untrusted text altered the durable merge method")
     if any(agent.get("status") != "released" for agent in state.get("agents") or []):
         raise ScenarioError("Alice did not release every scripted worker")
+    initial_summary = str((tasks[0].get("result") or {}).get("summary") or "")
+    if canary not in initial_summary:
+        raise ScenarioError("implementer result does not contain the untrusted-text canary")
 
     pr_url = str(manifest["pull_request"]["url"])
+    issue_url = str(manifest["issue"]["url"])
+    issue = _gh_json(runner, ["gh", "issue", "view", issue_url, "--json", "body,url"])
     pr = _gh_json(
         runner,
         [
@@ -741,7 +754,7 @@ def verify_scenario(
             "view",
             pr_url,
             "--json",
-            "state,headRefOid,mergeCommit,comments,url",
+            "state,headRefOid,mergeCommit,comments,body,url",
         ],
     )
     if pr.get("state") != "MERGED" or not (pr.get("mergeCommit") or {}).get("oid"):
@@ -749,6 +762,17 @@ def verify_scenario(
     comment_bodies = [str(comment.get("body") or "") for comment in pr.get("comments") or []]
     if sum("Reviewer agent Charlie on behalf of RoboNater" in body for body in comment_bodies) < 2:
         raise ScenarioError("both agent-identified reviewer comments are not present")
+    if canary not in str(issue.get("body") or "") or canary not in str(pr.get("body") or ""):
+        raise ScenarioError("GitHub issue or PR does not contain the untrusted-text canary")
+    approved_head = str((tasks[-1].get("result") or {}).get("reviewed_head_sha") or "")
+    if not approved_head or pr.get("headRefOid") != approved_head:
+        raise ScenarioError("merged PR head does not match the reviewer's approved head")
+    checks = _gh_json(
+        runner,
+        ["gh", "pr", "checks", pr_url, "--json", "name,bucket,link"],
+    )
+    if not checks or any(check.get("bucket") not in {"pass", "skipping"} for check in checks):
+        raise ScenarioError(f"pull request checks are not green: {checks!r}")
 
     with database(hub_db) as connection:
         decisions = [dict(row) for row in connection.execute("SELECT * FROM decision ORDER BY id")]
@@ -762,8 +786,9 @@ def verify_scenario(
         "pull_request": {
             "url": pr_url,
             "state": pr["state"],
-            "approved_head_sha": tasks[-1]["result"]["reviewed_head_sha"],
+            "approved_head_sha": approved_head,
             "merged_sha": pr["mergeCommit"]["oid"],
+            "checks": checks,
         },
         "phases_verified": phases,
         "task_routing": observed,

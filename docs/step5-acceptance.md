@@ -13,6 +13,10 @@ a throwaway PR. Its JSON run manifest records the issue and PR URLs, base and
 head SHAs, worker identities, intended disturbances, every scripted action,
 and the evidence path. It contains no hub or GitHub credentials.
 
+The completed first acceptance run is recorded in
+[`docs/evidence/step5c-20260914-001.md`](evidence/step5c-20260914-001.md), with
+the verifier's machine-readable output beside it.
+
 ## Run it
 
 Authenticate `gh` before starting. Use a fresh absolute run directory outside
@@ -30,6 +34,11 @@ the checked-in `alice-orchestrator` skill only inside that run's runtime
 directory and starts the hub as Alice's stdio MCP server. It refuses to start
 when another listener already owns port 8420; inspect `pgrep -a hub` and stop
 only this checkout's listener.
+
+On a new Claude Code runtime directory, accept the one-time workspace trust
+dialog. If that first-use dialog consumes the launcher's positional prompt and
+leaves a blank input, exit Claude and rerun the same launcher; the trust choice
+is retained and the unchanged manifest renders the same prompt.
 
 After Alice's session opens, start the scripted workers in a second terminal:
 
