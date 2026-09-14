@@ -68,16 +68,26 @@ def create_mcp(store: HubStore, gate: MergeGate | None = None) -> FastMCP:
         role: str,
         title: str,
         instructions: str,
+        event_id: int,
         lease_min: Lease = 30,
         pr_head_sha: Sha | None = None,
     ) -> dict[str, Any]:
         """Assign work to an idle worker and wake its pending NEXT.
 
+        event_id: the durable event whose handling causes this assignment.
         role: implementer, reviewer or rebase — the guide the worker fetches.
         pr_head_sha: the PR head a review or rebase is bound to.
         """
         return asdict(
-            store.assign_task(agent, role, title, instructions, lease_min, pr_head_sha)
+            store.assign_task(
+                agent,
+                role,
+                title,
+                instructions,
+                lease_min,
+                pr_head_sha,
+                source_event_id=event_id,
+            )
         )
 
     @server.tool()
@@ -92,10 +102,8 @@ def create_mcp(store: HubStore, gate: MergeGate | None = None) -> FastMCP:
         return asdict(await merge_gate.check(pr_url, expected_head_sha))
 
     @server.tool()
-    async def reply(
-        task_id: str, text: str, message_id: int | None = None
-    ) -> dict[str, bool]:
-        """Answer a worker question and return its task to working."""
+    async def reply(task_id: str, text: str, message_id: int) -> dict[str, bool]:
+        """Answer the named worker question and return its task to working."""
         applied = store.reply(task_id, text, message_id=message_id)
         return {"ok": True, "applied": applied}
 

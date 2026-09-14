@@ -346,7 +346,9 @@ async def test_a_question_holds_until_alice_replies(
     async def alice() -> None:
         event = await hub_store.wait_for_event(2.0)
         assert event is not None and event.kind is EventKind.WORKER_QUESTION
-        hub_store.reply(event.payload["task_id"], "main")
+        hub_store.reply(
+            event.payload["task_id"], "main", message_id=event.payload["message_id"]
+        )
 
     async def worker() -> httpx.Response:
         return await client.post(
@@ -411,7 +413,9 @@ async def test_a_retried_question_still_receives_a_reply_sent_in_the_gap(
 
     timed_out = await client.post("/a2a", json=ask)
     # Alice answers after the hold elapsed but before the worker calls again.
-    hub_store.reply(task_id, "main")
+    event = hub_store.next_event()
+    assert event is not None and event.kind is EventKind.WORKER_QUESTION
+    hub_store.reply(task_id, "main", message_id=event.payload["message_id"])
     retried = await client.post("/a2a", json=ask)
 
     marker = sse_results(timed_out)[0]
@@ -419,7 +423,6 @@ async def test_a_retried_question_still_receives_a_reply_sent_in_the_gap(
     # The marker names the id the retry has to be sent under.
     assert marker["metadata"][MetaKeys.RETRY_AS_MESSAGE_ID] == ask["params"]["message"]["messageId"]
     assert sse_results(retried)[0]["parts"][0]["text"] == "main"
-    assert hub_store.next_event() is not None
     assert hub_store.next_event() is None
 
 

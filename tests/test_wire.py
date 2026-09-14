@@ -242,7 +242,7 @@ async def test_tasks_get_populated_history_has_only_prefixed_metadata(
     store.record_progress(task.id, "bob", "working on fix")
     q_id = store.open_question(task.id, "bob", "Which approach?", sent_as="q-001")
     assert q_id > 0
-    store.reply(task.id, "Use MetaKeys constants")
+    store.reply(task.id, "Use MetaKeys constants", message_id=q_id)
 
     # Directly insert legacy transcript rows with raw, unprefixed keys to test
     # backward compatibility for existing persisted databases.

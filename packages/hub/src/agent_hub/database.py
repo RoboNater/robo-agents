@@ -19,13 +19,13 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-# v8 is #59's rebuild of the tables `ALTER TABLE` could not reshape, after
-# #27/#41's v7, #24's v5 and #25's v6.
+# v9 is #51's durable binding from an assignment to its triggering event,
+# after #59's v8 canonical table rebuild.
 # Bumping this means first dumping the version it replaces:
 # `uv run python scripts/dump-schema.py` writes tests/fixtures/schema_v<N>.sql,
 # which is what the migration tests replay instead of a fixture written from
 # memory (#54).
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class DatabaseVersionError(RuntimeError):
@@ -91,8 +91,10 @@ CREATE TABLE IF NOT EXISTS task (
     created TEXT NOT NULL,
     updated TEXT NOT NULL,
     pr_head_sha TEXT,
+    source_event_id INTEGER,
     FOREIGN KEY (workflow_id) REFERENCES workflow(id) ON DELETE CASCADE,
-    FOREIGN KEY (assignee) REFERENCES agent(name) ON DELETE SET NULL
+    FOREIGN KEY (assignee) REFERENCES agent(name) ON DELETE SET NULL,
+    FOREIGN KEY (source_event_id) REFERENCES event(id)
 );
 
 CREATE TABLE IF NOT EXISTS message (
@@ -138,6 +140,8 @@ CREATE TABLE IF NOT EXISTS operation (
 
 CREATE INDEX IF NOT EXISTS idx_task_workflow_state ON task(workflow_id, state);
 CREATE INDEX IF NOT EXISTS idx_task_assignee ON task(assignee);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_source_event_id
+    ON task(source_event_id) WHERE source_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_message_context_ts ON message(context_id, ts);
 CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id);
 CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id);
@@ -225,6 +229,7 @@ def initialize_database(path: Path) -> None:
         _migrate_event_delivery(connection)
         _migrate_decision_key(connection)
         _migrate_task_pr_head_sha(connection)
+        _migrate_task_source_event_id(connection)
 
     # v8 (#59). Outside the transaction above: the rebuild needs its own
     # connection, because `PRAGMA foreign_keys` is a no-op inside one. The
@@ -363,6 +368,17 @@ def _migrate_task_pr_head_sha(connection: sqlite3.Connection) -> None:
 
     if "pr_head_sha" not in _columns(connection, "task"):
         connection.execute("ALTER TABLE task ADD COLUMN pr_head_sha TEXT")
+
+
+def _migrate_task_source_event_id(connection: sqlite3.Connection) -> None:
+    """Bind new assignments to one durable source event (#51).
+
+    Historical tasks predate the contract, so NULL is their only truthful
+    source. The partial unique index is recreated after v8's canonical rebuild.
+    """
+
+    if "source_event_id" not in _columns(connection, "task"):
+        connection.execute("ALTER TABLE task ADD COLUMN source_event_id INTEGER")
 
 
 def _rebuild_drifted_tables(path: Path) -> None:

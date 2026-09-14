@@ -127,6 +127,8 @@ class TaskRecord:
     updated: str
     # The PR head a review or rebase is bound to (#27, #41); None when unbound.
     pr_head_sha: str | None = None
+    # The durable event whose handling created this task (#51); direct tasks are unbound.
+    source_event_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +232,7 @@ def _task(row: Row) -> TaskRecord:
         created=row["created"],
         updated=row["updated"],
         pr_head_sha=row["pr_head_sha"],
+        source_event_id=row["source_event_id"],
     )
 
 
@@ -778,11 +781,14 @@ class HubStore:
         instructions: str,
         lease_min: float = DEFAULT_LEASE_MIN,
         pr_head_sha: str | None = None,
+        source_event_id: int | None = None,
     ) -> TaskRecord:
         """Create a task for an idle agent and unblock its pending wait.
 
         `pr_head_sha` binds a review or rebase to the PR head it was given, so
         the verdict can be checked against what the PR holds at merge time.
+        `source_event_id` makes Alice's event-driven call idempotent: an exact
+        replay returns the original task even after it has become terminal.
         """
 
         if pr_head_sha is not None and not SHA_HEX_40_RE.fullmatch(pr_head_sha):
@@ -798,6 +804,44 @@ class HubStore:
         now_moment = self._now()
         now = to_iso(now_moment)
         with database(self.path) as connection:
+            workflow_id = self._require_workflow(connection, "assign_task")
+            lease_cap_min = self._max_task_lease_min(connection, workflow_id)
+            effective_lease_min = min(lease_min, lease_cap_min)
+            if source_event_id is not None:
+                source = connection.execute(
+                    "SELECT id FROM event WHERE id = ?", (source_event_id,)
+                ).fetchone()
+                if source is None:
+                    raise NotFoundError(f"unknown source event: {source_event_id}")
+                existing = connection.execute(
+                    "SELECT * FROM task WHERE source_event_id = ?", (source_event_id,)
+                ).fetchone()
+                if existing is not None:
+                    task = _task(existing)
+                    requested = (
+                        workflow_id,
+                        agent,
+                        role,
+                        title,
+                        instructions,
+                        effective_lease_min * 60,
+                        head,
+                    )
+                    stored = (
+                        task.workflow_id,
+                        task.assignee,
+                        task.role,
+                        task.title,
+                        task.instructions,
+                        task.lease_duration_s,
+                        task.pr_head_sha,
+                    )
+                    if requested == stored:
+                        return task
+                    raise IdempotencyConflictError(
+                        f"source event {source_event_id} already assigned task {task.id} "
+                        "with a different payload"
+                    )
             record = self._require_agent(connection, agent)
             if record.status is not AgentStatus.IDLE:
                 held = self._open_task_id(connection, record.current_task_id)
@@ -810,14 +854,11 @@ class HubStore:
                     f"agent {agent} is {record.status.value}, not idle; "
                     "it must check in again before it can be given work"
                 )
-            workflow_id = self._require_workflow(connection, "assign_task")
-            lease_cap_min = self._max_task_lease_min(connection, workflow_id)
-            effective_lease_min = min(lease_min, lease_cap_min)
             task_id = uuid4().hex
             connection.execute(
                 "INSERT INTO task (id, workflow_id, assignee, role, title, instructions, state,"
-                " lease_expires, lease_duration_s, created, updated, pr_head_sha)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " lease_expires, lease_duration_s, created, updated, pr_head_sha, source_event_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     workflow_id,
@@ -827,10 +868,11 @@ class HubStore:
                     instructions,
                     TaskState.SUBMITTED.value,
                     to_iso(now_moment + timedelta(minutes=effective_lease_min)),
-                    lease_min * 60,
+                    effective_lease_min * 60,
                     now,
                     now,
                     head,
+                    source_event_id,
                 ),
             )
             connection.execute(
@@ -1011,7 +1053,7 @@ class HubStore:
                     return int(row["id"])
         return None
 
-    def reply(self, task_id: str, text: str, message_id: int | None = None) -> bool:
+    def reply(self, task_id: str, text: str, message_id: int) -> bool:
         """Answer a worker question and put the task back to `working`.
 
         Returns True if the reply was applied, or False if skipped due to state guards.
@@ -1021,19 +1063,38 @@ class HubStore:
             task = self._require_task(connection, task_id)
             if task.state != TaskState.INPUT_REQUIRED:
                 return False
-            if message_id is not None:
-                prior = connection.execute(
-                    """
-                    SELECT id FROM message
-                     WHERE task_id = ?
-                       AND id > ?
-                       AND direction = 'from_alice'
-                     ORDER BY id LIMIT 1
-                    """,
-                    (task.id, message_id),
-                ).fetchone()
-                if prior is not None:
-                    return False
+            questions = connection.execute(
+                "SELECT id, parts_json FROM message"
+                " WHERE task_id = ? AND direction = 'to_alice' ORDER BY id",
+                (task.id,),
+            ).fetchall()
+            newest_question_id = next(
+                (
+                    int(row["id"])
+                    for row in reversed(questions)
+                    if any(
+                        (_normalize_part(part).get("metadata") or {}).get(MetaKeys.KIND)
+                        == "question"
+                        for part in json.loads(row["parts_json"])
+                        if isinstance(part, dict)
+                    )
+                ),
+                None,
+            )
+            if newest_question_id != message_id:
+                return False
+            prior = connection.execute(
+                """
+                SELECT id FROM message
+                 WHERE task_id = ?
+                   AND id > ?
+                   AND direction = 'from_alice'
+                 ORDER BY id LIMIT 1
+                """,
+                (task.id, message_id),
+            ).fetchone()
+            if prior is not None:
+                return False
 
             context_id = self._task_context_id(connection, task)
             self._add_message(
