@@ -2,12 +2,14 @@
 
 This repository implements the proof of concept described in
 [`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
-Steps 1–4: the uv workspace, shared configuration and bearer-token provisioning,
-the SQLite schema, A2A agent-card discovery, the hub core (A2A request handlers,
-role-guide route, event queue, lease/heartbeat sweeper, bearer enforcement),
-Alice's MCP tools over stdio (including the `check_merge_gate` merge gate), and worker MCP tools connecting Claude Code
-and Codex CLI workers to the hub. The Step 4A durability retrofit is currently in progress.
-Alice so far runs in relay mode: a prompts-only skill,
+Steps 1–4B and Step 5A: the uv workspace, shared configuration and bearer-token
+provisioning, the SQLite schema, A2A agent-card discovery, the hub core (A2A
+request handlers, role-guide route, event queue, lease/heartbeat sweeper,
+bearer enforcement), Alice's MCP tools over stdio (including the
+`check_merge_gate` merge gate), and worker MCP tools connecting Claude Code and
+Codex CLI workers to the hub, plus the durability contracts and reference
+harness that precede Step 5's runtime behavior. Alice so far runs in relay
+mode: a prompts-only skill,
 [`skills/alice-relay/`](skills/alice-relay/SKILL.md), whose prompts a human
 copies between agents ([trial notes](docs/notes/relay-trial-2026-09.md)); the
 hub-mode `alice-orchestrator` skill is Step 5.
@@ -67,8 +69,16 @@ A normal client disconnect is logged at info level. A standalone `uv run hub`
 needs stdin to stay open; EOF before MCP initialization is an error and exits
 nonzero so detached launches cannot silently appear healthy.
 
-Alice gets `get_state`, `wait_for_event`, `assign_task`, `reply`,
-`set_task_state`, `release_agent`, `set_workflow_status`, and `log_decision`.
+Alice gets `get_state`, `initialize_workflow`, `wait_for_event`, `assign_task`,
+`reply`, `set_task_state`, `release_agent`, `set_workflow_status`, and
+`log_decision`.
+Her first mutating call must be `initialize_workflow(goal, policy)`, using the
+goal and policy from the initial operator prompt. On restart, call `get_state`
+first and resume the stored workflow; repeat `initialize_workflow` only with
+those exact original values to confirm them. A different goal or policy is
+refused so a later prompt cannot silently replace the durable rails. Worker
+check-in may happen before initialization, but task assignment and workflow
+status changes may not.
 `wait_for_event` leases the oldest eligible event, waits up to 120 seconds
 (default 120), and returns `{"event": null}` on timeout; call again.
 Zero seconds performs a nonblocking check. If your runtime uses a shorter tool
@@ -172,4 +182,4 @@ uv run --locked mypy
 uv run --locked pytest
 ```
 
-Step 4A durability retrofit and Step 4B worker endurance testing are next.
+Step 5B runtime guides, prompts, and the hub-mode Alice skill are next.

@@ -371,15 +371,6 @@ class HubStore:
 
     # -- workflow -----------------------------------------------------------
 
-    def ensure_workflow(
-        self, goal: str = DEFAULT_GOAL, policy: Mapping[str, Any] | None = None
-    ) -> str:
-        """Return the id of the single PoC workflow, creating it if needed."""
-
-        requested_policy = _validated_workflow_policy(policy)
-        with database(self.path) as connection:
-            return self._ensure_workflow(connection, goal, requested_policy)
-
     def initialize_workflow(
         self, goal: str = DEFAULT_GOAL, policy: Mapping[str, Any] | None = None
     ) -> str:
@@ -420,25 +411,6 @@ class HubStore:
                     "for a different workflow"
                 )
             return str(row["id"])
-
-    def _ensure_workflow(
-        self, connection: Connection, goal: str, policy: Mapping[str, Any] | None
-    ) -> str:
-        row = connection.execute("SELECT id FROM workflow ORDER BY created LIMIT 1").fetchone()
-        if row is not None:
-            return str(row["id"])
-        workflow_id = uuid4().hex
-        connection.execute(
-            "INSERT INTO workflow (id, goal, status, policy_json, created) VALUES (?, ?, ?, ?, ?)",
-            (
-                workflow_id,
-                goal,
-                WorkflowStatus.ACTIVE.value,
-                json.dumps(dict(policy or {})),
-                self._now_iso(),
-            ),
-        )
-        return workflow_id
 
     def _require_workflow(self, connection: Connection, operation: str) -> str:
         row = connection.execute("SELECT id FROM workflow ORDER BY created LIMIT 1").fetchone()

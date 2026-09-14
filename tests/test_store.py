@@ -702,13 +702,13 @@ def test_state_reports_heartbeat_and_progress_ages_separately(store: HubStore) -
     assert agent["progress_age_s"] == 30
 
 
-def test_the_single_workflow_is_created_once(store: HubStore) -> None:
-    first = store.ensure_workflow()
+def test_the_single_workflow_is_initialized_once(store: HubStore) -> None:
+    first = store.initialize_workflow()
     store.check_in("bob")
     task_id = assign(store)
 
     task = store.get_task(task_id)
-    assert store.ensure_workflow() == first
+    assert store.initialize_workflow() == first
     assert task is not None and task.workflow_id == first
 
 
