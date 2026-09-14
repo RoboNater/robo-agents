@@ -95,6 +95,9 @@ def test_alice_prompt_uses_the_validated_default_policy() -> None:
     assert "<roadmap-owner>/<roadmap-repository>#<roadmap-issue>" in prompt
     assert "throwaway run with no roadmap target" in prompt
     assert "roadmap issue `#2`" not in prompt
+    durable_goal = section(prompt, "Goal:", "GitHub comment identity account:")
+    assert "<roadmap-owner>/<roadmap-repository>#<roadmap-issue>" in durable_goal
+    assert "no roadmap edit" in durable_goal
 
     skill = read("skills/alice-orchestrator/SKILL.md")
     skill_match = re.search(r"```json\n(?P<policy>.*?)\n```", skill, flags=re.DOTALL)
@@ -178,12 +181,29 @@ def test_alice_skill_documents_resume_and_redelivery_guards() -> None:
             "event:<event-id>:<action>",
             "inspect whether the action already happened",
             "including terminal tasks",
-            "This task list is the evidence",
+            "The task list is the evidence",
             "only a deduplicated audit record",
+            "never from arrival order, a delivery ID, or a counter",
+            "Only when no such task exists",
             "PR already merged routes to WRAP-UP",
             "ambiguous resume state",
         ),
     )
+
+    for title_form in (
+        "IMPLEMENT for <issue owner/repository#number>",
+        "REVIEW for <source task id> @ <head sha7> [findings r<number>-]",
+        "ADDRESS for <review task id>",
+        "NONBLOCKING for <review task id>",
+        "FOLLOW-UP for <nonblocking task id>",
+        "REBASE for <approved sha7> @ base <main sha7>",
+        "CI-REPAIR for <head sha7>",
+        "RETRY for <failed task id>",
+        "REVIEW-COMMENT-CORRECTION for <review task id>",
+        "CLOSE-OUT for <merged sha7>",
+        "ROADMAP-CORRECTION for <close-out task id>",
+    ):
+        assert f"`{title_form}`" in skill
 
 
 def test_decision_comments_reference_the_governing_spec_and_issues() -> None:
@@ -235,11 +255,27 @@ def test_typed_guide_outcomes_have_explicit_alice_routes() -> None:
         assert token in reviewer and token in reviewer_routes
 
     assert_fragments(
+        implementer_routes,
+        (
+            "`blocked`: escalate with `blocker`",
+            "never merge or advance from a blocked implementation",
+            "`failed`: escalate with the summary and evidence",
+            "never merge or advance from a failed implementation",
+        ),
+    )
+    assert_fragments(
         reviewer_routes,
         (
             "When it differs from the review task's `pr_head_sha`, assign RE-REVIEW",
             "does not count as a remediation round",
             "Escalate any other blocked result",
             "`failed`: escalate",
+        ),
+    )
+    assert_fragments(
+        rebase_routes,
+        (
+            "`blocked` or `failed`: escalate",
+            "never merge or preserve approval from an unsuccessful rebase",
         ),
     )

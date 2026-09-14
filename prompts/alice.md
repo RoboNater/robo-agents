@@ -2,14 +2,13 @@ Use the `alice-orchestrator` skill to carry this issue through a reviewed,
 gate-checked merge and roadmap close-out.
 
 Goal: Address issue `<issue-owner>/<issue-repository>#<issue>`, merge its pull
-request, and perform the close-out target below.
-
-Roadmap close-out target:
+request, and close out by updating roadmap issue
 `<roadmap-owner>/<roadmap-repository>#<roadmap-issue>`.
 
-For a throwaway run with no roadmap target, replace that line with `none`; in
-that case WRAP-UP records the merge in the workflow summary and does not invent
-or edit a roadmap issue.
+For a throwaway run with no roadmap target, replace the final clause inside the
+Goal with: `and close out with no roadmap edit; record the merge only in the
+workflow summary`. Never leave the durable Goal pointing to text outside
+itself.
 
 GitHub comment identity account: `<account>`.
 

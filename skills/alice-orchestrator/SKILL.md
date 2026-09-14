@@ -104,19 +104,46 @@ Role selection is policy-driven, never arrival-order-driven:
   valid reviewer pair when REVIEW begins, escalate and name the failed rule.
 
 Before every `assign_task`, inspect every item in `get_state.tasks`, including
-terminal tasks. Match the intended phase/title, role, PR URL from the stored
-result when present, and `pr_head_sha` (including an absent SHA for initial
-implementation).
-If a matching task already exists, route its current state/result instead of
-creating another. This task list is the evidence that an assignment happened;
-a repeated `log_decision` call is only a deduplicated audit record and does not
-say whether its associated action ran. Use stable phase-prefixed task titles so
-the comparison survives restart.
+terminal tasks. Derive the intended title from the durable source that caused
+the assignment, never from arrival order, a delivery ID, or a counter allocated
+after the source event. Match the source-bearing title, role, PR URL from the
+stored result when present, and `pr_head_sha` (including an absent SHA for
+initial implementation). If a matching task exists, route its current
+state/result instead of creating another. If its role, PR, or SHA contradicts
+the intended assignment, escalate rather than treating it as a match.
 
-Checkpoint the decision, then call `assign_task` with `role="implementer"`, a
-title prefixed `IMPLEMENT:`, the KICKOFF instructions, and no `pr_head_sha`.
-Leave the reviewer idle. Never assign a second task for a completed or active
-phase.
+Use these stable title forms for every task-producing route:
+
+| Route | Task title |
+|---|---|
+| Initial implementation | `IMPLEMENT for <issue owner/repository#number>` |
+| Review or re-review | `REVIEW for <source task id> @ <head sha7> [findings r<number>-]` |
+| Blocking review response | `ADDRESS for <review task id>` |
+| Approved nonblocking choice | `NONBLOCKING for <review task id>` |
+| Reviewer follow-up issue | `FOLLOW-UP for <nonblocking task id>` |
+| Rebase | `REBASE for <approved sha7> @ base <main sha7>` |
+| CI repair | `CI-REPAIR for <head sha7>` |
+| Retry after lost/expired work | `RETRY for <failed task id>` |
+| Missing review comment | `REVIEW-COMMENT-CORRECTION for <review task id>` |
+| Post-merge close-out | `CLOSE-OUT for <merged sha7>` |
+| Missing roadmap update | `ROADMAP-CORRECTION for <close-out task id>` |
+
+For review titles, first search by the stable
+`REVIEW for <source task id> @ <head sha7>` portion. If it exists, route that
+task and read its finding prefix from the stored title. Only when no such task
+exists may Alice scan existing titles/findings, allocate the next unused
+`r<number>-` prefix, append it to the title, and assign the review. Event IDs
+may substitute for a source task ID only when no task caused the action;
+`EventRecord.id` is stable across redelivery, while `delivery_id` is not.
+
+The task list is the evidence that an assignment happened. A repeated
+`log_decision` call is only a deduplicated audit record and does not say whether
+its associated action ran.
+
+Checkpoint the decision, then call `assign_task` with `role="implementer"`,
+title `IMPLEMENT for <issue owner/repository#number>`, the KICKOFF instructions,
+and no `pr_head_sha`. Leave the reviewer idle. Never assign a second task for a
+completed or active phase.
 
 ## Durable event loop
 
@@ -184,8 +211,10 @@ not route a result by prose in its summary; use its typed fields.
   next review to the result's final/newest `head_sha`, verified against GitHub;
   do not ask which commit to use. If GitHub has an unambiguous newer head, log
   the mismatch and review that current head.
-- `blocked`: escalate with `blocker` and the available options.
-- `failed`: escalate with the summary and evidence.
+- `blocked`: escalate with `blocker` and the available options; never merge or
+  advance from a blocked implementation.
+- `failed`: escalate with the summary and evidence; never merge or advance from
+  a failed implementation.
 
 ### `ReviewerResult`
 
@@ -209,15 +238,18 @@ approval.
   SHA becomes the approved head and returns to MERGE after CI. With any conflict
   files, require `resolution_summary` and route to a focused RE-REVIEW of the
   new head.
-- `blocked` or `failed`: escalate.
+- `blocked` or `failed`: escalate; never merge or preserve approval from an
+  unsuccessful rebase.
 
 ## REVIEW, ADDRESS, and RE-REVIEW
 
 <!-- Comment approval: #37. Newest-head and round behavior: spec §5 / #42. -->
 
-For REVIEW, independently verify the PR URL and head, choose the next unused
-finding ID prefix `r<number>-`, and use it in a stable `REVIEW r<number>:` task
-title. Then call `assign_task`
+For REVIEW, independently verify the PR URL and head. Use the triggering
+implementer, address, rebase, or blocked-review task ID plus the head SHA to
+search for the stable REVIEW title above. Only if it does not exist, choose the
+next unused finding ID prefix `r<number>-`, append it to that title, and call
+`assign_task`
 for the policy-selected reviewer with `role="reviewer"` and
 `pr_head_sha=<verified current head>`. Include the issue URL, PR URL,
 acceptance criteria, and:
