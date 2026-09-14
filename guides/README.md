@@ -5,9 +5,8 @@ Runtime-agnostic instructions for workers, served by the hub at
 `get_role_guide(role)` tool. Every runtime gets identical text, which is why
 worker behaviour cannot live in a Claude Code skill.
 
-The content is written in plan Step 5: `worker.md`, `implementer.md` and
-`reviewer.md` (spec §5). Until then every request for those is a `404`.
-`rebase.md` is already here: it came with the REBASE step (GitHub issue #41),
+The plan Step 5 content is in `worker.md`, `implementer.md` and `reviewer.md`
+(spec §5). `rebase.md` came earlier with the REBASE step (GitHub issue #41),
 and `assign_task(role="rebase")` points workers at it.
 
 File names are role names as they appear in `assign_task(role=...)`: lowercase
