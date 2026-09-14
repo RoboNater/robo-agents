@@ -561,6 +561,7 @@ class WorkerHubClient:
         assignment = {
             "task_id": str(task_id) if task_id else "",
             "role": str(role),
+            "title": str(metadata.get(MetaKeys.TITLE, "")),
             "instructions": instructions,
         }
         pr_head_sha = metadata.get(MetaKeys.PR_HEAD_SHA)
