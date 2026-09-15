@@ -337,7 +337,7 @@ async def test_a_question_parks_the_task_until_alice_replies(store: HubStore) ->
 
     async def alice() -> None:
         await asyncio.sleep(0.01)
-        store.reply(task_id, "main")
+        store.reply(task_id, "main", message_id=question_id)
 
     reply, _ = await asyncio.gather(store.await_reply(task_id, question_id, 2.0), alice())
 
@@ -370,7 +370,7 @@ async def test_a_reply_that_lands_between_attempts_reaches_the_retry(
     assert await store.await_reply(task_id, first, 0.05) is None
 
     # Alice answers in the gap between the timeout and the worker calling again.
-    store.reply(task_id, "main")
+    store.reply(task_id, "main", message_id=first)
     retry = store.open_question(task_id, "bob", "Which base branch?", "q-1")
     reply = await store.await_reply(task_id, retry, 0.05)
 
@@ -679,7 +679,7 @@ def test_initial_lease_is_also_bounded_by_the_workflow_cap(tmp_path: Path) -> No
     task = store.assign_task("bob", "implementer", "Task", "Work", lease_min=30)
 
     assert task.lease_expires == to_iso(clock.now + timedelta(minutes=10))
-    assert task.lease_duration_s == 30 * 60
+    assert task.lease_duration_s == 10 * 60
 
 
 def test_state_reports_heartbeat_and_progress_ages_separately(store: HubStore) -> None:

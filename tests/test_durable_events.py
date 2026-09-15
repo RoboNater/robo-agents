@@ -11,7 +11,7 @@ import httpx
 import pytest
 from agent_hub.database import database, initialize_database
 from agent_hub.mcp import create_mcp
-from agent_hub.store import ConflictError, EventRecord, HubStore
+from agent_hub.store import ConflictError, EventRecord, HubStore, IdempotencyConflictError
 from agent_hub_common import (
     AgentProfile,
     AgentStatus,
@@ -368,7 +368,7 @@ def test_state_guards_idempotency(store: HubStore) -> None:
     # task is in WORKING state; reply should return False and not write messages
     with database(store.path) as conn:
         before_count = conn.execute("SELECT COUNT(*) AS n FROM message").fetchone()["n"]
-    applied = store.reply(task.id, "Late answer")
+    applied = store.reply(task.id, "Late answer", message_id=0)
     assert applied is False
     with database(store.path) as conn:
         after_count = conn.execute("SELECT COUNT(*) AS n FROM message").fetchone()["n"]
@@ -383,10 +383,10 @@ def test_state_guards_idempotency(store: HubStore) -> None:
 
     # Terminal task safely no-ops with False
     store.set_task_state(task.id, TaskState.CANCELED, "Canceled")
-    assert store.reply(task.id, "Late answer on canceled task") is False
+    assert store.reply(task.id, "Late answer on canceled task", message_id=0) is False
     task2 = store.assign_task("worker-1", "implementer", "Task 2", "Instructions")
     store.set_task_state(task2.id, TaskState.FAILED, "Failed")
-    assert store.reply(task2.id, "Late answer on failed task") is False
+    assert store.reply(task2.id, "Late answer on failed task", message_id=0) is False
 
     # 5. release_agent guard when agent is already released
     store.release_agent("worker-1")
@@ -396,6 +396,40 @@ def test_state_guards_idempotency(store: HubStore) -> None:
     store.release_agent("worker-1")
     agent_second = store.agent_by_name("worker-1")
     assert agent_second is not None and agent_second.status == AgentStatus.RELEASED
+
+
+def test_assignment_replay_is_bound_to_its_source_event(store: HubStore) -> None:
+    store.check_in("bob", AgentProfile(harness="claude-code"))
+    source = store.lease_next_event()
+    assert source is not None and source.kind is EventKind.AGENT_CHECKED_IN
+
+    original = store.assign_task(
+        "bob",
+        "implementer",
+        "IMPLEMENT for RoboNater/example#1",
+        "Do it",
+        source_event_id=source.id,
+    )
+    store.submit_result(original.id, "bob", TaskState.COMPLETED, "Done")
+
+    replay = store.assign_task(
+        "bob",
+        "implementer",
+        "IMPLEMENT for RoboNater/example#1",
+        "Do it",
+        source_event_id=source.id,
+    )
+    assert replay.id == original.id
+    assert len(store.tasks()) == 1
+
+    with pytest.raises(IdempotencyConflictError, match="different payload"):
+        store.assign_task(
+            "bob",
+            "implementer",
+            "A different task",
+            "Do something else",
+            source_event_id=source.id,
+        )
 
 
 async def test_mcp_wait_for_event_and_implicit_ack(store: HubStore) -> None:
@@ -559,7 +593,13 @@ def _alice_acts(store: HubStore, event: EventRecord) -> None:
     if event.kind is EventKind.AGENT_CHECKED_IN:
         # Refusing a second task for a busy worker is the guard working.
         with suppress(ConflictError):
-            store.assign_task(payload["agent"], "implementer", "Fix it", "Please fix it.")
+            store.assign_task(
+                payload["agent"],
+                "implementer",
+                "Fix it",
+                "Please fix it.",
+                source_event_id=event.id,
+            )
     elif event.kind is EventKind.WORKER_QUESTION:
         store.reply(payload["task_id"], "Approved.", message_id=payload["message_id"])
     elif event.kind in (EventKind.TASK_COMPLETED, EventKind.TASK_FAILED):
@@ -630,14 +670,7 @@ def _interleaves(store: HubStore, scenario: str) -> None:
     "scenario",
     [
         "agent_checked_in",
-        pytest.param(
-            "agent_checked_in_after_completion",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="#51: assign_task guards on a busy worker, not on the "
-                "event, so a redelivery after the task completed assigns a second",
-            ),
-        ),
+        "agent_checked_in_after_completion",
         "task_progress",
         "worker_question",
         "worker_question_then_another",
@@ -673,20 +706,8 @@ def test_replaying_a_delivered_event_changes_nothing_twice(
     assert _fingerprint(store) == settled
 
 
-def test_reply_without_a_message_id_answers_whatever_question_is_open(store: HubStore) -> None:
-    """#51's first gap, pinned as it behaves today.
-
-    Alice answers q1 and dies before acking. The worker asks q2, so the task is
-    `input-required` again, and the redelivered q1 arrives first by FIFO. The
-    guard passes — without `message_id` there is nothing to compare against —
-    and the worker reads Alice's answer to q1 as the answer to q2. This was
-    reproduced during #49's review; §5 now tells Alice to pass
-    `payload.message_id`, but prose is the only thing enforcing it.
-
-    Passing it does refuse the replay: that is the `worker_question_then_another`
-    parameter of the harness above. When #51 makes the guard unconditional this
-    test fails, which is the point of pinning it.
-    """
+def test_reply_requires_and_guards_the_newest_question_id(store: HubStore) -> None:
+    """A redelivered answer to q1 can never become the answer to q2 (#51)."""
 
     store.check_in("bob", AgentProfile(harness="claude-code"))
     task = store.assign_task("bob", "implementer", "Fix it", "Please fix it.")
@@ -695,9 +716,8 @@ def test_reply_without_a_message_id_answers_whatever_question_is_open(store: Hub
     assert store.reply(task.id, "answer-to-q1", message_id=q1) is True
     q2 = store.open_question(task.id, "bob", "And rename the module?", sent_as="q-2")
 
-    # The redelivered q1, handled the way mock-alice handled it during the review.
-    assert store.reply(task.id, "answer-to-q1") is True
+    with pytest.raises(TypeError, match="message_id"):
+        store.reply(task.id, "answer-to-q1")  # type: ignore[call-arg]
+    assert store.reply(task.id, "answer-to-q1", message_id=q1) is False
 
-    answer = store.pending_reply(task.id, q2)
-    assert answer is not None
-    assert answer.parts[0]["text"] == "answer-to-q1"
+    assert store.pending_reply(task.id, q2) is None

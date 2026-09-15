@@ -68,6 +68,8 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
         )
     )["id"] == initialized["id"]
     bob = store.check_in("bob", AgentProfile(capabilities=("python",)))
+    checkin_event = store.lease_next_event()
+    assert checkin_event is not None
     with pytest.raises(Exception, match=f"maximum is {MAX_MESSAGE_PART_BYTES} bytes"):
         await call(
             "assign_task",
@@ -75,19 +77,27 @@ async def test_tools_and_durable_actions(tmp_path: Path) -> None:
             role="implementer",
             title="Too large",
             instructions="x" * MAX_MESSAGE_PART_BYTES,
+            event_id=checkin_event.id,
         )
     assert store.tasks() == []
     pending = asyncio.create_task(store.await_assignment(bob.context_id, 1))
     await asyncio.sleep(0)
     task = await call(
-        "assign_task", agent="bob", role="implementer", title="Fix", instructions="Do it"
+        "assign_task",
+        agent="bob",
+        role="implementer",
+        title="Fix",
+        instructions="Do it",
+        event_id=checkin_event.id,
     )
     claimed = await pending
     assert claimed is not None
     question = store.open_question(task["id"], "bob", "Which?", "q1")
     waiting = asyncio.create_task(store.await_reply(task["id"], question, 1))
     await asyncio.sleep(0)
-    await call("reply", task_id=task["id"], text="This one")
+    with pytest.raises(Exception, match="message_id"):
+        await call("reply", task_id=task["id"], text="This one")
+    await call("reply", task_id=task["id"], text="This one", message_id=question)
     answer = await waiting
     assert answer is not None and answer.parts[0]["text"] == "This one"
     await call("set_task_state", task_id=task["id"], state="failed", note="Stop")

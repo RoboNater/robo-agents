@@ -8,6 +8,7 @@ import pytest
 from agent_hub.store import HubStore
 from agent_hub_common import (
     AgentProfile,
+    EventKind,
     HubSettings,
     ImplementerOutcome,
     ImplementerResult,
@@ -254,6 +255,8 @@ async def test_ask_alice_reply_and_retry_correlation(
     worker = WorkerHubClient(worker_settings, http_client=client)
     await worker.check_in()
     task = hub_store.assign_task("bob", "implementer", "Task 1", "Instructions")
+    while hub_store.next_event() is not None:
+        pass
 
     # 1. Ask question with answer
     async def answer() -> None:
@@ -262,7 +265,13 @@ async def test_ask_alice_reply_and_retry_correlation(
             if current is not None and current.state == TaskState.INPUT_REQUIRED:
                 break
             await asyncio.sleep(0.01)
-        hub_store.reply(task.id, "Use SQLite for persistence.")
+        event = hub_store.next_event()
+        assert event is not None and event.kind is EventKind.WORKER_QUESTION
+        hub_store.reply(
+            task.id,
+            "Use SQLite for persistence.",
+            message_id=event.payload["message_id"],
+        )
 
     ask_task = asyncio.create_task(worker.ask_alice(task.id, "Which database?", timeout_s=2.0))
     await asyncio.gather(answer(), ask_task)
@@ -277,7 +286,13 @@ async def test_ask_alice_reply_and_retry_correlation(
     assert saved_msg_id != ""
 
     # Alice answers while worker is retrying in the gap
-    hub_store.reply(task.id, "The answer given in the gap.")
+    event = hub_store.next_event()
+    assert event is not None and event.kind is EventKind.WORKER_QUESTION
+    hub_store.reply(
+        task.id,
+        "The answer given in the gap.",
+        message_id=event.payload["message_id"],
+    )
 
     # 3. Retry uses the saved message_id and picks up the answer
     retry_res = await worker.ask_alice(task.id, "Second question?", timeout_s=2.0)

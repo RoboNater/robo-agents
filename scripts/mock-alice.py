@@ -429,10 +429,13 @@ async def drive_endurance(
                         question_reply_delay_s,
                     )
                     await asyncio.sleep(question_reply_delay_s)
+                    message_id = event.payload.get("message_id")
+                    if not isinstance(message_id, int):
+                        raise RuntimeError("worker_question event has no integer message_id")
                     applied = store.reply(
                         task.id,
                         "Approved. Continue the endurance probe.",
-                        message_id=event.payload.get("message_id"),
+                        message_id=message_id,
                     )
                     if not applied:
                         raise RuntimeError("Endurance question reply was not applied")
@@ -503,10 +506,10 @@ class AliceBackend(Protocol):
     ) -> dict[str, Any]: ...
 
     async def assign_task(
-        self, agent: str, role: str, title: str, instructions: str
+        self, agent: str, role: str, title: str, instructions: str, event_id: int
     ) -> dict[str, Any]: ...
 
-    async def reply(self, task_id: str, text: str, message_id: int | None) -> dict[str, Any]: ...
+    async def reply(self, task_id: str, text: str, message_id: int) -> dict[str, Any]: ...
 
     async def release_agent(self, agent: str) -> dict[str, Any]: ...
 
@@ -544,13 +547,17 @@ class DirectStoreBackend:
         return {"event": None if event is None else asdict(event)}
 
     async def assign_task(
-        self, agent: str, role: str, title: str, instructions: str
+        self, agent: str, role: str, title: str, instructions: str, event_id: int
     ) -> dict[str, Any]:
-        task = asdict(self.store.assign_task(agent, role, title, instructions))
+        task = asdict(
+            self.store.assign_task(
+                agent, role, title, instructions, source_event_id=event_id
+            )
+        )
         await asyncio.sleep(0)
         return task
 
-    async def reply(self, task_id: str, text: str, message_id: int | None) -> dict[str, Any]:
+    async def reply(self, task_id: str, text: str, message_id: int) -> dict[str, Any]:
         applied = self.store.reply(task_id, text, message_id)
         await asyncio.sleep(0)
         return {"ok": True, "applied": applied}
@@ -595,15 +602,21 @@ class McpBackend:
         return await _call_dict(self.session, "wait_for_event", arguments)
 
     async def assign_task(
-        self, agent: str, role: str, title: str, instructions: str
+        self, agent: str, role: str, title: str, instructions: str, event_id: int
     ) -> dict[str, Any]:
         return await _call_dict(
             self.session,
             "assign_task",
-            {"agent": agent, "role": role, "title": title, "instructions": instructions},
+            {
+                "agent": agent,
+                "role": role,
+                "title": title,
+                "instructions": instructions,
+                "event_id": event_id,
+            },
         )
 
-    async def reply(self, task_id: str, text: str, message_id: int | None) -> dict[str, Any]:
+    async def reply(self, task_id: str, text: str, message_id: int) -> dict[str, Any]:
         return await _call_dict(
             self.session,
             "reply",
@@ -739,8 +752,20 @@ async def drive_one_task_with_backend(
             event = delivered.get("event") if isinstance(delivered, dict) else None
             if not isinstance(event, dict):
                 if known_agent is not None:
-                    agent_name = expected_agent
-                    checked_in_harness = known_agent.get("harness")
+                    unacked = state.get("unacked_delivered") or []
+                    source = next(
+                        (
+                            item
+                            for item in unacked
+                            if item.get("kind") == EventKind.AGENT_CHECKED_IN.value
+                            and (item.get("payload") or {}).get("agent") == expected_agent
+                        ),
+                        None,
+                    )
+                    if isinstance(source, dict) and isinstance(source.get("id"), int):
+                        agent_name = expected_agent
+                        checked_in_harness = known_agent.get("harness")
+                        checkin_event_id = source["id"]
                 continue
 
             last_delivery_id = event.get("delivery_id")
@@ -766,7 +791,11 @@ async def drive_one_task_with_backend(
             f"Initial assignment for role {role}",
             f"{checkpoint_source}:assign",
         )
-        task = await backend.assign_task(agent_name, role, title, instructions)
+        if not isinstance(checkin_event_id, int):
+            raise RuntimeError("Initial assignment has no durable check-in event id")
+        task = await backend.assign_task(
+            agent_name, role, title, instructions, checkin_event_id
+        )
         task_id = str(task.get("id") or "")
         logger.info("Task assigned: id=%s title=%r", task_id, title)
         if crash_at == "after_action":
@@ -813,10 +842,12 @@ async def drive_one_task_with_backend(
                 question_task_id,
                 payload.get("question"),
             )
+            if not isinstance(message_id, int):
+                raise RuntimeError("worker_question event has no integer message_id")
             await backend.reply(
                 question_task_id,
                 "Approved. Proceed with the proposed design.",
-                message_id if isinstance(message_id, int) else None,
+                message_id,
             )
             logger.info("Alice replied to question on %s", question_task_id)
             if crash_at in ("after_action", "after_reply"):

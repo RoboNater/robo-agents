@@ -2,7 +2,7 @@
 
 This repository implements the proof of concept described in
 [`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
-Steps 1–4B and Step 5A: the uv workspace, shared configuration and bearer-token
+Steps 1–4B and Step 5: the uv workspace, shared configuration and bearer-token
 provisioning, the SQLite schema, A2A agent-card discovery, the hub core (A2A
 request handlers, role-guide route, event queue, lease/heartbeat sweeper,
 bearer enforcement), Alice's MCP tools over stdio (including the
@@ -183,4 +183,5 @@ uv run --locked mypy
 uv run --locked pytest
 ```
 
-Step 5C's integrated sandbox acceptance demo is next.
+The Step 5C scripted acceptance driver and interactive Alice launchers are
+documented in [`docs/step5-acceptance.md`](docs/step5-acceptance.md).
