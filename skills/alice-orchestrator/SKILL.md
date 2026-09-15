@@ -137,8 +137,13 @@ may substitute for a source task ID only when no task caused the action;
 `EventRecord.id` is stable across redelivery, while `delivery_id` is not.
 
 Pass that source event's stable `id` as `event_id` on `assign_task`; never pass
-its per-delivery `delivery_id`. The hub returns the original task for an exact
-replay of the same event and refuses a conflicting reuse.
+its per-delivery `delivery_id`. A source event creates at most one task. The
+hub returns the original task for an exact replay of the same event and refuses
+a conflicting reuse while naming the task already bound to it. If replayed
+instructions are worded differently and cause that conflict, do not escalate
+or invent another event ID: call `get_state`, find the task with that
+`source_event_id`, and route its current state/result. A later assignment in a
+multi-step route must be driven by its own subsequent durable event.
 
 The task list is the evidence that an assignment happened. A repeated
 `log_decision` call is only a deduplicated audit record and does not say whether

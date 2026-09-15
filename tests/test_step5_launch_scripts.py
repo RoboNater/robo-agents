@@ -15,7 +15,7 @@ def test_step5_launch_scripts_are_executable_and_parse() -> None:
     for script in SCRIPTS:
         assert os.access(script, os.X_OK), script
         parsed = subprocess.run(
-            ["bash", "-n", str(script)],
+            ["bash", "-n", script.as_posix()],
             check=False,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -40,5 +40,6 @@ def test_prepare_and_verify_keep_evidence_outside_the_checkout() -> None:
 
     assert "RUN_DIR" in prepare
     assert "--seed" in prepare
+    assert "--allow-repeat" in prepare
     assert "--verify" in verify
     assert '"$run_dir/evidence.json"' in verify

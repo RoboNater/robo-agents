@@ -29,6 +29,16 @@ scripts/prepare-step5-demo.sh /tmp/robo-step5c-001 step5c-001
 scripts/launch-step5-alice.sh /tmp/robo-step5c-001
 ```
 
+The canonical scenario's first-merge guard is intentionally one-shot. After
+the first acceptance merge has been preserved, use an explicit rehearsal run:
+
+```sh
+scripts/prepare-step5-demo.sh /tmp/robo-step5c-rehearsal step5c-rehearsal --allow-repeat
+```
+
+`--allow-repeat` records the already-merged PRs in the manifest and marks that
+run as a rehearsal; its evidence does not claim to prove the first merge.
+
 The Alice launcher is deliberately interactive, matching spec §8. It installs
 the checked-in `alice-orchestrator` skill only inside that run's runtime
 directory and starts the hub as Alice's stdio MCP server. It refuses to start
@@ -62,8 +72,11 @@ scripts/verify-step5-demo.sh /tmp/robo-step5c-001
 ```
 
 Keep `run.json`, `evidence.json`, Alice's session transcript, and the hub
-database together. The GitHub issue, PR, commits, checks, and review comments
-are durable remote evidence referenced by those files.
+database together. For the canonical acceptance, also check in the
+credential-free manifest, verifier output, and extracted decision audit under
+`docs/evidence/`; the database and runtime credentials remain outside the
+checkout. The GitHub issue, PR, commits, checks, and review comments are durable
+remote evidence referenced by those files.
 
 ## Crash hooks
 

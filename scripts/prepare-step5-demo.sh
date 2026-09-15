@@ -2,12 +2,21 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "usage: $0 RUN_DIR [RUN_ID]" >&2
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+  echo "usage: $0 RUN_DIR [RUN_ID] [--allow-repeat]" >&2
   exit 2
 fi
 run_dir=$(realpath -m "$1")
 run_id=${2:-}
+repeat_arg=${3:-}
+if [[ "$run_id" == "--allow-repeat" ]]; then
+  repeat_arg=$run_id
+  run_id=""
+fi
+if [[ -n "$repeat_arg" && "$repeat_arg" != "--allow-repeat" ]]; then
+  echo "third argument must be --allow-repeat" >&2
+  exit 2
+fi
 manifest="$run_dir/run.json"
 scenario="$repo_root/scenarios/step5c-untrusted.json"
 
@@ -25,6 +34,9 @@ seed_args=(
 )
 if [[ -n "$run_id" ]]; then
   seed_args+=(--run-id "$run_id")
+fi
+if [[ -n "$repeat_arg" ]]; then
+  seed_args+=(--allow-repeat)
 fi
 UV_CACHE_DIR=${UV_CACHE_DIR:-/tmp/robo-step5-uv-cache} "${seed_args[@]}"
 

@@ -429,10 +429,13 @@ async def drive_endurance(
                         question_reply_delay_s,
                     )
                     await asyncio.sleep(question_reply_delay_s)
+                    message_id = event.payload.get("message_id")
+                    if not isinstance(message_id, int):
+                        raise RuntimeError("worker_question event has no integer message_id")
                     applied = store.reply(
                         task.id,
                         "Approved. Continue the endurance probe.",
-                        message_id=event.payload.get("message_id"),
+                        message_id=message_id,
                     )
                     if not applied:
                         raise RuntimeError("Endurance question reply was not applied")

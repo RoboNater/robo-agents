@@ -258,6 +258,7 @@ def test_seed_scenario_writes_a_reproducible_manifest(tmp_path: Path) -> None:
     assert manifest["issue"]["number"] == 7
     assert manifest["pull_request"]["number"] == 2
     assert manifest["prior_merged_pull_requests"] == []
+    assert manifest["first_workflow_merge_required"] is True
     bodies = "\n".join(body or "" for _, body in calls)
     assert manifest["injection_canary"] in bodies
     assert manifest["scenario_definition"]["repository"] == mock_worker.SANDBOX_REPOSITORY
@@ -285,6 +286,40 @@ def test_seed_scenario_refuses_a_nonfirst_or_nonsandbox_merge(tmp_path: Path) ->
         mock_worker.seed_scenario(
             scenario_path, tmp_path / "wrong.json", run_id="step5c-wrong", runner=merged_runner
         )
+
+
+def test_seed_scenario_allows_an_explicit_repeat_rehearsal(tmp_path: Path) -> None:
+    scenario_path = Path(__file__).resolve().parents[1] / "scenarios" / "step5c-untrusted.json"
+
+    def repeat_runner(args: list[str], input_text: str | None = None) -> str:
+        del input_text
+        joined = " ".join(args)
+        if "pr list" in joined:
+            return '[{"number": 3, "url": "https://example.test/pull/3"}]'
+        if "issue create" in joined:
+            return "https://github.com/RoboNater/robo-agents-sandbox/issues/8"
+        if "git/ref/heads/main" in joined:
+            return "a" * 40
+        if "git/refs" in joined:
+            return "{}"
+        if "contents/runs/step5c-repeat.txt" in joined:
+            return json.dumps({"commit": {"sha": "b" * 40}})
+        if "pr create" in joined:
+            return "https://github.com/RoboNater/robo-agents-sandbox/pull/4"
+        raise AssertionError(args)
+
+    manifest = mock_worker.seed_scenario(
+        scenario_path,
+        tmp_path / "repeat.json",
+        run_id="step5c-repeat",
+        allow_repeat=True,
+        runner=repeat_runner,
+    )
+
+    assert manifest["first_workflow_merge_required"] is False
+    assert manifest["prior_merged_pull_requests"] == [
+        {"number": 3, "url": "https://example.test/pull/3"}
+    ]
 
 
 def test_render_alice_prompt_is_self_contained(tmp_path: Path) -> None:
@@ -331,6 +366,7 @@ def test_verify_scenario_proves_routing_merge_and_release(tmp_path: Path) -> Non
     initialize_database(db_path)
     store = HubStore(db_path)
     store.initialize_workflow(policy={"merge_method": "squash"})
+    store.log_decision("Plan for issue #7", "Use the normal workflow")
     store.check_in("bob", AgentProfile(harness="claude-code"))
     store.check_in("charlie", AgentProfile(harness="codex"))
     pr_url = "https://github.com/RoboNater/robo-agents-sandbox/pull/2"
@@ -390,6 +426,11 @@ def test_verify_scenario_proves_routing_merge_and_release(tmp_path: Path) -> Non
     )
     store.release_agent("bob")
     store.release_agent("charlie")
+    store.log_decision(
+        "Merge invariant satisfied; executing squash merge",
+        "Gate passed",
+        key="event:10:merge",
+    )
     store.set_workflow_status(WorkflowStatus.DONE, "merged and wrapped up")
 
     manifest_path = tmp_path / "run.json"
@@ -420,17 +461,33 @@ def test_verify_scenario_proves_routing_merge_and_release(tmp_path: Path) -> Non
             )
         if args[1:3] == ["pr", "checks"]:
             return json.dumps(
-                [{"name": "test", "bucket": "pass", "link": "https://example.test/check"}]
+                [
+                    {
+                        "name": "test",
+                        "bucket": "pass",
+                        "link": "https://example.test/check",
+                        "completedAt": "2026-09-14T21:41:07Z",
+                    }
+                ]
             )
+        if args[1] == "api":
+            return json.dumps({"parents": [{"sha": "0" * 40}]})
         payload: dict[str, Any] = {
             "state": "MERGED",
             "headRefOid": sha2,
             "mergeCommit": {"oid": "3" * 40},
             "comments": [
-                {"body": "Reviewer agent Charlie on behalf of RoboNater"},
-                {"body": "Reviewer agent Charlie on behalf of RoboNater"},
+                {
+                    "body": "Reviewer agent Charlie on behalf of RoboNater",
+                    "createdAt": "2026-09-14T21:40:37Z",
+                },
+                {
+                    "body": f"Reviewer agent Charlie on behalf of RoboNater\nApproved `{sha2}`",
+                    "createdAt": "2026-09-14T21:41:08Z",
+                },
             ],
             "body": "fixture STEP5C-UNTRUSTED-step5c-test",
+            "mergedAt": "2026-09-14T21:41:38Z",
             "url": pr_url,
         }
         return json.dumps(payload)
@@ -446,5 +503,7 @@ def test_verify_scenario_proves_routing_merge_and_release(tmp_path: Path) -> Non
         "WRAP-UP",
     ]
     assert evidence["untrusted_text_behavior_unchanged"] is True
+    assert all(evidence["phase_checks"].values())
+    assert all(evidence["untrusted_text_behavior_checks"].values())
     assert evidence["pull_request"]["merged_sha"] == "3" * 40
     assert (tmp_path / "evidence.json").is_file()

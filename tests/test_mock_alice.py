@@ -385,10 +385,10 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
         token=TOKEN,
         token_file=tmp_path / "token",
         guides_dir=tmp_path / "guides",
-        default_wait_s=0.04,
+        default_wait_s=0.1,
         max_wait_s=1.0,
-        lost_after_s=0.15,
-        sweep_interval_s=0.01,
+        lost_after_s=0.5,
+        sweep_interval_s=0.02,
     )
     app = create_app(settings)
     worker_settings = WorkerSettings(
@@ -396,8 +396,8 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
         token=TOKEN,
         agent_name="bob",
         profile=AgentProfile(harness="codex"),
-        default_wait_s=0.04,
-        heartbeat_s=0.02,
+        default_wait_s=0.1,
+        heartbeat_s=0.05,
         max_retries=2,
         backoff_factor_s=0.01,
     )
@@ -416,7 +416,7 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
             async with WorkerHubClient(worker_settings, http_client=http_client) as worker:
                 await worker.check_in()
                 while True:
-                    assignment = await worker.await_assignment(timeout_s=0.04)
+                    assignment = await worker.await_assignment(timeout_s=0.1)
                     if assignment.get("timeout"):
                         observed["assignment_timeouts"] += 1
                         continue
@@ -427,16 +427,16 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
                     task_id = assignment["task_id"]
                     if observed["cycles"] == 1:
                         reply = await worker.ask_alice(
-                            task_id, mock_alice.ENDURANCE_QUESTION, timeout_s=0.04
+                            task_id, mock_alice.ENDURANCE_QUESTION, timeout_s=0.1
                         )
                         if reply.get("timeout"):
                             observed["question_timeouts"] += 1
                             reply = await worker.ask_alice(
-                                task_id, mock_alice.ENDURANCE_QUESTION, timeout_s=0.2
+                                task_id, mock_alice.ENDURANCE_QUESTION, timeout_s=1.0
                             )
                         assert "Approved" in reply.get("reply", "")
                     elif observed["cycles"] == 2:
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.7)
 
                     await worker.submit_result(
                         task_id,
@@ -454,22 +454,22 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
                 "bob",
                 expected_harness="codex",
                 cycles=3,
-                min_elapsed_s=0.55,
-                assignment_delay_s=0.08,
-                cycle_gap_s=0.04,
-                worker_hold_s=0.04,
-                question_hold_s=0.04,
-                question_reply_delay_s=0.08,
-                long_work_s=0.2,
-                lost_after_s=0.15,
-                checkin_timeout_s=1.0,
+                min_elapsed_s=1.5,
+                assignment_delay_s=0.2,
+                cycle_gap_s=0.1,
+                worker_hold_s=0.1,
+                question_hold_s=0.1,
+                question_reply_delay_s=0.2,
+                long_work_s=0.7,
+                lost_after_s=0.5,
+                checkin_timeout_s=2.0,
             )
         )
         result, _ = await asyncio.gather(alice_task, run_worker())
 
     assert result["cycles"] == 3
-    assert result["elapsed_s"] >= 0.55
-    assert result["long_work_interval_s"] >= 0.2
+    assert result["elapsed_s"] >= 1.5
+    assert result["long_work_interval_s"] >= 0.7
     assert result["heartbeat_advanced"] is True
     assert result["row_counts"] == {
         "assignments": 3,
