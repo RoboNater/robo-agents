@@ -564,8 +564,13 @@ class HubStore:
             if profile.workspace_id is not None:
                 owner = connection.execute(
                     "SELECT name FROM agent WHERE workspace_id = ? "
-                    "AND status IN ('idle', 'busy') AND name != ?",
-                    (profile.workspace_id, name),
+                    "AND status IN (?, ?) AND name != ?",
+                    (
+                        profile.workspace_id,
+                        AgentStatus.IDLE.value,
+                        AgentStatus.BUSY.value,
+                        name,
+                    ),
                 ).fetchone()
                 if owner is not None:
                     raise DuplicateAgentError(

@@ -182,3 +182,16 @@ async def test_worker_reports_persisted_identity(
     await worker.check_in()
     registered = hub_store.agent_by_name("bob")
     assert registered is not None and registered.workspace_id == persisted["workspace_id"]
+
+
+def test_bootstrap_missing_identity_error(repository: Path, tmp_path: Path) -> None:
+    destination = tmp_path / "interrupted"
+    subprocess.run(["git", "clone", str(repository), str(destination)], check=True)
+    result = subprocess.run(
+        [str(ROOT / "scripts/bootstrap-workspace.sh"), "bob", str(destination), str(repository)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "missing robo-agents-workspace.json" in result.stderr
+    assert "remove the incomplete clone" in result.stderr
