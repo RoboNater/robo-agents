@@ -157,6 +157,7 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
     }
     for label, sha, second in (("head", b, 10), ("base", c, 15), ("final", f, 19)):
         gate = {
+            "pr_url": url,
             "expected_head_sha": sha,
             "current_head_sha": c if label == "head" else sha,
             "head_matches": label != "head",
@@ -712,6 +713,73 @@ def test_fabricated_gate_log_does_not_satisfy_proof(proof: tuple[Any, ...]) -> N
     assert "head_gate_response_correlated" in evidence["failed_checks"]
 
 
+@pytest.mark.parametrize("label", ["head", "base", "final"])
+def test_gate_response_cannot_come_from_another_pr(proof: tuple[Any, ...], label: str) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    call = traces["alice"][["head", "base", "final"].index(label)]
+    correct = copy.deepcopy(call)
+    del correct["result"]
+    call["input"]["pr_url"] = "https://github.com/RoboNater/robo-agents-sandbox/pull/999"
+    traces["alice"].append(correct)
+    assert (
+        label + "_gate_response_correlated"
+        in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+@pytest.mark.parametrize(
+    "command,failed_check",
+    [
+        ("git -C . push origin HEAD:refs/heads/x", "reviewer_did_not_push"),
+        ("git\tpush origin x", "reviewer_did_not_push"),
+        ("gh\tpr\tmerge 10 --squash", "workers_did_not_merge"),
+        ("bash -lc 'git -C . push origin x'", "reviewer_did_not_push"),
+        ("cd .. && cat bob/secret", "charlie_no_other_workspace_access"),
+        ("cat ../bob/secret", "charlie_no_other_workspace_access"),
+    ],
+)
+def test_worker_action_variants_fail_proof(
+    proof: tuple[Any, ...], command: str, failed_check: str
+) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    traces["charlie"].append({"name": "Bash", "input": {"command": command}})
+    assert failed_check in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+
+
+@pytest.mark.parametrize("option", ["--auto", "--admin", "--match-head-commit"])
+def test_extra_merge_options_fail_proof(proof: tuple[Any, ...], option: str) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    call = next(call for call in traces["alice"] if call["name"] == "Bash")
+    call["input"]["command"] += " " + option
+    assert (
+        "alice_sha_bound_merge"
+        in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+def test_subsecond_hub_times_are_compatible_with_github_seconds(proof: tuple[Any, ...]) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    manifest["disturbances"]["base"]["merged_at"] = stamp(12)
+    snapshot["task"][4]["updated"] = stamp(12).replace(".000", ".100")
+    snapshot["task"][5]["created"] = stamp(12).replace(".000", ".900")
+    facts["checks"][manifest["disturbances"]["base"]["head"]][0]["completed_at"] = stamp(12)
+    gate = next(row for row in snapshot["decision"] if row["key"] == "step6:gate:base")
+    gate["ts"] = stamp(12).replace(".000", ".800")
+    final_gate = next(row for row in snapshot["decision"] if row["key"] == "step6:gate:final")
+    final_gate["ts"] = stamp(20).replace(".000", ".100")
+    merge = next(call for call in traces["alice"] if call["name"] == "Bash")
+    merge["timestamp"] = stamp(20).replace(".000", ".200")
+    merge["completed_at"] = stamp(20).replace(".000", ".900")
+    evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
+    assert evidence["passed"], evidence["failed_checks"]
+
+
+def test_unresolved_fixture_placeholders_fail_before_seeding() -> None:
+    for value in ("<run_id>", "<account>", "/absolute/path/to/bob"):
+        with pytest.raises(ValueError, match="placeholder"):
+            STEP6.reject_placeholders(value)
+
+
 def test_setup_failure_retries_in_place_with_same_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -761,13 +829,77 @@ def test_setup_failure_retries_in_place_with_same_identity(
     assert (directory / "token").read_text() == token
 
 
+def test_seeded_setup_recovers_ready_window_before_issue_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "ready-run"
+    directory.mkdir()
+    checkpoint = {
+        "phase": "ready",
+        "seed": True,
+        "repository": None,
+        "run_id": "unchanged-run-id",
+        "scenario_sha256": STEP6.hashlib.sha256(
+            (ROOT / "scenarios/step6-localhost-untrusted.json").read_bytes()
+        ).hexdigest(),
+    }
+    STEP6.save(directory / "setup.json", checkpoint)
+    (directory / "token").write_text("unchanged-private-token")
+    for name in ("bob", "charlie", "driver"):
+        (directory / name / ".git/info").mkdir(parents=True)
+    mutations = []
+
+    def runner(*args: Any, **kwargs: Any) -> str:
+        if str(args[0]).endswith("bootstrap-workspace.sh"):
+            return json.dumps(
+                {"path": str(directory / args[1]), "workspace_id": args[1] + "-unchanged"}
+            )
+        if args[:3] == ("gh", "issue", "create"):
+            mutations.append("issue")
+            return "https://github.com/RoboNater/robo-agents-sandbox/issues/77"
+        if args[:3] == ("gh", "issue", "comment"):
+            mutations.append("reservation")
+        return "2.1.276 (Claude Code)" if args[0] == "claude" else "codex-cli 0.154.0"
+
+    def github(*args: Any) -> dict[str, Any]:
+        if args[0] == "api":
+            return {
+                "workflows": [{"state": "active", "name": "CI", "path": ".github/workflows/ci.yml"}]
+            }
+        return {
+            "viewerPermission": "WRITE",
+            "squashMergeAllowed": True,
+            "mergeCommitAllowed": False,
+            "rebaseMergeAllowed": False,
+        }
+
+    monkeypatch.setattr(STEP6, "run", runner)
+    monkeypatch.setattr(STEP6, "gh", github)
+    monkeypatch.setattr(STEP6, "green", lambda _: True)
+    monkeypatch.setattr(STEP6, "claude_authenticated", lambda: True)
+    monkeypatch.setattr(
+        STEP6.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 1, stdout="{}"),
+    )
+    STEP6.prepare(directory, seed=True)
+    manifest = STEP6.load_manifest(directory)
+    assert manifest["run_id"] == checkpoint["run_id"]
+    assert (directory / "token").read_text() == "unchanged-private-token"
+    assert manifest["workspaces"]["bob"]["workspace_id"] == "bob-unchanged"
+    assert mutations == ["issue", "reservation"]
+    assert json.loads((directory / "setup.json").read_text())["phase"] == "issue_creating"
+
+
 def test_collect_success_correlates_fake_github_and_transcripts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proof: tuple[Any, ...]
 ) -> None:
     manifest, snapshot, facts, traces = copy.deepcopy(proof)
-    directory = tmp_path / "run"
+    directory = tmp_path / "persistent run"
     directory.mkdir()
     manifest["run_dir"] = str(directory)
+    manifest["alice_session_id"] = "test-session"
+    manifest["claude_config_dir"] = str(tmp_path / "claude-config")
     manifest["workspaces"]["driver"] = {"path": str(directory / "driver")}
     manifest["disturbances"]["base"]["pr"] = {"number": 11}
     STEP6.save(directory / "run.json", manifest)
@@ -852,6 +984,10 @@ def test_collect_success_correlates_fake_github_and_transcripts(
             (directory / f"{name}.telemetry.jsonl").write_text(
                 "\n".join(json.dumps(row) for row in facts["telemetry"][name])
             )
+    project = re.sub(r"[^A-Za-z0-9]", "-", str(directory / "alice-runtime"))
+    source = Path(manifest["claude_config_dir"]) / "projects" / project / "test-session.jsonl"
+    source.parent.mkdir(parents=True)
+    (directory / "alice.transcript.jsonl").rename(source)
     STEP6.collect(directory)
     evidence = json.loads((directory / "evidence.json").read_text())
     assert evidence["passed"], evidence["failed_checks"]

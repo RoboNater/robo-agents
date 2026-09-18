@@ -46,7 +46,7 @@ gh workflow list --repo RoboNater/robo-agents-sandbox
 scripts/prepare-step6-demo.sh /absolute/persistent/step6-attempt --seed
 ```
 
-Preparation refuses an existing run directory, creates independent full clones
+Preparation refuses a measured run directory, creates independent full clones
 and owner-only identity files, checks cross-clone uncommitted isolation, renders
 trusted prompts, then creates a fresh issue last. It records the issue atomically
 and adds an identified reservation comment to coordination roadmap #2 without
@@ -133,7 +133,8 @@ python3 scripts/step6.py export /absolute/persistent/step6-attempt --destination
 ```
 
 Review the five JSON artifacts before committing and add the concise narrative.
-Before issue creation, `setup.json` checkpoints allow retries in place with the
+Before issue creation, `setup.json` checkpoints in `preparing` or a seeded
+`ready` phase allow retries in place with the
 same run ID, token and clone identities. A ready/measured directory is never
 reused. If issue creation has started but its response is ambiguous, preserve
 that namespace and reconcile GitHub rather than blindly creating another issue.
@@ -147,3 +148,11 @@ transcript collection. Worker restarts retain clone IDs but get fresh process
 instance IDs; a still-live old instance is intentionally rejected until its
 loss is observed and Alice reconciles the assignment. Do not delete rows or
 reset a clone to force recovery. Crash scenarios remain Step 8 work.
+
+Gate proof binds the invocation and returned report to the same work PR.
+Worker-action auditing tokenizes visible shell commands, including global Git
+options, shell wrappers, and relative paths after `cd`. It cannot establish
+arbitrary program behavior or an OS filesystem boundary. GitHub's timestamps
+represent one-second intervals; subsecond hub events are compared for compatible
+ordering rather than invented timestamp precision. Extra merge options such as
+`--admin` and `--auto` fail verification.
