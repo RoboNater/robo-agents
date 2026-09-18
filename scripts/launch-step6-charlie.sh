@@ -14,5 +14,5 @@ PY
 )
 export HUB_WORKSPACE=${settings[0]}
 export CODEX_HOME="$run_dir/codex-home"
-exec codex exec --ephemeral -C "$HUB_WORKSPACE" --approve-for-me \
+exec codex exec --ephemeral -C "$HUB_WORKSPACE" --add-dir "$HUB_WORKSPACE/.git" --approve-for-me \
   --model "${settings[1]}" --json - < "$run_dir/charlie.prompt.md"

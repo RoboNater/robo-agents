@@ -112,6 +112,9 @@ Step 6 launchers render private run-local configurations and expose all six
 worker tools. Bob uses the existing transport-only supervisor with the worker
 prompt and repository tools. Its continuation prompt remains fixed and owns
 no workflow decisions. Charlie uses `--approve-for-me`, which selects
-workspace-write in Codex 0.154.0, with a run-local `CODEX_HOME` and authentication
+workspace-write in Codex 0.154.0, plus `--add-dir <charlie-clone>/.git` so fetch
+and checkout can update only his own Git metadata. His launch prompt requires
+the trusted review-check helper to run tests and audit the actual assigned head
+in that persisted clone. Charlie uses a run-local `CODEX_HOME` and authentication
 symlink; global configuration is never edited. See
 [`docs/step6-acceptance.md`](../docs/step6-acceptance.md).

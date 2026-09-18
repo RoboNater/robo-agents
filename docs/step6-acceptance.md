@@ -32,7 +32,10 @@ in the manifest and generated configurations. Verify the configured models with
 harmless CLI calls before seeding. `--approve-for-me` already selects
 workspace-write in Codex 0.154.0 and cannot be combined with `--sandbox`.
 Its run-local config allows network access for GitHub and hub HTTP; the six
-worker MCP tools are approved individually. Bob's supervisor supplies a fixed
+worker MCP tools are approved individually. Charlie also receives the narrow
+`--add-dir <own-clone>/.git` writable grant: Codex otherwise protects Git metadata
+even under workspace-write. A disposable real-Codex fetch/checkout preflight
+verified this grant without a sandbox bypass. Bob's supervisor supplies a fixed
 continuation prompt and makes no workflow decisions.
 
 ```sh
@@ -158,3 +161,14 @@ arbitrary program behavior or an OS filesystem boundary. GitHub's timestamps
 represent one-second intervals; subsecond hub events are compared for compatible
 ordering rather than invented timestamp precision. Extra merge options such as
 `--admin` and `--auto` fail verification.
+
+For every REVIEW or RE-REVIEW, Charlie's trusted launch prompt requires fetching
+and checking out the assigned head in his own full clone, then running
+`scripts/step6-review-check.py <absolute-charlie-clone> <assigned-full-sha> <run-id>`
+through its absolute coordination-checkout path. The helper runs the standard
+unittest command in that clone and records its actual identity, before/after
+HEAD, test return code, clean state, source commit, and UTC interval under
+`.git/step6-review-audit.jsonl`. The verifier correlates each record with the
+successful executed Codex command result and the exact review task interval.
+An API archive or temporary test snapshot cannot substitute for this proof.
+If the helper fails, Charlie must ask Alice rather than invent a workaround.

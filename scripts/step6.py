@@ -260,6 +260,7 @@ def prepare(directory, local_repository=None, seed=False):
             (ROOT / "scenarios/step6-localhost-untrusted.json").read_bytes()
         ).hexdigest(),
         "coordination_head": run("git", "rev-parse", "HEAD", cwd=ROOT),
+        "review_check_script": str(ROOT / "scripts/step6-review-check.py"),
         "implementation_branch": f"step6-{run_id}/implement",
         "base_branch": f"step6-{run_id}/base",
         "canary": "STEP6-INJECT-" + run_id,
@@ -437,7 +438,34 @@ def render(directory, manifest, scenario):
         stream.write("\n.claude/\n")
     worker = (ROOT / "prompts/worker.md").read_text()
     for name in ("bob", "charlie"):
-        (directory / f"{name}.prompt.md").write_text(worker.replace("$AGENT_NAME", name))
+        instruction = worker.replace("$AGENT_NAME", name)
+        if name == "charlie":
+            audit_command = shlex.join(
+                [
+                    "python3",
+                    str(ROOT / "scripts/step6-review-check.py"),
+                    str(directory / "charlie"),
+                    "ASSIGNED_FULL_SHA",
+                    manifest["run_id"],
+                ]
+            )
+            instruction += f"""
+
+Trusted Step 6 review evidence capture:
+Your own clone's Git metadata is explicitly writable. For EVERY reviewer task,
+fetch and check out the assigned exact SHA in {directory / "charlie"}.
+Do not substitute an archive, temporary snapshot, or another checkout.
+After checkout, execute the trusted audit helper:
+{audit_command}
+Replace ASSIGNED_FULL_SHA with the task's assigned full commit SHA.
+Execute this as its own command in exactly this form, with no shell suffix.
+It checks the persisted identity and actual HEAD, runs
+python3 -m unittest discover -s tests -v in that exact clone, and retains its
+audit in .git/step6-review-audit.jsonl. Use its actual tests in your review,
+then independently run any focused assertions needed for the finding.
+If fetch, checkout, or this audit fails, ask Alice; do not invent a workaround.
+"""
+        (directory / f"{name}.prompt.md").write_text(instruction)
     issue = manifest.get("issue", {"url": "LOCAL-VALIDATION-NO-ISSUE", "number": 0})
     prompt = (ROOT / "prompts/alice.md").read_text()
     begin = prompt.index("Goal:")
@@ -478,6 +506,9 @@ step6:gate:base, then route REBASE only from its actual stale-base result.
 After a conflict-free RebaseResult, require green exact-head CI and call check_merge_gate
 immediately before merge. Log its JSON with key step6:gate:final. Merge yourself with
 --squash --delete-branch --match-head-commit <approved rebased head>.
+Use exactly this standalone command form, with no shell suffix:
+gh pr merge <work_pr_url> --squash --delete-branch --match-head-commit <rebased_sha>
+Substitute the canonical work PR URL and approved rebased SHA from verified facts.
 Log key step6:merge-command with rationale containing the exact command and approved SHA
 before executing it, then verify GitHub merge facts. Log key step6:wrap-up at WRAP-UP start.
 Assign Bob CLOSE-OUT even with no roadmap target: verify issue closure and respond on PR;
@@ -766,7 +797,22 @@ def tool_calls(lines):
                         call["merge_result"] = json.dumps(block.get("content", ""))
         codex = item.get("item", {})
         if codex.get("type") == "command_execution":
-            calls.append({"name": "Bash", "input": {"command": codex.get("command", "")}})
+            call = {
+                "name": "Bash",
+                "input": {"command": codex.get("command", "")},
+                "status": codex.get("status"),
+                "exit_code": codex.get("exit_code"),
+            }
+            if "step6-review-check.py" in codex.get("command", ""):
+                for output in reversed(codex.get("aggregated_output", "").splitlines()):
+                    try:
+                        report = json.loads(output)
+                    except ValueError:
+                        continue
+                    if isinstance(report, dict) and report.get("review_check") == "step6":
+                        call["review_check"] = report
+                        break
+            calls.append(call)
         if codex.get("type") == "mcp_tool_call":
             calls.append(
                 {
@@ -775,6 +821,26 @@ def tool_calls(lines):
                 }
             )
     return calls
+
+
+def review_command_matches(command, manifest, record):
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if (
+        len(words) == 3
+        and Path(words[0]).name in ("bash", "sh", "zsh")
+        and words[1] in ("-c", "-lc")
+    ):
+        return review_command_matches(words[2], manifest, record)
+    return words == [
+        "python3",
+        manifest.get("review_check_script"),
+        manifest["workspaces"]["charlie"]["path"],
+        record.get("expected_head"),
+        manifest["run_id"],
+    ]
 
 
 def recorded_shell_actions(command, workspace, other_workspace):
@@ -1216,6 +1282,36 @@ def evaluate(manifest, snapshot, facts, traces):
 
     for task, result in chain:
         if task["role"] == "reviewer":
+            require(
+                "review_in_own_clone_" + task["id"],
+                any(
+                    record.get("run_id") == manifest["run_id"]
+                    and record.get("source_head") == manifest.get("coordination_head")
+                    and record.get("workspace_path") == manifest["workspaces"]["charlie"]["path"]
+                    and record.get("workspace_id")
+                    == manifest["workspaces"]["charlie"]["workspace_id"]
+                    and record.get("expected_head") == result.get("reviewed_head_sha")
+                    and record.get("head_before") == result.get("reviewed_head_sha")
+                    and record.get("head_after") == result.get("reviewed_head_sha")
+                    and record.get("returncode") == 0
+                    and record.get("clean_after") is True
+                    and record.get("command") == "python3 -m unittest discover -s tests -v"
+                    and task["created"]
+                    <= record.get("started_at", "")
+                    <= record.get("completed_at", "")
+                    <= task["updated"]
+                    and any(
+                        call.get("review_check") == record
+                        and call.get("status") == "completed"
+                        and call.get("exit_code") == 0
+                        and review_command_matches(
+                            call["input"].get("command", ""), manifest, record
+                        )
+                        for call in traces.get("charlie", [])
+                    )
+                    for record in facts.get("review_runs", [])
+                ),
+            )
             comment = comments.get(result.get("review_url"), {})
             require(
                 "review_comment_" + task["id"],
@@ -1371,6 +1467,14 @@ def collect(directory):
             "api", "--paginate", "--slurp", f"repos/{SANDBOX}/issues/{work['number']}/comments"
         ),
         "telemetry": {},
+        "review_runs": [
+            json.loads(line)
+            for line in (
+                Path(manifest["workspaces"]["charlie"]["path"]) / ".git/step6-review-audit.jsonl"
+            )
+            .read_text()
+            .splitlines()
+        ],
         "follow_ups": {},
     }
     facts["comments"] = [comment for page in facts["comments"] for comment in page]

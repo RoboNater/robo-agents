@@ -30,6 +30,8 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
     policy = json.loads((ROOT / "scenarios/step6-localhost-untrusted.json").read_text())["policy"]
     manifest: dict[str, Any] = {
         "run_id": "test",
+        "coordination_head": "2" * 40,
+        "review_check_script": str(ROOT / "scripts/step6-review-check.py"),
         "issue": {"number": 9},
         "work_pr": {"url": url, "number": 10},
         "repository": STEP6.SANDBOX,
@@ -220,7 +222,7 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
             }
         ],
     }
-    facts = {
+    facts: dict[str, Any] = {
         "work_pr": {
             "number": 10,
             "state": "MERGED",
@@ -273,6 +275,42 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
             if task["role"] == "reviewer"
         ],
     }
+    facts["review_runs"] = []
+    for review_task in (row for row in tasks if row["role"] == "reviewer"):
+        record = {
+            "review_check": "step6",
+            "run_id": manifest["run_id"],
+            "source_head": manifest["coordination_head"],
+            "workspace_path": manifest["workspaces"]["charlie"]["path"],
+            "workspace_id": manifest["workspaces"]["charlie"]["workspace_id"],
+            "expected_head": review_task["pr_head_sha"],
+            "head_before": review_task["pr_head_sha"],
+            "head_after": review_task["pr_head_sha"],
+            "clean_after": True,
+            "returncode": 0,
+            "command": "python3 -m unittest discover -s tests -v",
+            "started_at": review_task["created"],
+            "completed_at": review_task["updated"],
+        }
+        facts["review_runs"].append(record)
+        helper_command = STEP6.shlex.join(
+            [
+                "python3",
+                manifest["review_check_script"],
+                "/runs/charlie",
+                review_task["pr_head_sha"],
+                "test",
+            ]
+        )
+        traces["charlie"].append(
+            {
+                "name": "Bash",
+                "input": {"command": "/bin/bash -lc " + STEP6.shlex.quote(helper_command)},
+                "review_check": record,
+                "status": "completed",
+                "exit_code": 0,
+            }
+        )
     return manifest, snapshot, facts, traces
 
 
@@ -463,6 +501,9 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
             assert record["cwd"] == str(directory / expected)
         if name == "charlie":
             assert record["args"][record["args"].index("-C") + 1] == str(directory / "charlie")
+            assert record["args"][record["args"].index("--add-dir") + 1] == str(
+                directory / "charlie/.git"
+            )
             assert "--ephemeral" in record["args"] and "--approve-for-me" in record["args"]
     # Resume the exact recorded Alice session without touching user configuration.
     config_root = tmp_path / "fake-claude-config"
@@ -911,6 +952,23 @@ def test_collect_success_correlates_fake_github_and_transcripts(
     manifest["alice_session_id"] = "test-session"
     manifest["claude_config_dir"] = str(tmp_path / "claude-config")
     manifest["workspaces"]["driver"] = {"path": str(directory / "driver")}
+    manifest["workspaces"]["charlie"]["path"] = str(directory / "charlie")
+    for record in facts["review_runs"]:
+        record["workspace_path"] = str(directory / "charlie")
+    for call in traces["charlie"]:
+        if "review_check" in call:
+            call["input"]["command"] = STEP6.shlex.join(
+                [
+                    "python3",
+                    manifest["review_check_script"],
+                    str(directory / "charlie"),
+                    call["review_check"]["expected_head"],
+                    manifest["run_id"],
+                ]
+            )
+    review_audit = directory / "charlie/.git/step6-review-audit.jsonl"
+    review_audit.parent.mkdir(parents=True)
+    review_audit.write_text("\n".join(json.dumps(record) for record in facts["review_runs"]))
     manifest["disturbances"]["base"]["pr"] = {"number": 11}
     STEP6.save(directory / "run.json", manifest)
     facts["work_pr"]["mergeCommit"] = {"oid": "2" * 40}
@@ -942,6 +1000,20 @@ def test_collect_success_correlates_fake_github_and_transcripts(
     for name in ("alice", "bob", "charlie"):
         lines = []
         for index, call in enumerate(traces[name]):
+            if "review_check" in call:
+                lines.append(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": call["input"]["command"],
+                            "status": call["status"],
+                            "exit_code": call["exit_code"],
+                            "aggregated_output": json.dumps(call["review_check"]),
+                        },
+                    }
+                )
+                continue
             lines.append(
                 {
                     "timestamp": call.get("timestamp", stamp(1)),
@@ -1020,6 +1092,114 @@ def test_collect_success_correlates_fake_github_and_transcripts(
     with pytest.raises(ValueError, match="credential detected"):
         STEP6.export_evidence(directory, tmp_path / "rejected-exports")
     assert not (tmp_path / "rejected-exports").exists()
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing",
+        "head",
+        "workspace",
+        "identity",
+        "time",
+        "failure",
+        "no_tool_result",
+        "fake_invocation",
+        "bad_source",
+    ],
+)
+def test_review_snapshot_outside_persisted_clone_fails_proof(
+    proof: tuple[Any, ...], defect: str
+) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    record = facts["review_runs"][0]
+    if defect == "missing":
+        facts["review_runs"] = []
+    elif defect == "head":
+        record["head_before"] = "0" * 40
+    elif defect == "workspace":
+        record["workspace_path"] = "/tmp/archive-snapshot"
+    elif defect == "identity":
+        record["workspace_id"] = "another-clone"
+    elif defect == "time":
+        record["started_at"] = stamp(0)
+    elif defect == "failure":
+        record["returncode"] = 1
+    elif defect == "bad_source":
+        record["source_head"] = "0" * 40
+    elif defect == "fake_invocation":
+        next(call for call in traces["charlie"] if "review_check" in call)["input"]["command"] = (
+            "echo step6-review-check.py"
+        )
+    else:
+        traces["charlie"] = [call for call in traces["charlie"] if "review_check" not in call]
+    evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
+    assert "review_in_own_clone_1" in evidence["failed_checks"]
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_review_check_entry_point_records_real_clone_test_execution(
+    tmp_path: Path, failing: bool
+) -> None:
+    origin = tmp_path / "origin"
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(origin)], check=True, capture_output=True
+    )
+    (origin / "tests").mkdir()
+    (origin / ".gitignore").write_text("__pycache__/\n")
+    (origin / "tests/test_fixture.py").write_text(
+        "import unittest\nclass Fixture(unittest.TestCase):\n"
+        f" def test_fixture(self): self.assertEqual(2 + 2, {3 if failing else 4})\n"
+    )
+    subprocess.run(
+        ["git", "-C", str(origin), "add", "tests", ".gitignore"], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(origin),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    workspace = tmp_path / "charlie clone"
+    subprocess.run(
+        [str(ROOT / "scripts/bootstrap-workspace.sh"), "charlie", str(workspace), str(origin)],
+        check=True,
+        capture_output=True,
+    )
+    head = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    command = [
+        "python3",
+        str(ROOT / "scripts/step6-review-check.py"),
+        str(workspace),
+        head,
+        "test-run",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    audit = workspace / ".git/step6-review-audit.jsonl"
+    record = json.loads(audit.read_text())
+    assert json.loads(result.stdout.splitlines()[-1]) == record
+    assert record["head_before"] == record["head_after"] == head
+    assert record["workspace_path"] == str(workspace)
+    assert result.returncode == record["returncode"] == (1 if failing else 0)
+    assert record["clean_after"]
+    assert audit.stat().st_mode & 0o077 == 0
+    assert subprocess.run(command[:3] + ["0" * 40, "test-run"], capture_output=True).returncode != 0
+    assert len(audit.read_text().splitlines()) == 1
+    (workspace / "dirty-marker").write_text("preserve")
+    assert subprocess.run(command, capture_output=True).returncode != 0
+    assert (workspace / "dirty-marker").read_text() == "preserve"
 
 
 def test_driver_pushes_new_branches_from_detached_head_with_real_git(
