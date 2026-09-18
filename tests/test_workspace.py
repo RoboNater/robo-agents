@@ -150,3 +150,32 @@ async def test_workspace_wire_conflict_and_replay(
     )
     assert conflict.status_code == 409
     assert "workspace " + "a" * 64 in conflict.json()["error"]["message"]
+
+
+def test_busy_workspace_is_occupied(store: HubStore) -> None:
+    profile = AgentProfile(workspace_id="b" * 64)
+    store.check_in("bob", profile, worker_instance_id="first")
+    store.assign_task("bob", "implementer", "work", "independent edits")
+    with pytest.raises(DuplicateAgentError, match="workspace"):
+        store.check_in("charlie", profile, worker_instance_id="second")
+
+
+async def test_worker_reports_persisted_identity(
+    client: httpx.AsyncClient, hub_store: HubStore, repository: Path, tmp_path: Path
+) -> None:
+    from worker_mcp.client import WorkerHubClient
+
+    destination = tmp_path / "bob"
+    persisted = bootstrap(repository, destination)
+    settings = WorkerSettings.from_env(
+        {
+            "HUB_URL": "http://hub.test",
+            "HUB_TOKEN": "test-token",
+            "AGENT_NAME": "bob",
+            "HUB_WORKSPACE": str(destination),
+        }
+    )
+    worker = WorkerHubClient(settings, http_client=client)
+    await worker.check_in()
+    registered = hub_store.agent_by_name("bob")
+    assert registered is not None and registered.workspace_id == persisted["workspace_id"]
