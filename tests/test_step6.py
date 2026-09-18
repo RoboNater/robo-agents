@@ -414,7 +414,36 @@ def test_verifier_rejects_missing_or_wrong_evidence(proof: tuple[Any, ...], defe
     assert not evidence["passed"]
 
 
-def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
+@pytest.fixture
+def fake_step6_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep local preparation and launch tests independent of paid CLI installs."""
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    for name, version in (
+        ("claude", "2.1.277 (Claude Code)"),
+        ("codex", "codex-cli 0.154.0"),
+        ("gh", "gh version 2.96.0"),
+    ):
+        script = directory / name
+        script.write_text(
+            "#!/usr/bin/env python3\nimport os, sys, json\n"
+            "if sys.argv[1:] == ['--version']:\n"
+            f"    print({version!r})\n"
+            f"elif {name!r} == 'gh':\n"
+            "    raise SystemExit(1)\n"
+            "else:\n"
+            '    print(json.dumps({"cwd": os.getcwd(), "args": sys.argv[1:], '
+            '"config_dir": os.environ.get("CLAUDE_CONFIG_DIR")}))\n'
+        )
+        script.chmod(0o755)
+    curl = directory / "curl"
+    curl.write_text("#!/usr/bin/env bash\nexit 1\n")
+    curl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory) + os.pathsep + os.environ["PATH"])
+    return directory
+
+
+def test_local_prepare_and_all_launchers(tmp_path: Path, fake_step6_cli: Path) -> None:
     origin = tmp_path / "origin"
     subprocess.run(
         ["git", "init", "--initial-branch=main", str(origin)], check=True, capture_output=True
@@ -452,6 +481,8 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
     token = (directory / "token").read_text().strip()
     assert token not in (directory / "run.json").read_text()
     assert not manifest.get("issue")
+    assert manifest["versions"]["claude"] == "2.1.277 (Claude Code)"
+    assert manifest["versions"]["codex"] == "codex-cli 0.154.0"
     assert (
         manifest["workspaces"]["bob"]["workspace_id"]
         != manifest["workspaces"]["charlie"]["workspace_id"]
@@ -467,21 +498,8 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
     assert "<account>" not in (directory / "alice.prompt.md").read_text()
     manifest["issue"] = {"number": 9, "url": "https://github.com/" + STEP6.SANDBOX + "/issues/9"}
     STEP6.save(directory / "run.json", manifest)
-    fake = tmp_path / "bin"
-    fake.mkdir()
-    # These commands execute the real launcher paths without starting paid runtimes.
-    for name in ("claude", "codex"):
-        script = fake / name
-        script.write_text(
-            "#!/usr/bin/env python3\nimport os, sys, json\n"
-            'print(json.dumps({"cwd": os.getcwd(), "args": sys.argv[1:], '
-            '"config_dir": os.environ.get("CLAUDE_CONFIG_DIR")}))\n'
-        )
-        script.chmod(0o755)
-    curl = fake / "curl"
-    curl.write_text("#!/usr/bin/env bash\nexit 1\n")
-    curl.chmod(0o755)
-    env = os.environ | {"PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+    # Execute real launcher paths with the same fake CLIs used during preparation.
+    env = os.environ.copy()
     for name in ("alice", "bob", "charlie"):
         output = subprocess.run(
             [str(ROOT / f"scripts/launch-step6-{name}.sh"), str(directory)],
@@ -832,7 +850,7 @@ def test_unresolved_fixture_placeholders_fail_before_seeding() -> None:
 
 
 def test_setup_failure_retries_in_place_with_same_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_step6_cli: Path
 ) -> None:
     origin = tmp_path / "origin"
     subprocess.run(
