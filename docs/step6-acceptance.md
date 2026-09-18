@@ -122,3 +122,28 @@ are separate authorized actions: mark Step 6 complete only after the coordinatio
 PR merges, citing its SHA and sandbox evidence; leave Steps 7/8 and the branch
 protection choice open. Stop the hub listener and CLI children belonging to this
 run, leaving other checkout listeners and all workspaces intact.
+
+The checked-in export command validates the successful verifier output, excludes
+raw messages/configurations, replaces the private run root with `/RUN`, checks
+all artifacts for the bearer token and recognized credential formats, and refuses
+to overwrite an earlier export:
+
+```sh
+python3 scripts/step6.py export /absolute/persistent/step6-attempt --destination docs/evidence
+```
+
+Review the five JSON artifacts before committing and add the concise narrative.
+Before issue creation, `setup.json` checkpoints allow retries in place with the
+same run ID, token and clone identities. A ready/measured directory is never
+reused. If issue creation has started but its response is ambiguous, preserve
+that namespace and reconcile GitHub rather than blindly creating another issue.
+
+For an Alice restart, stop only this run's orphaned listener if it remains,
+then invoke the same Alice launcher. It detects the recorded session JSONL and
+uses `--resume` instead of attempting to recreate that session ID. The durable
+hub goal/policy and completed tasks remain authoritative. A custom
+`CLAUDE_CONFIG_DIR` is recorded at preparation and used for Alice's launcher and
+transcript collection. Worker restarts retain clone IDs but get fresh process
+instance IDs; a still-live old instance is intentionally rejected until its
+loss is observed and Alice reconciles the assignment. Do not delete rows or
+reset a clone to force recovery. Crash scenarios remain Step 8 work.

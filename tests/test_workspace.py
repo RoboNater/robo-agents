@@ -96,6 +96,9 @@ def test_workspace_configuration(repository: Path, tmp_path: Path) -> None:
     (bob / ".git" / IDENTITY_FILE).write_text('{"workspace_id":"bad"}')
     with pytest.raises(ConfigurationError, match="64 lowercase"):
         WorkerSettings.from_env(env)
+    (bob / ".git" / IDENTITY_FILE).write_text(json.dumps({"workspace_id": int("1" * 64)}))
+    with pytest.raises(ConfigurationError, match="64 lowercase"):
+        WorkerSettings.from_env(env)
     (bob / ".git" / IDENTITY_FILE).unlink()
     with pytest.raises(ConfigurationError, match="bootstrap-workspace"):
         WorkerSettings.from_env(env)

@@ -51,8 +51,10 @@ def read_identity(workspace: Path, agent: str) -> dict[str, Any]:
         if os.name != "nt" and identity_path.stat().st_mode & 0o077:
             raise ValueError("identity file must have owner-only permissions (0600)")
         value = json.loads(identity_path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or not re.fullmatch(
-            r"[0-9a-f]{64}", str(value.get("workspace_id", ""))
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("workspace_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["workspace_id"])
         ):
             raise ValueError("workspace_id must be 64 lowercase hexadecimal characters")
         if value.get("agent") != agent or value.get("path") != str(workspace):

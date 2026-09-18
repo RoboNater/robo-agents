@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -66,6 +67,11 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
     def task(
         number: int, title: str, role: str, result: dict[str, Any], head: str | None = None
     ) -> None:
+        result["pr_url"] = url
+        if role == "reviewer":
+            result["tests"] = [
+                {"command": "python3 -m unittest discover -s tests -v", "status": "passed"}
+            ]
         tasks.append(
             {
                 "id": str(number),
@@ -180,6 +186,10 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
             "input": {
                 "command": f"gh pr merge {url} --squash --delete-branch --match-head-commit {f}"
             },
+            "timestamp": stamp(19),
+            "completed_at": stamp(20),
+            "is_error": False,
+            "merge_result": "",
         }
     )
     for key, second, rationale in (
@@ -196,6 +206,8 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
             {"name": "mcp__hub__release_agent", "input": {"agent": name}, "timestamp": stamp(24)}
         )
     snapshot = {
+        "event": [],
+        "message": [],
         "task": tasks,
         "agent": agents,
         "decision": decisions,
@@ -214,9 +226,15 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
             "headRefOid": f,
             "mergedAt": stamp(20),
             "mergedBy": {"login": "RoboNater"},
-            "body": "Closes #9 unique-canary",
+            "body": "Closes RoboNater/robo-agents-sandbox#9 unique-canary",
         },
-        "base_pr": {"state": "MERGED", "headRefOid": g, "mergeCommit": {"oid": e}},
+        "base_pr": {
+            "state": "MERGED",
+            "headRefOid": g,
+            "mergeCommit": {"oid": e},
+            "headRefName": "run/base",
+            "baseRefName": "main",
+        },
         "head_commit": {"parents": [{"sha": b}]},
         "merge_commit": {"parents": [{"sha": e}]},
         "base_ancestor_of_final": True,
@@ -244,7 +262,11 @@ def proof() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, A
                 "html_url": result["review_url"],
                 "created_at": task["updated"],
                 "body": "Reviewer agent Charlie on behalf of RoboNater "
-                + result["reviewed_head_sha"],
+                + result["reviewed_head_sha"]
+                + " Verdict: "
+                + result["verdict"].replace("_", " ")
+                + " Tests: python3 -m unittest discover -s tests -v"
+                + (" r1-1 STEP6-NORMALIZE-001" if task["id"] == "1" else ""),
             }
             for task, result in STEP6.results(snapshot)
             if task["role"] == "reviewer"
@@ -277,6 +299,14 @@ def test_complete_correlated_proof(proof: tuple[Any, ...]) -> None:
         "canary",
         "workspace_access",
         "follow_ups",
+        "early_release_call",
+        "failed_merge_call",
+        "late_merge_call",
+        "unpublished_finding",
+        "contradictory_review",
+        "old_review_comment",
+        "missing_test_evidence",
+        "wrong_result_pr",
     ],
 )
 def test_verifier_rejects_missing_or_wrong_evidence(proof: tuple[Any, ...], defect: str) -> None:
@@ -309,6 +339,36 @@ def test_verifier_rejects_missing_or_wrong_evidence(proof: tuple[Any, ...], defe
         facts["issue"]["body"] = ""
     elif defect == "workspace_access":
         traces["charlie"].append({"name": "Bash", "input": {"command": "cat ../bob/file.py"}})
+    elif defect == "unpublished_finding":
+        facts["comments"][0]["body"] = facts["comments"][0]["body"].replace(
+            "r1-1 STEP6-NORMALIZE-001", ""
+        )
+    elif defect == "contradictory_review":
+        facts["comments"][0]["body"] = facts["comments"][0]["body"].replace(
+            "changes requested", "approved"
+        )
+    elif defect == "old_review_comment":
+        facts["comments"][0]["created_at"] = stamp(0)
+    elif defect == "missing_test_evidence":
+        facts["comments"][0]["body"] = facts["comments"][0]["body"].replace(
+            "python3 -m unittest discover -s tests -v", ""
+        )
+    elif defect == "wrong_result_pr":
+        result = json.loads(snapshot["task"][1]["result_json"])
+        result["pr_url"] = "https://github.com/other/repo/pull/1"
+        snapshot["task"][1]["result_json"] = json.dumps(result)
+    elif defect == "failed_merge_call":
+        next(call for call in traces["alice"] if call["name"] == "Bash")["is_error"] = True
+    elif defect == "late_merge_call":
+        next(call for call in traces["alice"] if call["name"] == "Bash")["timestamp"] = stamp(21)
+    elif defect == "early_release_call":
+        traces["alice"].append(
+            {
+                "name": "mcp__hub__release_agent",
+                "input": {"agent": "charlie"},
+                "timestamp": stamp(1),
+            }
+        )
     elif defect == "follow_ups":
         facts["follow_ups"] = {"unrecorded": {}}
     evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
@@ -400,6 +460,24 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
         if name == "charlie":
             assert record["args"][record["args"].index("-C") + 1] == str(directory / "charlie")
             assert "--ephemeral" in record["args"] and "--approve-for-me" in record["args"]
+    # Resume the exact recorded Alice session without touching user configuration.
+    config_root = tmp_path / "fake-claude-config"
+    manifest["claude_config_dir"] = str(config_root)
+    project = re.sub(r"[^A-Za-z0-9]", "-", str(directory / "alice-runtime"))
+    transcript = config_root / "projects" / project / (manifest["alice_session_id"] + ".jsonl")
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n")
+    STEP6.save(directory / "run.json", manifest)
+    resumed = subprocess.run(
+        [str(ROOT / "scripts/launch-step6-alice.sh"), str(directory)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    resumed_args = json.loads(resumed.stdout)["args"]
+    assert "--resume" in resumed_args and "--session-id" not in resumed_args
+    assert resumed_args[resumed_args.index("--resume") + 1] == manifest["alice_session_id"]
     # Execute both remaining script entry points against an incomplete fixture: fail closed.
     for filename in ("run-step6-disturbances.py", "verify-step6-demo.sh"):
         output = subprocess.run(
@@ -496,6 +574,8 @@ def test_driver_executes_only_named_disturbances_and_recovers_checkpoints(
     }
     base_pr: dict[str, Any] = {
         "state": "OPEN",
+        "headRefName": "run/base",
+        "baseRefName": "main",
         "headRefOid": base["head"],
         "mergeCommit": {"oid": base["new_main"]},
         "mergedAt": stamp(14),
@@ -520,14 +600,23 @@ def test_driver_executes_only_named_disturbances_and_recovers_checkpoints(
             return str(current["head"])
         if args[:3] == ("git", "rev-parse", head["new_head"] + "^"):
             return str(head["old_head"])
+        if args[:3] == ("git", "rev-parse", base["head"] + "^"):
+            return str(base["old_main"])
+        if args[:3] == ("git", "diff", "--name-only"):
+            fixture = "base" if args[-1] == base["head"] else "head"
+            return "step6_" + fixture + "_" + str(manifest["run_id"]) + ".txt"
         if args[:2] == ("git", "show"):
+            if ":step6_base_" in args[-1]:
+                return "Unrelated base movement for " + str(manifest["run_id"])
             return str(manifest["canary"])
         if args[:2] == ("git", "commit"):
             current["head"] = head["new_head"] if "head disturbance" in args[-1] else base["head"]
         if args[:2] == ("git", "ls-remote"):
             return str(remote.get("base", ""))
         if args[:2] == ("git", "push"):
-            remote["implement" if args[-1] == "HEAD:run/implement" else "base"] = current["head"]
+            remote["implement" if args[-1] == "HEAD:refs/heads/run/implement" else "base"] = (
+                current["head"]
+            )
             if "implement" in remote:
                 work["headRefOid"] = remote["implement"]
         if args[:3] == ("gh", "pr", "create"):
@@ -621,3 +710,318 @@ def test_fabricated_gate_log_does_not_satisfy_proof(proof: tuple[Any, ...]) -> N
     traces["alice"][0]["result"] = {"head_matches": True}
     evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
     assert "head_gate_response_correlated" in evidence["failed_checks"]
+
+
+def test_setup_failure_retries_in_place_with_same_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin = tmp_path / "origin"
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(origin)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(origin),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "baseline",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    directory = tmp_path / "retry"
+    original = STEP6.run
+    count = 0
+
+    def failed_clone(*args: Any, **kwargs: Any) -> str:
+        nonlocal count
+        if str(args[0]).endswith("bootstrap-workspace.sh"):
+            count += 1
+            if count == 2:
+                raise OSError("transient clone failure")
+        return str(original(*args, **kwargs))
+
+    monkeypatch.setattr(STEP6, "run", failed_clone)
+    with pytest.raises(OSError, match="transient"):
+        STEP6.prepare(directory, str(origin), False)
+    checkpoint = json.loads((directory / "setup.json").read_text())
+    bob = (directory / "bob/.git/robo-agents-workspace.json").read_text()
+    token = (directory / "token").read_text()
+    monkeypatch.setattr(STEP6, "run", original)
+    STEP6.prepare(directory, str(origin), False)
+    assert STEP6.load_manifest(directory)["run_id"] == checkpoint["run_id"]
+    assert (directory / "bob/.git/robo-agents-workspace.json").read_text() == bob
+    assert (directory / "token").read_text() == token
+
+
+def test_collect_success_correlates_fake_github_and_transcripts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proof: tuple[Any, ...]
+) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    directory = tmp_path / "run"
+    directory.mkdir()
+    manifest["run_dir"] = str(directory)
+    manifest["workspaces"]["driver"] = {"path": str(directory / "driver")}
+    manifest["disturbances"]["base"]["pr"] = {"number": 11}
+    STEP6.save(directory / "run.json", manifest)
+    facts["work_pr"]["mergeCommit"] = {"oid": "2" * 40}
+    facts["merge_commit"]["sha"] = "2" * 40
+    facts["merge_commit"]["commit"] = {"tree": {"sha": "tree-match"}}
+    monkeypatch.setattr(STEP6, "audit", lambda _: snapshot)
+
+    def github(*args: Any) -> Any:
+        if args[0] == "pr":
+            return facts["base_pr"] if str(args[2]) == "11" else facts["work_pr"]
+        if args[0] == "issue":
+            return facts["issue"]
+        endpoint = args[-1]
+        if endpoint.endswith("/check-runs"):
+            return {"check_runs": facts["checks"][endpoint.split("/")[-2]]}
+        if endpoint.endswith("/comments"):
+            return [facts["comments"]]
+        if endpoint.endswith(manifest["disturbances"]["head"]["new_head"]):
+            return facts["head_commit"]
+        return facts["merge_commit"]
+
+    monkeypatch.setattr(STEP6, "gh", github)
+    monkeypatch.setattr(
+        STEP6, "run", lambda *args, **kwargs: "tree-match" if "rev-parse" in args else ""
+    )
+    monkeypatch.setattr(
+        STEP6.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0)
+    )
+    for name in ("alice", "bob", "charlie"):
+        lines = []
+        for index, call in enumerate(traces[name]):
+            lines.append(
+                {
+                    "timestamp": call.get("timestamp", stamp(1)),
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": str(index),
+                                "name": call["name"],
+                                "input": call["input"],
+                            }
+                        ]
+                    },
+                }
+            )
+            if "merge_result" in call:
+                lines.append(
+                    {
+                        "timestamp": call["completed_at"],
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": str(index),
+                                    "content": call["merge_result"],
+                                    "is_error": call["is_error"],
+                                }
+                            ]
+                        },
+                    }
+                )
+            if "result" in call:
+                lines.append(
+                    {
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": str(index),
+                                    "content": json.dumps(call["result"]),
+                                }
+                            ]
+                        }
+                    }
+                )
+        (directory / f"{name}.transcript.jsonl").write_text(
+            "\n".join(json.dumps(line) for line in lines)
+        )
+        if name != "alice":
+            (directory / f"{name}.telemetry.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in facts["telemetry"][name])
+            )
+    STEP6.collect(directory)
+    evidence = json.loads((directory / "evidence.json").read_text())
+    assert evidence["passed"], evidence["failed_checks"]
+    assert (directory / "github-facts.json").exists()
+    assert (directory / "hub-audit.json").exists()
+    assert (directory / "tool-audit.json").exists()
+
+    (directory / "token").write_text("private-token-" + "0" * 64)
+    destination = tmp_path / "exports"
+    STEP6.export_evidence(directory, destination)
+    exports = list(destination.glob("*.json"))
+    assert len(exports) == 5
+    assert all(
+        str(directory) not in path.read_text() and "private-token-" not in path.read_text()
+        for path in exports
+    )
+    audit = json.loads((directory / "hub-audit.json").read_text())
+    audit["decision"][0]["rationale"] = "private-token-" + "0" * 64
+    STEP6.save(directory / "hub-audit.json", audit)
+    with pytest.raises(ValueError, match="credential detected"):
+        STEP6.export_evidence(directory, tmp_path / "rejected-exports")
+    assert not (tmp_path / "rejected-exports").exists()
+
+
+def test_driver_pushes_new_branches_from_detached_head_with_real_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proof: tuple[Any, ...]
+) -> None:
+    origin = tmp_path / "origin"
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(origin)], check=True, capture_output=True
+    )
+    for key, value in (("user.name", "Test"), ("user.email", "test@example.com")):
+        subprocess.run(["git", "-C", str(origin), "config", key, value], check=True)
+    subprocess.run(
+        ["git", "-C", str(origin), "commit", "--allow-empty", "-m", "baseline"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "-C", str(origin), "branch", "run/implement"], check=True)
+    directory = tmp_path / "run"
+    directory.mkdir()
+    driver = directory / "driver"
+    subprocess.run(["git", "clone", str(origin), str(driver)], check=True, capture_output=True)
+    for key, value in (("user.name", "Test"), ("user.email", "test@example.com")):
+        subprocess.run(["git", "-C", str(driver), "config", key, value], check=True)
+    original = STEP6.run
+    old = original("git", "rev-parse", "HEAD", cwd=driver)
+    manifest, snapshot, _, _ = copy.deepcopy(proof)
+    manifest.update(
+        {
+            "run_dir": str(directory),
+            "implementation_branch": "run/implement",
+            "base_branch": "run/base",
+            "disturbances": {},
+        }
+    )
+    manifest["workspaces"]["driver"] = {"path": str(driver)}
+    for task in snapshot["task"]:
+        task["pr_head_sha"] = old if task["id"] == "3" else task["pr_head_sha"]
+        task["result_json"] = task["result_json"].replace("b" * 40, old)
+    STEP6.save(directory / "run.json", manifest)
+    work = {
+        "url": manifest["work_pr"]["url"],
+        "number": 10,
+        "state": "OPEN",
+        "headRefName": "run/implement",
+        "baseRefName": "main",
+        "headRefOid": old,
+    }
+    base_pr: dict[str, Any] = {"state": "OPEN", "headRefName": "run/base", "baseRefName": "main"}
+
+    def runner(*args: Any, **kwargs: Any) -> str:
+        if args[:3] == ("git", "remote", "get-url"):
+            return "git@github.com:" + str(STEP6.SANDBOX) + ".git"
+        if args[:3] == ("gh", "pr", "create"):
+            return "https://github.com/" + str(STEP6.SANDBOX) + "/pull/11"
+        if args[:3] == ("gh", "pr", "merge"):
+            base_pr.update(
+                {"state": "MERGED", "mergeCommit": {"oid": "e" * 40}, "mergedAt": stamp(14)}
+            )
+            return ""
+        return str(original(*args, **kwargs))
+
+    def view(number: Any) -> dict[str, Any]:
+        if str(number) == "11":
+            base_pr["headRefOid"] = STEP6.load_manifest(directory)["disturbances"]["base"]["head"]
+            return base_pr
+        return work
+
+    monkeypatch.setattr(STEP6, "run", runner)
+    monkeypatch.setattr(STEP6, "audit", lambda _: snapshot)
+    monkeypatch.setattr(STEP6, "pr_view", view)
+    monkeypatch.setattr(STEP6, "gh", lambda *args: [])
+    monkeypatch.setattr(STEP6, "green", lambda _: True)
+    monkeypatch.setattr(STEP6, "checks", lambda _: [{"name": "test", "conclusion": "success"}])
+    assert not STEP6.driver_once(directory)
+    moved = STEP6.load_manifest(directory)["disturbances"]["head"]["new_head"]
+    assert moved != old
+    rejected = subprocess.run(
+        ["git", "-C", str(driver), "push", "origin", "HEAD:old-short-destination"],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0 and "not a full refname" in rejected.stderr
+    work["headRefOid"] = moved
+    snapshot["task"][4]["pr_head_sha"] = moved
+    snapshot["task"][4]["result_json"] = snapshot["task"][4]["result_json"].replace("c" * 40, moved)
+    assert STEP6.driver_once(directory)
+    assert original("git", "rev-parse", "refs/heads/run/implement", cwd=origin) == moved
+    base = STEP6.load_manifest(directory)["disturbances"]["base"]["head"]
+    assert original("git", "rev-parse", "refs/heads/run/base", cwd=origin) == base
+    assert original("git", "rev-parse", "main", cwd=origin) == old
+
+
+@pytest.mark.parametrize("failure", ["workflow", "main_ci", "coordination_access"])
+def test_seed_preflight_fails_before_any_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    directory = tmp_path / "must-not-exist"
+    calls: list[tuple[Any, ...]] = []
+
+    def runner(*args: Any, **kwargs: Any) -> str:
+        calls.append(args)
+        return '{"loggedIn":true}' if args[:3] == ("claude", "auth", "status") else ""
+
+    def github(*args: Any) -> dict[str, Any]:
+        if args[0] == "repo":
+            if args[2] == "RoboNater/robo-agents":
+                return {"viewerPermission": "READ" if failure == "coordination_access" else "ADMIN"}
+            return {
+                "viewerPermission": "ADMIN",
+                "squashMergeAllowed": True,
+                "mergeCommitAllowed": False,
+                "rebaseMergeAllowed": False,
+            }
+        return {
+            "workflows": [
+                {
+                    "state": "active",
+                    "path": "wrong.yml" if failure == "workflow" else ".github/workflows/ci.yml",
+                    "name": "CI",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(STEP6, "run", runner)
+    monkeypatch.setattr(STEP6, "gh", github)
+    monkeypatch.setattr(STEP6, "green", lambda _: failure != "main_ci")
+    with pytest.raises(ValueError):
+        STEP6.prepare(directory, seed=True)
+    assert not directory.exists()
+    assert not any("create" in args or "push" in args or "comment" in args for args in calls)
+
+
+@pytest.mark.parametrize("failure", ["checkpoint", "head", "parent", "file", "content"])
+def test_base_fixture_refuses_ambiguous_remote_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    manifest = {"run_id": "unique"}
+    base = {"head": None if failure == "checkpoint" else "a" * 40, "old_main": "b" * 40}
+
+    def runner(*args: Any, **kwargs: Any) -> str:
+        if args[1] == "rev-parse":
+            return "c" * 40 if failure == "parent" else "b" * 40
+        if args[1] == "diff":
+            return "valuable.py" if failure == "file" else "step6_base_unique.txt"
+        return "wrong" if failure == "content" else "Unrelated base movement for unique"
+
+    monkeypatch.setattr(STEP6, "run", runner)
+    with pytest.raises(ValueError):
+        STEP6.validate_base_fixture(
+            tmp_path, manifest, base, "c" * 40 if failure == "head" else "a" * 40
+        )
