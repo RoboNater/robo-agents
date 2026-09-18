@@ -40,11 +40,11 @@ launches `worker-mcp` from the absolute `robo-agents` checkout using
 `uv run --directory`; coordination code and work-product code therefore do not
 need to share a working directory.
 
-Issue #28 supplies the final workspace bootstrap and enforcement:
+The workspace bootstrap and enforcement contract (#28) is:
 
 - `HUB_WORKSPACE` names the worker's absolute clone path.
 - Bootstrap generates a random workspace ID once per clone and persists it in
-  the clone's `.git/` directory, where it is neither committed nor shared.
+  the clone's `.git/robo-agents-workspace.json` (0600), where it is neither committed nor shared.
 - Restarting a worker in that clone reports the same ID.
 - Two live worker instances reporting the same ID are rejected.
 - Released or lost workspaces remain in place. Automation never deletes

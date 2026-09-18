@@ -12,6 +12,7 @@
         "HUB_URL": "http://alice-host:8420",
         "HUB_TOKEN": "...",
         "AGENT_NAME": "bob",
+        "HUB_WORKSPACE": "/absolute/path/to/bob-sandbox",
         "HUB_HARNESS": "claude-code",
         "HUB_HARNESS_VERSION": "",
         "HUB_PROVIDER": "anthropic",
