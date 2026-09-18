@@ -733,8 +733,12 @@ def test_gate_response_cannot_come_from_another_pr(proof: tuple[Any, ...], label
         ("git -C . push origin HEAD:refs/heads/x", "reviewer_did_not_push"),
         ("git\tpush origin x", "reviewer_did_not_push"),
         ("gh\tpr\tmerge 10 --squash", "workers_did_not_merge"),
+        ("gh pr -R RoboNater/robo-agents-sandbox merge 10 --squash", "workers_did_not_merge"),
+        ("gh pr --repo=RoboNater/robo-agents-sandbox merge 10", "workers_did_not_merge"),
         ("bash -lc 'git -C . push origin x'", "reviewer_did_not_push"),
         ("cd .. && cat bob/secret", "charlie_no_other_workspace_access"),
+        ("cd -- .. && cat bob/secret", "charlie_no_other_workspace_access"),
+        ("cd -P -- .. && cat bob/secret", "charlie_no_other_workspace_access"),
         ("cat ../bob/secret", "charlie_no_other_workspace_access"),
     ],
 )

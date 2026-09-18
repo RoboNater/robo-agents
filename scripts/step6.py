@@ -788,8 +788,12 @@ def recorded_shell_actions(command, workspace, other_workspace):
     actions = set()
     cwd = workspace
     for index, word in enumerate(words):
-        if word == "cd" and index + 1 < len(words):
-            cwd = os.path.abspath(os.path.join(cwd, words[index + 1]))
+        if word == "cd":
+            destination = index + 1
+            while destination < len(words) and words[destination] in ("--", "-P", "-L", "-e"):
+                destination += 1
+            if destination < len(words):
+                cwd = os.path.abspath(os.path.join(cwd, words[destination]))
         # Git/gh global options can precede the subcommand; shell separators end it.
         if Path(word).name in ("git", "gh"):
             segment = []
@@ -799,11 +803,19 @@ def recorded_shell_actions(command, workspace, other_workspace):
                 segment.append(later)
             if Path(word).name == "git" and "push" in segment:
                 actions.add("push")
-            if Path(word).name == "gh" and any(
-                segment[offset : offset + 2] == ["pr", "merge"]
-                for offset in range(len(segment) - 1)
-            ):
-                actions.add("merge")
+            if Path(word).name == "gh":
+                # Cobra permits inherited repository options between command levels.
+                commands = []
+                skip_value = False
+                for token in segment:
+                    if skip_value:
+                        skip_value = False
+                    elif token in ("-R", "--repo", "--hostname"):
+                        skip_value = True
+                    elif not token.startswith("-"):
+                        commands.append(token)
+                if commands[:2] == ["pr", "merge"]:
+                    actions.add("merge")
         if (
             Path(word).name in ("bash", "sh", "zsh")
             and index + 2 < len(words)
