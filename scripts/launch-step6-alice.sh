@@ -16,12 +16,18 @@ config_root = Path(m.get('claude_config_dir', str(Path.home() / '.claude')))
 transcript = config_root / 'projects' / project / (m['alice_session_id'] + '.jsonl')
 print('resume' if transcript.is_file() else 'new')
 print(config_root)
+print('custom' if m.get('claude_config_dir_is_custom', config_root != Path.home() / '.claude') else 'default')
 PY
 )
 if curl --silent --fail http://127.0.0.1:8420/healthz >/dev/null 2>&1; then
   echo 'port 8420 occupied; leave other checkout listeners alone' >&2; exit 1
 fi
-export CLAUDE_CONFIG_DIR=${settings[3]}
+if [[ ${settings[4]} == custom ]]; then
+  export CLAUDE_CONFIG_DIR=${settings[3]}
+else
+  # Setting even the default directory relocates Claude's main .claude.json.
+  unset CLAUDE_CONFIG_DIR
+fi
 session_flags=(--session-id "${settings[1]}")
 if [[ ${settings[2]} == resume ]]; then
   session_flags=(--resume "${settings[1]}")

@@ -436,7 +436,8 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
         script = fake / name
         script.write_text(
             "#!/usr/bin/env python3\nimport os, sys, json\n"
-            'print(json.dumps({"cwd": os.getcwd(), "args": sys.argv[1:]}))\n'
+            'print(json.dumps({"cwd": os.getcwd(), "args": sys.argv[1:], '
+            '"config_dir": os.environ.get("CLAUDE_CONFIG_DIR")}))\n'
         )
         script.chmod(0o755)
     curl = fake / "curl"
@@ -455,6 +456,8 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
         else:
             assert output.returncode == 0, output.stderr
         record = json.loads(output.stdout)
+        if name == "alice" and not manifest["claude_config_dir_is_custom"]:
+            assert record["config_dir"] is None
         expected = "alice-runtime" if name == "alice" else "bob" if name == "bob" else None
         if expected:
             assert record["cwd"] == str(directory / expected)
@@ -464,6 +467,7 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
     # Resume the exact recorded Alice session without touching user configuration.
     config_root = tmp_path / "fake-claude-config"
     manifest["claude_config_dir"] = str(config_root)
+    manifest["claude_config_dir_is_custom"] = True
     project = re.sub(r"[^A-Za-z0-9]", "-", str(directory / "alice-runtime"))
     transcript = config_root / "projects" / project / (manifest["alice_session_id"] + ".jsonl")
     transcript.parent.mkdir(parents=True)
@@ -476,7 +480,9 @@ def test_local_prepare_and_all_launchers(tmp_path: Path) -> None:
         text=True,
         check=True,
     )
-    resumed_args = json.loads(resumed.stdout)["args"]
+    resumed_record = json.loads(resumed.stdout)
+    assert resumed_record["config_dir"] == str(config_root)
+    resumed_args = resumed_record["args"]
     assert "--resume" in resumed_args and "--session-id" not in resumed_args
     assert resumed_args[resumed_args.index("--resume") + 1] == manifest["alice_session_id"]
     # Execute both remaining script entry points against an incomplete fixture: fail closed.

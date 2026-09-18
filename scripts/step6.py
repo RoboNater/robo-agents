@@ -251,6 +251,7 @@ def prepare(directory, local_repository=None, seed=False):
     manifest = {
         "alice_session_id": str(uuid.uuid4()),
         "claude_config_dir": os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")),
+        "claude_config_dir_is_custom": "CLAUDE_CONFIG_DIR" in os.environ,
         "schema_version": 1,
         "run_id": run_id,
         "run_dir": str(directory),

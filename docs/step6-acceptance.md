@@ -144,7 +144,9 @@ then invoke the same Alice launcher. It detects the recorded session JSONL and
 uses `--resume` instead of attempting to recreate that session ID. The durable
 hub goal/policy and completed tasks remain authoritative. A custom
 `CLAUDE_CONFIG_DIR` is recorded at preparation and used for Alice's launcher and
-transcript collection. Worker restarts retain clone IDs but get fresh process
+transcript collection. The implicit default leaves that variable unset: explicitly
+setting it relocates Claude's main configuration file. Worker restarts retain
+clone IDs but get fresh process
 instance IDs; a still-live old instance is intentionally rejected until its
 loss is observed and Alice reconciles the assignment. Do not delete rows or
 reset a clone to force recovery. Crash scenarios remain Step 8 work.
