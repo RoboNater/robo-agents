@@ -1822,8 +1822,13 @@ def collect(directory):
     follow = next(
         (row for row in snapshot["decision"] if row.get("key") == "step6:follow-ups"), None
     )
-    if follow:
-        for url in json.loads(follow["rationale"])["urls"]:
+    try:
+        # A malformed record fails follow_ups_verified in evaluate(); never crash collection.
+        follow_urls = json.loads(follow["rationale"])["urls"] if follow else []
+    except (ValueError, KeyError, TypeError):
+        follow_urls = []
+    if follow_urls:
+        for url in follow_urls:
             if not url.startswith(f"https://github.com/{SANDBOX}/issues/"):
                 raise ValueError("follow-up targets another repository")
             facts["follow_ups"][url] = gh("issue", "view", url, "--json", "url,state")
