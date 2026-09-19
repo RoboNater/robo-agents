@@ -82,6 +82,8 @@ To keep credentials, MCP configurations, and worker clones cleanly separated, cr
 │   └── codex/               # Charlie's CODEX_HOME
 │       ├── config.toml      # Charlie's Codex MCP and sandbox configuration
 │       └── auth.json        # Linked authentication credentials
+├── bob.prompt.md            # Bob's rendered launch prompt (if supervised)
+├── bob-telemetry.jsonl      # Bob's worker telemetry log (if supervised)
 └── charlie.prompt.md        # Charlie's rendered launch prompt
 ```
 
@@ -260,14 +262,15 @@ Create `/path/to/my-run/configs/bob.mcp.json`:
         "HUB_HARNESS_VERSION": "2.1.277",
         "HUB_PROVIDER": "anthropic",
         "HUB_MODEL": "claude-sonnet-5",
-        "HUB_CAPABILITIES": "python,testing,git"
+        "HUB_CAPABILITIES": "python,testing,git",
+        "HUB_TELEMETRY_LOG": "/path/to/my-run/bob-telemetry.jsonl"
       }
     }
   }
 }
 ```
 
-*Note: Set `HUB_HARNESS_VERSION` to match your `claude --version`, and adjust `HUB_CAPABILITIES` to match your project needs.*
+*Note: Set `HUB_HARNESS_VERSION` to match your `claude --version`, and adjust `HUB_CAPABILITIES` to match your project needs. `HUB_TELEMETRY_LOG` is optional for manual interactive runs, but required when using the unattended supervisor so `worker-mcp` emits JSON Lines records and release events to the file the supervisor monitors.*
 
 ### 3. Start Bob in His Clone Directory
 Open a terminal, navigate to **Bob's clone directory**, and launch Claude pointing to the external MCP config:
@@ -297,15 +300,19 @@ Call check_in once, then await_assignment in a loop, fetch the assigned role gui
   Continue the worker loop.
   ```
 - **Unattended Supervision**:
-  To run Bob fully unattended without manual continuation prompts, you can drive him with `scripts/supervise-claude-code.sh`. For an implementation worker, you must configure the worker prompt and repository tools via environment variables:
-  ```bash
-  CLAUDE_MCP_CONFIG=/path/to/my-run/configs/bob.mcp.json \
-  HUB_TELEMETRY_LOG=/path/to/my-run/bob-telemetry.jsonl \
-  CLAUDE_WORKER_PROMPT_FILE=/path/to/robo-agents/prompts/worker.md \
-  CLAUDE_WORKER_TOOLS="Bash,Read,Edit,Write,TaskOutput,mcp__hub__check_in,mcp__hub__get_role_guide,mcp__hub__await_assignment,mcp__hub__report_progress,mcp__hub__ask_alice,mcp__hub__submit_result" \
-  CLAUDE_WORKER_ALLOWED_TOOLS="Read,Edit,Write,TaskOutput,Bash(git *),Bash(gh *),Bash(pytest *),Bash(python3 *),mcp__hub__*" \
-  scripts/supervise-claude-code.sh
-  ```
+  To run Bob fully unattended without manual continuation prompts, you can drive him with `scripts/supervise-claude-code.sh`.
+  1. Render Bob's launch prompt by copying [`prompts/worker.md`](../prompts/worker.md), replacing `$AGENT_NAME` with `bob`, and saving to `/path/to/my-run/bob.prompt.md`.
+  2. Ensure `HUB_TELEMETRY_LOG` in `/path/to/my-run/configs/bob.mcp.json` matches the path passed to the supervisor so release records are observed.
+  3. Change into **Bob's clone directory** first (so Claude runs inside Bob's workspace, not the coordination checkout), and launch the supervisor using its absolute path:
+     ```bash
+     cd /absolute/path/to/workspaces/bob-repo
+     CLAUDE_MCP_CONFIG=/path/to/my-run/configs/bob.mcp.json \
+     HUB_TELEMETRY_LOG=/path/to/my-run/bob-telemetry.jsonl \
+     CLAUDE_WORKER_PROMPT_FILE=/path/to/my-run/bob.prompt.md \
+     CLAUDE_WORKER_TOOLS="Bash,Read,Edit,Write,TaskOutput,mcp__hub__check_in,mcp__hub__get_role_guide,mcp__hub__await_assignment,mcp__hub__report_progress,mcp__hub__ask_alice,mcp__hub__submit_result" \
+     CLAUDE_WORKER_ALLOWED_TOOLS="Read,Edit,Write,TaskOutput,Bash(git *),Bash(gh *),Bash(pytest *),Bash(python3 *),mcp__hub__*" \
+     /absolute/path/to/robo-agents/scripts/supervise-claude-code.sh
+     ```
 
 ---
 
@@ -597,14 +604,15 @@ When the workflow completes:
      kill <PID>
      ```
      *(Do not use blanket `pkill -f agent_hub`, which would terminate hubs in other checkouts).*
-   - **Windows (PowerShell)**: Find the PID listening on port 8420, verify its path, and stop it:
+   - **Windows (PowerShell)**: Check which process owns port 8420, verify its path, and stop it:
      ```powershell
+     # 1. Identify the process listening on port 8420:
      $conn = Get-NetTCPConnection -LocalPort 8420 -ErrorAction SilentlyContinue
      if ($conn) {
-         $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-         Write-Host "Process on :8420 is PID $($proc.Id) ($($proc.Path))"
-         # Confirm the path matches your robo-agents checkout/venv before stopping:
-         Stop-Process -Id $proc.Id -Force
+         Get-Process -Id $conn.OwningProcess | Select-Object Id, ProcessName, Path
      }
+
+     # 2. Once verified that the Path matches your robo-agents checkout/venv, stop it:
+     # Stop-Process -Id <PID> -Force
      ```
 5. Your target repository will have a merged pull request, closing the issue (when referenced with `Closes #<issue>`).
