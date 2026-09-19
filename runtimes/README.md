@@ -91,7 +91,7 @@ Bootstrap each worker separately:
 scripts/bootstrap-workspace.sh bob /absolute/bob-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
 scripts/bootstrap-workspace.sh charlie /absolute/charlie-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
 # Or cross-platform via Python:
-# python scripts/bootstrap-workspace.py bob /absolute/bob-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
+# uv run --locked python scripts/bootstrap-workspace.py bob /absolute/bob-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
 ```
 
 The JSON stdout contains `workspace_id`, `agent`, `path`, and `repository`.
