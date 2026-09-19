@@ -561,6 +561,23 @@ class HubStore:
                         )
                     return (row["response_json"], False)
 
+            if profile.workspace_id is not None:
+                owner = connection.execute(
+                    "SELECT name FROM agent WHERE workspace_id = ? "
+                    "AND status IN (?, ?) AND name != ?",
+                    (
+                        profile.workspace_id,
+                        AgentStatus.IDLE.value,
+                        AgentStatus.BUSY.value,
+                        name,
+                    ),
+                ).fetchone()
+                if owner is not None:
+                    raise DuplicateAgentError(
+                        f"workspace {profile.workspace_id} is occupied "
+                        f"by live agent {owner['name']}"
+                    )
+
             row = connection.execute("SELECT * FROM agent WHERE name = ?", (name,)).fetchone()
             if row is None:
                 context_id = uuid4().hex

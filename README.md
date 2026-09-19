@@ -2,7 +2,7 @@
 
 This repository implements the proof of concept described in
 [`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
-Steps 1–4B and Step 5: the uv workspace, shared configuration and bearer-token
+Steps 1–6: the uv workspace, shared configuration and bearer-token
 provisioning, the SQLite schema, A2A agent-card discovery, the hub core (A2A
 request handlers, role-guide route, event queue, lease/heartbeat sweeper,
 bearer enforcement), Alice's MCP tools over stdio (including the
@@ -14,6 +14,9 @@ runtime-neutral [`guides/`](guides), and launcher [`prompts/`](prompts) now
 encode the Step 5B workflow. The prompts-only
 [`alice-relay`](skills/alice-relay/SKILL.md) skill remains as its reviewed
 baseline ([trial notes](docs/notes/relay-trial-2026-09.md)).
+Step 6 adds persistent isolated worker clones and a real-worker localhost
+acceptance harness; see [reproduction](docs/step6-acceptance.md) and
+[verified evidence](docs/evidence/step6-20260918191713_f99578f4.md).
 
 ## Run the hub
 

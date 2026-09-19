@@ -61,7 +61,7 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 - **Only Alice is an A2A server.** Workers are A2A clients → workers need no inbound port, which is what makes networking trivial.
 - **Bob's supervisor is transport-only.** It keeps one Claude Code session and its `worker-mcp` child alive by repeating a fixed continuation prompt after a premature end-turn. It writes stream-json to Claude Code; Claude Code owns the separate stdio MCP connection to `worker-mcp`. The supervisor never sees MCP frames and holds no assignment, retry, or orchestration policy; Alice and the worker role guide remain authoritative.
 - **Runtime mix (decided):** Alice + Bob on Claude Code, Charlie on Codex CLI (`charlie`), configured via `runtimes/codex.config.toml` (settled in Step 4). Consequence: **role guidance cannot depend on Claude Code skills.** The hub serves role guides over HTTP and `worker-mcp` exposes them as a tool, so every runtime gets identical instructions. Claude Code skill files become a thin wrapper that says "call `get_role_guide`."
-- **Sandbox work product:** The controlled test repository, per-agent clone topology, GitHub authentication boundary, repository policy, and repeatable run lifecycle are defined in [`docs/plan-for-the-sandbox-repo.md`](plan-for-the-sandbox-repo.md). Issue #28 supplies the `HUB_WORKSPACE` bootstrap and live workspace-identity enforcement before Step 6.
+- **Sandbox work product:** The controlled test repository, per-agent clone topology, GitHub authentication boundary, repository policy, and repeatable run lifecycle are defined in [`docs/plan-for-the-sandbox-repo.md`](plan-for-the-sandbox-repo.md). `scripts/bootstrap-workspace.sh` creates a dedicated full clone per worker; `HUB_WORKSPACE` identifies its canonical absolute root. Runtime launchers start the LLM in that clone and the MCP child in the coordination checkout. Lost/released clones are retained, including all unpushed work.
 - **Alice mode (decided): interactive Claude Code session.** Alice has `gh` in her env and performs the merge herself.
 - **Blocking tools with bounded timeouts** (default 120 s, under runtime MCP tool timeouts). Tool returns `{"event": null}` on timeout and the skill says "call again." No agent ever spins.
 - **A2A alignment:** A2A-shaped data model and transport; reuse `a2a-sdk` types (AgentCard, Task, TaskState, Message, Part, Artifact) and its JSON-RPC methods (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`). Pull semantics are layered on top via `contextId` per worker and `hub.*` message metadata — see §4. Third-party A2A clients are not expected to interoperate without `worker-mcp`.
@@ -99,7 +99,7 @@ summary in `task.result_json` and the terminal event.
 - `provider` / `model` — the model provider and exact model ID.
 - `model_source` — `env` when the launcher configured the model (`HUB_MODEL`); `declared` when the agent named its own model at check-in because the launcher did not; `unknown` when neither did. `unknown` if and only if `model` is.
 - `capabilities[]` — free-form strings matched by `role_policy`; empty when none are reported.
-- `workspace_id` — the worker's workspace, reported once isolated workspaces land (GitHub issue #28); null until then.
+- `workspace_id` — persisted random 256-bit clone identity, read from `.git/robo-agents-workspace.json` (owner-only, with agent, canonical path, and origin). `WorkerSettings` validates a full non-shallow independent clone whenever `HUB_WORKSPACE` is set; non-repository worker modes may omit it and report null. No path is sent to the hub. Check-in atomically rejects any other idle/busy owner of the same non-null ID, including a different agent name; lost/released rows do not reserve it. Operation replay precedes uniqueness checks, and stale heartbeats cannot reclaim a superseded identity.
 
 ---
 
@@ -235,6 +235,11 @@ No `merge` tool: Alice merges with `gh pr merge` herself (her session is a norma
 
 The hub declares an `idle` or `busy` worker `lost` after no heartbeat for `HUB_LOST_AFTER_S` (default 180 s), emits exactly one `agent_lost`, and fails its assigned task with `reason=worker_lost`. A heartbeat from the assigned instance renews the task's original lease window, but no later than the workflow policy's `max_task_lease_min` (default 120 minutes) after task creation. At that cap the normal sweeper emits `lease_expired` exactly once. `report_progress` updates `last_progress_at` only; LLM activity is never liveness evidence. There is deliberately no `suspect` state.
 
+Repository workers read `HUB_WORKSPACE` before check-in and report the persisted
+ID as `hub.workspace_id`. A second live owner receives HTTP 409 / JSON-RPC
+`-32600`, naming the workspace ID and owner without filesystem paths. Bootstrap
+never resets or deletes existing workspaces, and the hub performs no cleanup.
+
 ### 4.4 Result schemas
 
 Task results are structured, versioned payloads validated against Pydantic models in `agent_hub_common.models` (`SCHEMA_VERSION = 1`). The hub picks the model from the task's role (`implementer`, `reviewer`, `rebase`). On validation failure, the hub returns HTTP `400` leaving the task in `working` state so the worker can correct and retry. `RebaseResult` is a new body, not a change to an existing one, so the wire `hub.schema_version` stays `1`.
@@ -360,6 +365,13 @@ measured and allowed sizes, and that remediation, while the task remains open.
 - `rebase`: bring an approved PR up to date with its base without changing what was approved: start from `pr_head_sha`, merge in the base, resolve only the conflicts, check reserved counters for collisions git cannot see, run the full suite, report every hand-edited file; submit typed `RebaseResult` (§4.4). Written with GitHub issue #41, ahead of the other guides' Step 5 content
 - `worker`: protocol etiquette — loop `await_assignment → get_role_guide → do → submit_result`, when to `ask_alice`, always include URLs/SHAs. This text is also inlined into `prompts/worker.md` so non-Claude runtimes get it without any skill mechanism.
 
+Repository roles use separate full clones: implementers edit/push only their
+assigned branch; reviewers fetch/test/comment in their own clone, never push
+or inspect another worker's path; Alice reads work product through `gh` and
+performs the SHA-bound squash merge. Scoped GitHub credentials are recommended;
+the shared-account PoC enforces these boundaries through guides. Lost/released
+workspaces remain intact, never automatically deleting unpushed work.
+
 ---
 
 ## 6. Repo layout
@@ -448,7 +460,8 @@ Alice acceptance demo against the sandbox repository.
 | Runtime | Mixed — Alice + Bob: Claude Code; Charlie: Codex CLI (`charlie`), configured via `runtimes/codex.config.toml` (settled in Step 4). Tool hold timeouts bounded at 120 s to remain safely below observed harness/runtime MCP tool-timeout limits |
 | Second runtime | Codex CLI (`charlie`, `HUB_HARNESS=codex`), settled in Step 4. **Observed MCP tool-timeout limit: 300 s** by default (Codex CLI 0.154.0, no `tool_timeout_sec` set: a 150 s call completed, a 330 s call failed with `timed out awaiting tools/call after 300s`); the per-server `tool_timeout_sec` overrides it (20 s set → 20 s observed). The 120 s default hold fits, but a worker may request up to `HUB_MAX_WAIT_S` (300 s) and its client waits 15 s past the hold, so `runtimes/codex.config.toml` sets `tool_timeout_sec = 330` |
 | allow_no_ci | Renamed from `require_ci_green` (default `false`), semantics unchanged: setting `allow_no_ci: true` acts as an explicit escape hatch that suppresses escalation when no CI workflows are configured on the repo; it never permits merging on red or pending CI |
-| role_policy defaults | Default policy in `policy_json`: `role_policy = { reviewer_harness_differs: true, reviewer_provider_differs: false, implementer_capabilities: [], reviewer_capabilities: [] }` with `pairing_wait_s: 120`. Enforces multi-harness diversity between implementer and reviewer based on declared worker identity profiles (§3); an `unknown` field never satisfies a "differs" rule. Alice evaluates it (§5) — the hub records and exposes profiles but does not pair workers. No permission-claim taxonomy (`repo_write`, …): permissions are configured out of band (GitHub issue #28) |
+| Workspace isolation | Dedicated full non-shallow clones; canonical `HUB_WORKSPACE`; `.git/robo-agents-workspace.json` persisted ID; live ID uniqueness at check-in; lost/released clones retained |
+| role_policy defaults | Default policy in `policy_json`: `role_policy = { reviewer_harness_differs: true, reviewer_provider_differs: false, implementer_capabilities: [], reviewer_capabilities: [] }` with `pairing_wait_s: 120`. Enforces multi-harness diversity between implementer and reviewer based on declared worker identity profiles (§3); an `unknown` field never satisfies a "differs" rule. Alice evaluates it (§5) — the hub records and exposes profiles but does not pair workers. No permission-claim taxonomy (`repo_write`, …): permissions are configured out of band; scoped role credentials are recommended, guide-enforced in the shared-account PoC |
 | Workflow initialization | The initial prompt's goal and strictly validated policy are persisted create-once through `initialize_workflow`; identical retries confirm them after restart, while different values are refused with stored-workflow and fresh-state guidance. `assign_task` and `set_workflow_status` require this initialization. Alice and hub-side rails read the durable `workflow.policy_json` |
 | Payload caps | A message part is at most 16 KiB and a typed result body at most 32 KiB, measured as compact key-sorted UTF-8 JSON. Oversized payloads are rejected before state mutation with a GitHub-reference remediation. A result summary is governed by the result cap; if its derived transcript echo would exceed the part cap, only that echo is compacted and the full result remains authoritative |
 | Alice mode | Interactive (PoC); headless deferred |

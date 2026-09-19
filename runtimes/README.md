@@ -82,3 +82,39 @@ blocking background-task wait that Claude Code requires for long sleeps, and
 the four worker coordination tools. It sends a continuation message after a
 premature end-turn, and exits only after telemetry records the hub's release
 response.
+
+## Repository workspace contract (Step 6 / #28)
+
+Bootstrap each worker separately:
+
+```sh
+scripts/bootstrap-workspace.sh bob /absolute/bob-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
+scripts/bootstrap-workspace.sh charlie /absolute/charlie-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
+```
+
+The JSON stdout contains `workspace_id`, `agent`, `path`, and `repository`.
+Each full, non-shallow clone has its own `.git/robo-agents-workspace.json`,
+created exclusively with mode 0600 and a cryptographically random 256-bit ID.
+Reruns preserve the ID and all commits; they never fetch, reset, or delete an
+existing clone. Dirty clones, different origins, absent identities, and
+agent/path mismatches fail with an actionable error. A moved clone requires
+manual reconciliation, not automatic identity regeneration.
+
+Replace the Bob and Charlie templates' distinct `HUB_WORKSPACE` placeholders
+with their canonical absolute clone roots. Start the LLM in that clone with
+`cd` (Claude) or `-C` (Codex). `uv --directory` selects the coordination code
+for the MCP child; it does not set the LLM's shell workspace. Worker settings
+validate clone topology, origin, identity ownership and permissions before
+reporting the persisted ID. Non-repository tests/endurance may omit
+`HUB_WORKSPACE`; explicitly setting it empty is an error.
+
+Step 6 launchers render private run-local configurations and expose all six
+worker tools. Bob uses the existing transport-only supervisor with the worker
+prompt and repository tools. Its continuation prompt remains fixed and owns
+no workflow decisions. Charlie uses `--approve-for-me`, which selects
+workspace-write in Codex 0.154.0, plus `--add-dir <charlie-clone>/.git` so fetch
+and checkout can update only his own Git metadata. His launch prompt requires
+the trusted review-check helper to run tests and audit the actual assigned head
+in that persisted clone. Charlie uses a run-local `CODEX_HOME` and authentication
+symlink; global configuration is never edited. See
+[`docs/step6-acceptance.md`](../docs/step6-acceptance.md).

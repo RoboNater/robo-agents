@@ -1,6 +1,9 @@
 # Plan for Step 6 — localhost E2E
 
-Status: planning only, 2026-09-15. This file is intentionally uncommitted.
+Status: implementation and live acceptance complete, 2026-09-18.
+[Acceptance evidence](evidence/step6-20260918191713_f99578f4.md) records Phases 1–6.
+Phase 7 coordination merge and subsequent roadmap completion are recorded on
+the coordination PR and [Roadmap #2](https://github.com/RoboNater/robo-agents/issues/2).
 
 ## Executive answer
 
@@ -442,22 +445,25 @@ clones and the run directory. Confirm no process from this checkout remains.
 
 ## Completion checklist
 
-- [ ] Issue #28 implementation and deterministic tests pass.
-- [ ] Step 6 scenario, launchers, driver, and verifier pass local fake runs.
-- [ ] Full repository validation passes.
-- [ ] Fresh sandbox issue is created and recorded only after readiness.
-- [ ] Alice, Bob, and Charlie run in the locked harness topology.
-- [ ] Bob and Charlie report distinct, persistent workspace IDs and isolated
+- [x] Issue #28 implementation and deterministic tests pass.
+- [x] Step 6 scenario, launchers, driver, and verifier pass local fake runs.
+- [x] Full repository validation passes.
+- [x] Fresh sandbox issue is created and recorded only after readiness.
+- [x] Alice, Bob, and Charlie run in the locked harness topology.
+- [x] Bob and Charlie report distinct, persistent workspace IDs and isolated
       uncommitted state.
-- [ ] Real workflow proves changes-requested, ADDRESS, and approval.
-- [ ] Post-approval head push proves merge refusal and RE-REVIEW.
-- [ ] Post-approval `main` movement proves merge refusal and REBASE.
-- [ ] Rebased exact head passes CI and is squash-merged by Alice with
+- [x] Real workflow proves changes-requested, ADDRESS, and approval.
+- [x] Post-approval head push proves merge refusal and RE-REVIEW.
+- [x] Post-approval `main` movement proves merge refusal and REBASE.
+- [x] Rebased exact head passes CI and is squash-merged by Alice with
       `--match-head-commit`.
-- [ ] Injection canary is present and observable invariants remain intact.
-- [ ] Follow-ups are filed or verified absent; both workers are released and
+- [x] Injection canary is present and observable invariants remain intact.
+- [x] Follow-ups are filed or verified absent; both workers are released and
       workflow status is done.
-- [ ] Credential-free evidence is reproducible and the raw run is preserved.
+- [x] Credential-free evidence is reproducible and the raw run is preserved.
 - [ ] Coordination PR closes #28/#29, passes CI/review, and is squash-merged.
 - [ ] Roadmap issue #2 marks Step 6 complete only after that merge.
 
+
+The final two items are post-review actions: the PR and roadmap retain their
+actual completion records after the coordination merge.

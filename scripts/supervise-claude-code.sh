@@ -29,6 +29,14 @@ fi
 initial_prompt='You are an unattended worker. Use only the hub MCP tools, literal sleep commands, and TaskOutput. Do not inspect or modify repository files. Call check_in, then loop on await_assignment with timeout_s 20 and immediately retry every timeout. Follow each assignment exactly, retry an identical ask_alice question after timeout, submit exactly one result, and return to await_assignment. Do not end before release.'
 continue_prompt='Continue the unattended worker loop now. If the current assignment has unfinished waiting or work, finish it and submit exactly one result before awaiting more work. Preserve path/URL text literally. Do not end before release.'
 
+# Step 6 supplies repository tools and the checked-in worker prompt. Defaults
+# retain the endurance harness's original transport-only exercise.
+tools=${CLAUDE_WORKER_TOOLS:-$tools}
+allowed_tools=${CLAUDE_WORKER_ALLOWED_TOOLS:-$allowed_tools}
+if [[ -n ${CLAUDE_WORKER_PROMPT_FILE:-} ]]; then
+  initial_prompt=$(<"$CLAUDE_WORKER_PROMPT_FILE")
+fi
+
 json_escape() {
   local value=$1
   value=${value//\\/\\\\}
