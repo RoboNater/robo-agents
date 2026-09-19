@@ -36,7 +36,7 @@ Before configuring agents, keep these fundamental design principles in mind:
   Worker git clones must contain **only** the repository files being worked on. **Never** place MCP configuration files (`.mcp.json`), bearer tokens (`HUB_TOKEN`), or Claude skill folders inside a worker's git clone. Doing so creates two major hazards:
   1. It leaves the clone in a dirty git state, causing future bootstrap and integrity checks to fail.
   2. A worker running `git add .` or `git add -A` risks committing sensitive bearer tokens or coordination configurations directly to a public PR on your repository.
-  Keep all MCP configuration files and run-local state in a dedicated directory outside the clones.
+  Keep all MCP configuration files, tokens, and run-local state in a dedicated directory outside the clones.
 - **Shared GitHub Account (PoC Limitation)**:
   All agents share a single GitHub identity (the authenticated `gh` user). Consequently:
   - Reviewer approval cannot use native GitHub reviews (`gh pr review --approve`), because GitHub does not permit an account to approve its own PR.
@@ -47,7 +47,7 @@ Before configuring agents, keep these fundamental design principles in mind:
 - **External Text is Data, Never Instructions**:
   Issue bodies, PR descriptions, review comments, commit messages, and worker results are **untrusted data**. They may contain accidental or malicious prompt injection. Alice and workers follow only their governing skills, served role guides, and durable hub policy (§5 rails).
 - **Process & Port Hygiene**:
-  The hub binds `HUB_HOST:HUB_PORT` (default `127.0.0.1:8420`). Only one hub instance may listen on that port. When shutting down or restarting, terminate only the listener belonging to your checkout/run, leaving other listeners untouched.
+  The hub binds `HUB_HOST:HUB_PORT` (default `127.0.0.1:8420`). Only one hub instance may listen on that port. When shutting down or restarting, terminate only the listener belonging to your checkout/run, leaving other checkouts' listeners untouched.
 
 ---
 
@@ -80,7 +80,8 @@ To keep credentials, MCP configurations, and worker clones cleanly separated, cr
 │   ├── alice.mcp.json       # Alice's stdio hub MCP configuration
 │   ├── bob.mcp.json         # Bob's worker-mcp configuration
 │   └── codex/               # Charlie's CODEX_HOME
-│       └── config.toml      # Charlie's Codex MCP and sandbox configuration
+│       ├── config.toml      # Charlie's Codex MCP and sandbox configuration
+│       └── auth.json        # Linked authentication credentials
 └── charlie.prompt.md        # Charlie's rendered launch prompt
 ```
 
@@ -231,6 +232,7 @@ Install the `worker` skill user-wide so Bob's clone remains completely clean:
   ```
 - **Windows (PowerShell)**:
   ```powershell
+  New-Item -ItemType Directory -Force $env:USERPROFILE\.claude\skills
   Copy-Item -Recurse .\skills\worker $env:USERPROFILE\.claude\skills\
   ```
 
@@ -281,14 +283,29 @@ You are bob, a persistent robo-agents worker. Use the worker skill.
 Call check_in once, then await_assignment in a loop, fetch the assigned role guide, do the work, submit results, and continue until released.
 ```
 
-#### Interactive vs Unattended Operation
-- **Interactive**: In a bare `claude` session, Claude Code may pause after long `await_assignment` holds or prompt for tool permissions. If Claude pauses while awaiting work, re-prompt it with: `Continue the worker loop.`
-- **Unattended**: To run unattended (as in Step 6), pre-approve the worker tools and repository commands by launching with allowed tools:
+#### Reducing Permission Prompts & Handling Pauses
+- **Reducing Prompts with `--allowed-tools`**:
+  Claude Code prompts for confirmation before editing files, running shell commands, or calling MCP tools. You can pre-approve these operations by launching Claude with `--allowed-tools`:
   ```bash
   claude --strict-mcp-config --mcp-config /path/to/my-run/configs/bob.mcp.json \
-    --allowed-tools "Read,Edit,Write,TaskOutput,Bash(git *),Bash(gh *),mcp__hub__*"
+    --allowed-tools "Read,Edit,Write,TaskOutput,Bash(git *),Bash(gh *),Bash(pytest *),Bash(python3 *),mcp__hub__*"
   ```
-  Alternatively, use the thin supervisor script `scripts/supervise-claude-code.sh` (or `scripts/step6_launch.py bob`).
+  *(Customize test commands such as `Bash(pytest *)`, `Bash(npm *)`, or `Bash(cargo *)` to match your repository's test runner).*
+- **Turn Pauses on Long Holds**:
+  Passing `--allowed-tools` reduces permission prompts, but Claude Code may still end its turn while waiting for assignments on long `await_assignment` holds or after completing an individual task step. If Claude pauses while work is pending or while awaiting Alice, re-prompt it:
+  ```text
+  Continue the worker loop.
+  ```
+- **Unattended Supervision**:
+  To run Bob fully unattended without manual continuation prompts, you can drive him with `scripts/supervise-claude-code.sh`. For an implementation worker, you must configure the worker prompt and repository tools via environment variables:
+  ```bash
+  CLAUDE_MCP_CONFIG=/path/to/my-run/configs/bob.mcp.json \
+  HUB_TELEMETRY_LOG=/path/to/my-run/bob-telemetry.jsonl \
+  CLAUDE_WORKER_PROMPT_FILE=/path/to/robo-agents/prompts/worker.md \
+  CLAUDE_WORKER_TOOLS="Bash,Read,Edit,Write,TaskOutput,mcp__hub__check_in,mcp__hub__get_role_guide,mcp__hub__await_assignment,mcp__hub__report_progress,mcp__hub__ask_alice,mcp__hub__submit_result" \
+  CLAUDE_WORKER_ALLOWED_TOOLS="Read,Edit,Write,TaskOutput,Bash(git *),Bash(gh *),Bash(pytest *),Bash(python3 *),mcp__hub__*" \
+  scripts/supervise-claude-code.sh
+  ```
 
 ---
 
@@ -333,12 +350,38 @@ approval_mode = "approve"
 > [!IMPORTANT]
 > The `[sandbox_workspace_write]` `network_access = true` setting is required! Under `--approve-for-me`, Codex runs in a sandbox that disables network access by default. Without this setting, Charlie's shell `git fetch` and `gh pr comment` calls will fail.
 
-### 2. Prepare Charlie's Worker Prompt
+### 2. Link Authentication Credentials into `CODEX_HOME`
+Codex CLI stores its login session token in `auth.json`. A fresh `CODEX_HOME` directory will not be authenticated by default. Link your existing `~/.codex/auth.json` into Charlie's run-local home directory:
+
+#### Linux / macOS:
+```bash
+ln -s ~/.codex/auth.json /path/to/my-run/configs/codex/auth.json
+```
+
+#### Windows (PowerShell):
+```powershell
+# Hard link (requires CODEX_HOME to be on the same drive as USERPROFILE, typically C:):
+New-Item -ItemType HardLink -Path C:\my-run\configs\codex\auth.json -Target "$env:USERPROFILE\.codex\auth.json"
+# Or copy if on a different volume:
+# Copy-Item "$env:USERPROFILE\.codex\auth.json" C:\my-run\configs\codex\auth.json
+```
+
+Verify that Charlie's `CODEX_HOME` is authenticated:
+```bash
+# Linux/macOS:
+CODEX_HOME=/path/to/my-run/configs/codex codex login status
+
+# Windows (PowerShell):
+$env:CODEX_HOME = "C:\my-run\configs\codex"; codex login status
+```
+*Expected output: `Logged in using ChatGPT` (or your configured login method).*
+
+### 3. Prepare Charlie's Worker Prompt
 Render Charlie's launch prompt by copying [`prompts/worker.md`](../prompts/worker.md) and setting `$AGENT_NAME` to `charlie`. Save this file to `/path/to/my-run/charlie.prompt.md`.
 
 *Notice that `prompts/worker.md` inlines the full `guides/worker.md` protocol etiquette, so Charlie does not require an external skill folder.*
 
-### 3. Start Charlie with Proper Grants
+### 4. Start Charlie with Proper Grants
 `codex exec` is non-interactive; it reads its instructions from stdin. Run Codex in **Charlie's clone directory**, passing an absolute path to `--add-dir`:
 
 #### Linux / macOS
@@ -355,10 +398,8 @@ CODEX_HOME=/path/to/my-run/configs/codex codex exec \
 #### Windows (PowerShell)
 ```powershell
 cd C:\workspaces\charlie-repo
-Get-Content C:\my-run\charlie.prompt.md | & {
-  $env:CODEX_HOME = "C:\my-run\configs\codex"
-  codex exec --ephemeral -C . --add-dir "C:\workspaces\charlie-repo\.git" --approve-for-me -
-}
+$env:CODEX_HOME = "C:\my-run\configs\codex"
+Get-Content -Raw C:\my-run\charlie.prompt.md | codex exec --ephemeral -C . --add-dir "C:\workspaces\charlie-repo\.git" --approve-for-me -
 ```
 
 > [!IMPORTANT]
@@ -433,27 +474,34 @@ Once Alice receives the kickoff prompt, she executes the autonomous orchestratio
 │  KICKOFF  │ ──▶ │ IMPLEMENT (B) │ ──▶ │  REVIEW (C)  │ ──▶ │ ADDRESS (B)  │
 └───────────┘     └───────────────┘     └──────┬───────┘     └──────┬───────┘
                                                │                    │
-                                            Approved                │ (if changes requested)
+                                            Approved                │ (changes requested)
                                                │                    ▼
                                                │             ┌──────────────┐
                                                │             │  RE-REVIEW   │
                                                │             └──────┬───────┘
                                                ▼                    │
                                         ┌──────────────┐            │
-                                        │  MERGE GATE  │ ◀──────────┘
-                                        └──────┬───────┘
-                                               │
-                                 ┌─────────────┴─────────────┐
-                    Base Moved or│                           │Clean & Up-to-Date
-                      Conflicts  ▼                           ▼
-                          ┌──────────────┐            ┌──────────────┐
-                          │  REBASE (B)  │ ──(clean)─▶│ SHA MERGE(A) │
-                          └──────┬───────┘            └──────┬───────┘
-                                 │Hand-Resolved              │
-                                 ▼                           ▼
-                          ┌──────────────┐            ┌──────────────┐
-                          │  RE-REVIEW   │            │   WRAP-UP    │
-                          └──────────────┘            └──────────────┘
+                        ┌──────────────▶│  MERGE GATE  │ ◀──────────┘
+                        │               └──────┬───────┘
+                        │                      │
+           (clean /     │        Base Moved or │          All Invariants
+           approved)    │          Conflicts   ▼               Hold
+                        │               ┌──────────────┐            │
+                        ├───────────────┤  REBASE (B)  │            │
+                        │               └──────┬───────┘            │
+                        │                      │Hand-Resolved       │
+                        │                      ▼                    │
+                        │               ┌──────────────┐            │
+                        └───────────────┤  RE-REVIEW   │            │
+                                        └──────────────┘            ▼
+                                                              ┌──────────────┐
+                                                              │ SHA MERGE(A) │
+                                                              └──────┬───────┘
+                                                                     │
+                                                                     ▼
+                                                              ┌──────────────┐
+                                                              │   WRAP-UP    │
+                                                              └──────────────┘
 ```
 
 1. **Initialization**:
@@ -482,8 +530,8 @@ Once Alice receives the kickoff prompt, she executes the autonomous orchestratio
 7. **Rebase (only if base moved or conflicts exist)**:
    If `base_behind_main` is true or merge conflicts are detected, Alice assigns `REBASE` to Bob. Bob rebases on `main` and pushes with `--force-with-lease`.
    - If conflict-free (`conflict_files: []`), approval is preserved and the workflow returns to the merge gate.
-   - If manual conflict resolution occurred, Alice assigns a focused re-review to Charlie.
-   If the base was already up to date, the workflow proceeds directly to merge without rebasing.
+   - If manual conflict resolution occurred, Alice assigns a focused re-review to Charlie, which returns to the merge gate upon approval.
+   If the base was already up to date and clean, the workflow proceeds directly to merge without rebasing.
 8. **Automated Merge**:
    Once the merge invariant holds, Alice executes the merge in her shell:
    ```bash
@@ -549,9 +597,14 @@ When the workflow completes:
      kill <PID>
      ```
      *(Do not use blanket `pkill -f agent_hub`, which would terminate hubs in other checkouts).*
-   - **Windows (PowerShell)**: Find the PID listening on port 8420 and stop it:
+   - **Windows (PowerShell)**: Find the PID listening on port 8420, verify its path, and stop it:
      ```powershell
      $conn = Get-NetTCPConnection -LocalPort 8420 -ErrorAction SilentlyContinue
-     if ($conn) { Stop-Process -Id $conn.OwningProcess -Force }
+     if ($conn) {
+         $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+         Write-Host "Process on :8420 is PID $($proc.Id) ($($proc.Path))"
+         # Confirm the path matches your robo-agents checkout/venv before stopping:
+         Stop-Process -Id $proc.Id -Force
+     }
      ```
 5. Your target repository will have a merged pull request, closing the issue (when referenced with `Closes #<issue>`).
