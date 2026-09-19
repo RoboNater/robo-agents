@@ -90,6 +90,8 @@ Bootstrap each worker separately:
 ```sh
 scripts/bootstrap-workspace.sh bob /absolute/bob-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
 scripts/bootstrap-workspace.sh charlie /absolute/charlie-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
+# Or cross-platform via Python:
+# python scripts/bootstrap-workspace.py bob /absolute/bob-sandbox git@github.com:RoboNater/robo-agents-sandbox.git
 ```
 
 The JSON stdout contains `workspace_id`, `agent`, `path`, and `repository`.
@@ -117,4 +119,6 @@ and checkout can update only his own Git metadata. His launch prompt requires
 the trusted review-check helper to run tests and audit the actual assigned head
 in that persisted clone. Charlie uses a run-local `CODEX_HOME` and authentication
 symlink; global configuration is never edited. See
-[`docs/step6-acceptance.md`](../docs/step6-acceptance.md).
+[`docs/step6-acceptance.md`](../docs/step6-acceptance.md) for the automated sandbox
+demo and [`docs/user-guide.md`](../docs/user-guide.md) for user-facing setup on
+your own repositories.
