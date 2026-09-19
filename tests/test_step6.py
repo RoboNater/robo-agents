@@ -805,6 +805,9 @@ def test_gate_response_cannot_come_from_another_pr(proof: tuple[Any, ...], label
         ("cd -- .. && cat bob/secret", "charlie_no_other_workspace_access"),
         ("cd -P -- .. && cat bob/secret", "charlie_no_other_workspace_access"),
         ("cat ../bob/secret", "charlie_no_other_workspace_access"),
+        (r"type ..\bob\secret", "charlie_no_other_workspace_access"),
+        (r"cd ..\bob; type secret", "charlie_no_other_workspace_access"),
+        (r"Get-Content -Path ..\bob\secret", "charlie_no_other_workspace_access"),
     ],
 )
 def test_worker_action_variants_fail_proof(
@@ -879,7 +882,7 @@ def test_setup_failure_retries_in_place_with_same_identity(
 
     def failed_clone(*args: Any, **kwargs: Any) -> str:
         nonlocal count
-        if str(args[0]).endswith("bootstrap-workspace.sh"):
+        if any(str(arg).endswith("bootstrap-workspace.py") for arg in args):
             count += 1
             if count == 2:
                 raise OSError("transient clone failure")
@@ -919,10 +922,9 @@ def test_seeded_setup_recovers_ready_window_before_issue_creation(
     mutations = []
 
     def runner(*args: Any, **kwargs: Any) -> str:
-        if str(args[0]).endswith("bootstrap-workspace.sh"):
-            return json.dumps(
-                {"path": str(directory / args[1]), "workspace_id": args[1] + "-unchanged"}
-            )
+        if any(str(arg).endswith("bootstrap-workspace.py") for arg in args):
+            name = args[-3]
+            return json.dumps({"path": str(directory / name), "workspace_id": name + "-unchanged"})
         if args[:3] == ("gh", "issue", "create"):
             mutations.append("issue")
             return "https://github.com/RoboNater/robo-agents-sandbox/issues/77"
@@ -1369,3 +1371,211 @@ def test_base_fixture_refuses_ambiguous_remote_branch(
         STEP6.validate_base_fixture(
             tmp_path, manifest, base, "c" * 40 if failure == "head" else "a" * 40
         )
+
+
+def test_windows_powershell_wrapper_is_unwrapped() -> None:
+    wrapper = r'"C:\Program Files\PowerShell\7\pwsh.exe" -Command '
+    assert STEP6.shell_payload(wrapper + "'gh pr merge 10 --squash'") == "gh pr merge 10 --squash"
+    assert STEP6.shell_payload(wrapper + "'echo ''x'''") == "echo 'x'"
+    assert STEP6.shell_payload('pwsh -NoProfile -Command "git log -1"') == "git log -1"
+    assert STEP6.shell_payload("bash -lc 'ls'") == "bash -lc 'ls'"
+
+
+def test_codex_app_server_supervisor_log_yields_timed_calls() -> None:
+    gate = {"pr_url": "u", "expected_head_sha": "a" * 40, "head_matches": False}
+    command = r""""C:\pwsh.exe" -Command 'gh pr merge u --squash'"""
+    lines = [
+        {"sent_at": stamp(1), "message": {"id": 1, "method": "turn/start"}},
+        {
+            "received_at": stamp(2),
+            "message": {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "g",
+                        "type": "mcpToolCall",
+                        "server": "hub",
+                        "tool": "check_merge_gate",
+                        "arguments": {"pr_url": "u"},
+                        "status": "inProgress",
+                    }
+                },
+            },
+        },
+        {
+            "received_at": stamp(3),
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "g",
+                        "type": "mcpToolCall",
+                        "server": "hub",
+                        "tool": "check_merge_gate",
+                        "arguments": {"pr_url": "u"},
+                        "status": "completed",
+                        "result": {"content": [{"type": "text", "text": json.dumps(gate)}]},
+                    }
+                },
+            },
+        },
+        {
+            "received_at": stamp(4),
+            "message": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "m",
+                        "type": "commandExecution",
+                        "command": command,
+                        "status": "completed",
+                        "exitCode": 0,
+                        "aggregatedOutput": "merged",
+                    }
+                },
+            },
+        },
+    ]
+    calls = STEP6.tool_calls("\n".join(json.dumps(line) for line in lines))
+    assert calls[0]["name"] == "mcp__hub__check_merge_gate"
+    assert (calls[0]["timestamp"], calls[0]["completed_at"]) == (stamp(2), stamp(3))
+    assert calls[0]["result"] == gate and calls[0]["is_error"] is False
+    assert calls[1]["input"]["command"] == "gh pr merge u --squash"
+    assert calls[1]["merge_result"] == json.dumps("merged") and calls[1]["is_error"] is False
+
+
+def test_opencode_events_yield_review_check_and_mcp_calls() -> None:
+    report = {"review_check": "step6", "expected_head": "a" * 40}
+    events = [
+        {
+            "type": "tool_use",
+            "part": {
+                "type": "tool",
+                "tool": "hub_check_in",
+                "state": {
+                    "status": "completed",
+                    "input": {"model": "m"},
+                    "time": {"start": 0, "end": 1000},
+                },
+            },
+        },
+        {
+            "type": "tool_use",
+            "part": {
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "python3 check.py"},
+                    "output": "ok\n" + json.dumps(report),
+                    "metadata": {"exit": 0},
+                    "time": {"start": 2000, "end": 3000},
+                },
+            },
+        },
+        {"type": "text", "part": {"text": "done"}},
+    ]
+    calls = STEP6.tool_calls("\n".join(json.dumps(event) for event in events))
+    assert [call["name"] for call in calls] == ["mcp__hub__check_in", "Bash"]
+    assert calls[0]["timestamp"] == "1970-01-01T00:00:00.000Z"
+    assert calls[1]["review_check"] == report and calls[1]["exit_code"] == 0
+
+
+def test_manifest_topology_sets_expected_worker_profiles(proof: tuple[Any, ...]) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    assert (
+        "charlie_profile" not in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+    manifest["harnesses"] = {"alice": "codex", "bob": "claude-code", "charlie": "opencode"}
+    manifest["providers"] = {"bob": "anthropic", "charlie": "openrouter"}
+    manifest["versions"]["opencode"] = "1.18.31"
+    assert STEP6.harness_version(manifest, "charlie") == "1.18.31"
+    assert "charlie_profile" in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    charlie = next(row for row in snapshot["agent"] if row["name"] == "charlie")
+    charlie.update({"harness": "opencode", "provider": "openrouter", "harness_version": "1.18.31"})
+    assert (
+        "charlie_profile" not in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+def test_windows_style_paths_detect_other_workspace_access(proof: tuple[Any, ...]) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    bob = manifest["workspaces"]["bob"]["path"]
+    traces["charlie"].append(
+        {"name": "read", "input": {"filePath": bob.replace("/", os.sep) + os.sep + "x"}}
+    )
+    assert (
+        "charlie_no_other_workspace_access"
+        in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MSYS drive spelling exists only on Windows")
+@pytest.mark.parametrize(
+    "call",
+    [
+        {"name": "Bash", "input": {"command": "cat /c/runs/bob/secret"}},
+        {"name": "Bash", "input": {"command": "cd /c/runs/bob && cat secret"}},
+        {"name": "read", "input": {"filePath": "/c/runs/bob/secret"}},
+    ],
+)
+def test_git_bash_drive_paths_detect_other_workspace_access(
+    proof: tuple[Any, ...], call: dict[str, Any]
+) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    manifest["workspaces"]["bob"]["path"] = r"C:\runs\bob"
+    manifest["workspaces"]["charlie"]["path"] = r"C:\runs\charlie"
+    traces["charlie"].append(call)
+    assert (
+        "charlie_no_other_workspace_access"
+        in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+def test_own_workspace_paths_are_not_cross_access() -> None:
+    workspace, other = str(Path("/runs/charlie").resolve()), str(Path("/runs/bob").resolve())
+    for command in ("git status", r"python3 .\tests\run.py", "ls ../charlie"):
+        assert "other_workspace" not in STEP6.recorded_shell_actions(command, workspace, other)
+
+
+@pytest.mark.parametrize("rationale", ["null", "[]", '"text"', '{"urls": 3}', "not json"])
+def test_wrong_shaped_follow_ups_fail_closed(proof: tuple[Any, ...], rationale: str) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    row = next(row for row in snapshot["decision"] if row["key"] == "step6:follow-ups")
+    row["rationale"] = rationale
+    assert (
+        "follow_ups_verified" in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+def test_codex_exec_windows_command_is_unwrapped() -> None:
+    line = {
+        "item": {
+            "type": "command_execution",
+            "command": r""""C:\pwsh.exe" -Command 'git push origin x'""",
+            "status": "completed",
+            "exit_code": 0,
+        }
+    }
+    call = STEP6.tool_calls(json.dumps(line))[0]
+    assert call["input"]["command"] == "git push origin x"
+    assert "push" in STEP6.recorded_shell_actions(call["input"]["command"], "/w", "/o")
+
+
+def test_telemetry_ignores_partially_written_records(tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("step6_launch", ROOT / "scripts/step6_launch.py")
+    assert spec and spec.loader
+    launch = importlib.util.module_from_spec(spec)
+    import sys
+
+    sys.modules.setdefault("step6", STEP6)
+    spec.loader.exec_module(launch)
+    path = tmp_path / "telemetry.jsonl"
+    path.write_text('{"outcome": "idle"}\n')
+    telemetry = launch.Telemetry(path)
+    with path.open("a") as stream:
+        stream.write('{"outcome": "release", "worker_')
+    assert telemetry.released() is False
+    with path.open("a") as stream:
+        stream.write('instance_id": "x"}\n[]\n')
+    assert telemetry.released() is True
