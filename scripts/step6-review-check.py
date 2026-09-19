@@ -50,7 +50,7 @@ def main():
     if head != args.expected_head or run("git", "status", "--porcelain", cwd=workspace):
         parser.error("check out the assigned head in the clean persisted clone before reviewing")
     audit = workspace / ".git" / AUDIT_FILE
-    if audit.is_symlink() or os.name != "nt" and audit.exists() and audit.stat().st_mode & 0o077:
+    if audit.is_symlink() or (os.name != "nt" and audit.exists() and audit.stat().st_mode & 0o077):
         parser.error("review audit must be a private regular file")
     started = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     command = ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]

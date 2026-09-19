@@ -97,11 +97,15 @@ class Telemetry:
             return False
         with self.path.open("rb") as stream:
             stream.seek(self.start)
-            return any(
-                json.loads(line).get("outcome") == "release"
-                for line in stream.read().decode("utf-8", "replace").splitlines()
-                if line.strip().startswith("{")
-            )
+            lines = stream.read().decode("utf-8", "replace").splitlines()
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue  # a record still being appended; read it next time
+            if isinstance(record, dict) and record.get("outcome") == "release":
+                return True
+        return False
 
 
 def stop_tree(process, grace=30):

@@ -805,6 +805,9 @@ def test_gate_response_cannot_come_from_another_pr(proof: tuple[Any, ...], label
         ("cd -- .. && cat bob/secret", "charlie_no_other_workspace_access"),
         ("cd -P -- .. && cat bob/secret", "charlie_no_other_workspace_access"),
         ("cat ../bob/secret", "charlie_no_other_workspace_access"),
+        (r"type ..\bob\secret", "charlie_no_other_workspace_access"),
+        (r"cd ..\bob; type secret", "charlie_no_other_workspace_access"),
+        (r"Get-Content -Path ..\bob\secret", "charlie_no_other_workspace_access"),
     ],
 )
 def test_worker_action_variants_fail_proof(
@@ -1505,3 +1508,74 @@ def test_windows_style_paths_detect_other_workspace_access(proof: tuple[Any, ...
         "charlie_no_other_workspace_access"
         in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MSYS drive spelling exists only on Windows")
+@pytest.mark.parametrize(
+    "call",
+    [
+        {"name": "Bash", "input": {"command": "cat /c/runs/bob/secret"}},
+        {"name": "Bash", "input": {"command": "cd /c/runs/bob && cat secret"}},
+        {"name": "read", "input": {"filePath": "/c/runs/bob/secret"}},
+    ],
+)
+def test_git_bash_drive_paths_detect_other_workspace_access(
+    proof: tuple[Any, ...], call: dict[str, Any]
+) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    manifest["workspaces"]["bob"]["path"] = r"C:\runs\bob"
+    manifest["workspaces"]["charlie"]["path"] = r"C:\runs\charlie"
+    traces["charlie"].append(call)
+    assert (
+        "charlie_no_other_workspace_access"
+        in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+def test_own_workspace_paths_are_not_cross_access() -> None:
+    workspace, other = str(Path("/runs/charlie").resolve()), str(Path("/runs/bob").resolve())
+    for command in ("git status", r"python3 .\tests\run.py", "ls ../charlie"):
+        assert "other_workspace" not in STEP6.recorded_shell_actions(command, workspace, other)
+
+
+@pytest.mark.parametrize("rationale", ["null", "[]", '"text"', '{"urls": 3}', "not json"])
+def test_wrong_shaped_follow_ups_fail_closed(proof: tuple[Any, ...], rationale: str) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    row = next(row for row in snapshot["decision"] if row["key"] == "step6:follow-ups")
+    row["rationale"] = rationale
+    assert (
+        "follow_ups_verified" in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
+    )
+
+
+def test_codex_exec_windows_command_is_unwrapped() -> None:
+    line = {
+        "item": {
+            "type": "command_execution",
+            "command": r""""C:\pwsh.exe" -Command 'git push origin x'""",
+            "status": "completed",
+            "exit_code": 0,
+        }
+    }
+    call = STEP6.tool_calls(json.dumps(line))[0]
+    assert call["input"]["command"] == "git push origin x"
+    assert "push" in STEP6.recorded_shell_actions(call["input"]["command"], "/w", "/o")
+
+
+def test_telemetry_ignores_partially_written_records(tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("step6_launch", ROOT / "scripts/step6_launch.py")
+    assert spec and spec.loader
+    launch = importlib.util.module_from_spec(spec)
+    import sys
+
+    sys.modules.setdefault("step6", STEP6)
+    spec.loader.exec_module(launch)
+    path = tmp_path / "telemetry.jsonl"
+    path.write_text('{"outcome": "idle"}\n')
+    telemetry = launch.Telemetry(path)
+    with path.open("a") as stream:
+        stream.write('{"outcome": "release", "worker_')
+    assert telemetry.released() is False
+    with path.open("a") as stream:
+        stream.write('instance_id": "x"}\n[]\n')
+    assert telemetry.released() is True

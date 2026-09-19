@@ -78,6 +78,20 @@ def same_path(left, right):
     return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right))
 
 
+def native_path(text):
+    """Windows spelling of a Git Bash/MSYS drive path such as `/c/dir` (OpenCode's shell)."""
+    if os.name == "nt" and (match := re.fullmatch(r"/([A-Za-z])(/.*)?", text)):
+        return match[1] + ":" + (match[2] or "/")
+    return text
+
+
+def native_text(text):
+    """Normalize every MSYS drive prefix and separator in free text for substring checks."""
+    if os.name == "nt":
+        text = re.sub(r"(?<![\w:/])/([A-Za-z])(?=/)", r"\1:", text)
+    return os.path.normcase(text.replace("/", os.sep))
+
+
 def within(path, directory):
     path = os.path.normcase(os.path.abspath(path))
     directory = os.path.normcase(os.path.abspath(directory))
@@ -489,7 +503,13 @@ def codex_home(directory, name):
             (home / "auth.json").symlink_to(auth)
         except OSError:
             # Hard link: no extra copy of the credential and no symlink privilege.
-            os.link(auth, home / "auth.json")
+            try:
+                os.link(auth, home / "auth.json")
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot link {auth} into {home}; hard links need the same volume, "
+                    "so place RUN_DIR on the drive holding CODEX_HOME"
+                ) from exc
     return home
 
 
@@ -1099,7 +1119,10 @@ def tool_calls(lines):
         if codex.get("type") == "command_execution":
             call = {
                 "name": "Bash",
-                "input": {"command": codex.get("command", "")},
+                "input": {
+                    "command": shell_payload(codex.get("command", "")),
+                    "raw_command": codex.get("command", ""),
+                },
                 "status": codex.get("status"),
                 "exit_code": codex.get("exit_code"),
             }
@@ -1155,7 +1178,7 @@ def recorded_shell_actions(command, workspace, other_workspace):
             while destination < len(words) and words[destination] in ("--", "-P", "-L", "-e"):
                 destination += 1
             if destination < len(words):
-                cwd = os.path.abspath(os.path.join(cwd, words[destination]))
+                cwd = os.path.abspath(os.path.join(cwd, native_path(words[destination])))
         # Git/gh global options can precede the subcommand; shell separators end it.
         if Path(word).name in ("git", "gh"):
             segment = []
@@ -1189,11 +1212,20 @@ def recorded_shell_actions(command, workspace, other_workspace):
             if (
                 candidate
                 and not candidate.startswith("-")
-                and within(os.path.abspath(os.path.join(cwd, candidate)), other_workspace)
+                and within(
+                    os.path.abspath(os.path.join(cwd, native_path(candidate))), other_workspace
+                )
             ):
                 actions.add("other_workspace")
     if other_workspace in command or "../" + Path(other_workspace).name in command:
         actions.add("other_workspace")
+    if os.path.normcase(other_workspace) in native_text(command):
+        actions.add("other_workspace")
+    if "\\" in command:
+        # POSIX shlex consumes backslashes, hiding `..\bob` and `cd ..\bob`; re-scan the
+        # Windows spelling with separators normalized, keeping only path findings.
+        slashed = command.replace("\\", "/")
+        actions |= recorded_shell_actions(slashed, workspace, other_workspace) & {"other_workspace"}
     return actions
 
 
@@ -1698,15 +1730,17 @@ def evaluate(manifest, snapshot, facts, traces):
             name + "_no_other_workspace_access",
             all(
                 not any(
-                    os.path.normcase(other_path) in os.path.normcase(text.replace("/", os.sep))
-                    or "../" + other in text
+                    os.path.normcase(other_path) in native_text(text)
+                    or "../" + other in text.replace("\\", "/")
                     for text in strings(call["input"])
                 )
                 and "other_workspace" not in shell_actions[name][index]
                 and all(
                     not isinstance(value, str)
                     or not within(
-                        os.path.abspath(os.path.join(manifest["workspaces"][name]["path"], value)),
+                        os.path.abspath(
+                            os.path.join(manifest["workspaces"][name]["path"], native_path(value))
+                        ),
                         other_path,
                     )
                     for key, value in call["input"].items()
@@ -1718,7 +1752,7 @@ def evaluate(manifest, snapshot, facts, traces):
     follow = decisions.get("step6:follow-ups")
     try:
         urls = json.loads(follow["rationale"])["urls"] if follow else None
-    except (ValueError, KeyError):
+    except (ValueError, KeyError, TypeError):
         urls = None
     require(
         "follow_ups_verified",
