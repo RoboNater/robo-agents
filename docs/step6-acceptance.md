@@ -172,3 +172,28 @@ HEAD, test return code, clean state, source commit, and UTC interval under
 successful executed Codex command result and the exact review task interval.
 An API archive or temporary test snapshot cannot substitute for this proof.
 If the helper fails, Charlie must ask Alice rather than invent a workaround.
+
+## Native Windows and alternate harnesses
+
+Alice may run on Codex and Charlie on OpenCode by setting these before
+preparation (defaults remain Claude Alice/Bob and Codex Charlie):
+
+```sh
+STEP6_ALICE_HARNESS=codex STEP6_ALICE_MODEL=gpt-5.6-luna
+STEP6_BOB_MODEL=claude-haiku-4-5-20251001
+STEP6_CHARLIE_HARNESS=opencode STEP6_CHARLIE_PROVIDER=openrouter
+STEP6_CHARLIE_MODEL=openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+STEP6_PYENV_VERSION=3.12.10        # pyenv-win python3 shim for every clone
+STEP6_SKIP_ROADMAP_RESERVATION=1   # when not authorized to comment on #2
+PYTHONUTF8=1
+uv run --locked python scripts/step6.py prepare 'C:\absolute\run' --seed
+```
+
+Launch with `scripts/step6_launch.py {alice,bob,charlie} RUN_DIR` in separate
+processes (Alice first), then `scripts/run-step6-disturbances.py RUN_DIR`. Codex
+Alice runs under a `codex app-server` supervisor so one process keeps the hub
+alive across turns; OpenCode Charlie runs `opencode serve` with `run --attach`
+turns so his `worker-mcp` instance persists. Supervisors send only fixed
+continuation text. OpenCode has no OS sandbox: Charlie's generated config denies
+edits and external directories and allows a narrow shell list. See
+[the Windows attempt](evidence/step6-failed-20260919013155_2a972a49.md).
