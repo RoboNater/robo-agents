@@ -17,6 +17,8 @@ baseline ([trial notes](docs/notes/relay-trial-2026-09.md)).
 Step 6 adds persistent isolated worker clones and a real-worker localhost
 acceptance harness; see [reproduction](docs/step6-acceptance.md) and
 [verified evidence](docs/evidence/step6-20260918191713_f99578f4.md).
+For orchestrating issues on your own repositories, see the
+[user guide](docs/user-guide.md).
 
 ## Run the hub
 
