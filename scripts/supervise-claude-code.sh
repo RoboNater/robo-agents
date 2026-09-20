@@ -38,10 +38,18 @@ if [[ -n ${CLAUDE_WORKER_PROMPT_FILE:-} ]]; then
 fi
 
 json_escape() {
+  # Hand-rolled JSON string escaping for stream-json stdin. Prompts rendered
+  # from a Windows (CRLF) checkout carry carriage returns, so \r must be
+  # escaped like the other JSON short escapes; a raw control byte corrupts
+  # the framing and Claude exits with a streaming-input SyntaxError.
   local value=$1
   value=${value//\\/\\\\}
   value=${value//\"/\\\"}
+  value=${value//$'\b'/\\b}
+  value=${value//$'\f'/\\f}
   value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
   printf '%s' "$value"
 }
 
@@ -59,17 +67,20 @@ released() {
 }
 
 coproc CLAUDE_PROC {
+  # `=` value forms: Claude 2.1.278 on Windows mis-parses space-separated
+  # --mcp-config/--tools/--allowedTools in -p mode (the value is ignored and
+  # the following args are swallowed); `=` works on every platform.
   "$claude_bin" -p \
-    --model "$model" \
-    --input-format stream-json \
-    --output-format stream-json \
+    --model="$model" \
+    --input-format=stream-json \
+    --output-format=stream-json \
     --verbose \
     --strict-mcp-config \
-    --mcp-config "$CLAUDE_MCP_CONFIG" \
-    --permission-mode dontAsk \
-    --permission-prompts none \
-    --tools "$tools" \
-    --allowedTools "$allowed_tools"
+    --mcp-config="$CLAUDE_MCP_CONFIG" \
+    --permission-mode=dontAsk \
+    --permission-prompts=none \
+    --tools="$tools" \
+    --allowedTools="$allowed_tools"
 }
 claude_pid=$CLAUDE_PROC_PID
 read_fd=${CLAUDE_PROC[0]}

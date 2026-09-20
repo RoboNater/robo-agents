@@ -20,6 +20,7 @@ This document archives completed milestones, closed issues, review hardening, op
 - [Step 5 — Guides, Alice Skill, Prompts](#step-5--guides-alice-skill-prompts)
 - [Step 6 — E2E on Localhost](#step-6--e2e-on-localhost)
 - [User Documentation (#73)](#user-documentation-73)
+- [User Run Preparation (#75, #76)](#user-run-preparation-75-76)
 - [Settled Architectural Decisions](#settled-architectural-decisions)
 - [PoC Status Summary (as of Step 6 / #73)](#poc-status-summary-as-of-step-6--73)
 
@@ -37,6 +38,7 @@ Shared, monotonic counters (schema version, migration number, wire `schema_versi
 - **Step 6 (#28/#29):** no shared counter needed; merged in [#69](https://github.com/RoboNater/robo-agents/pull/69) (`5abf7dc1787af8c1ed78d85b9e27dabd70bb2a9f`), reusing DB schema v9 and wire version 1.
 - **Step 6 native-Windows harness (#72):** no shared counter needed; merged in [#72](https://github.com/RoboNater/robo-agents/pull/72) (`4070cd3`) with harness, verifier and documentation changes only.
 - **User guide (#73):** no shared counter needed; user documentation and workspace bootstrap guide merged in [#74](https://github.com/RoboNater/robo-agents/pull/74) (`f192331`).
+- **User run preparation (#75/#76):** no shared counter needed; docs, run-preparation and supervisor scripts, and tests only (PR #81, pending merge).
 
 ---
 
@@ -297,6 +299,18 @@ Step 3 reuses `HubStore` for `assign_task`, `reply` and `release_agent`. The wai
 - [x] **#73 — Document user-facing usage for own repos** (`f192331`, [#74](https://github.com/RoboNater/robo-agents/pull/74))
 
   Added `docs/user-guide.md` documenting end-to-end orchestration on arbitrary user repositories, covering architecture, workspace bootstrapping with `scripts/bootstrap-workspace.py`, external MCP configuration outside clones to preserve clean working trees and prevent secret leakage, run-local `CODEX_HOME` with linked credentials and sandbox network access, unattended vs interactive worker loops, Alice kickoff prompt and policy options, full lifecycle routing, and clean process shutdown. Linked from `README.md` and `runtimes/README.md`. ✔
+
+---
+
+## User Run Preparation (#75, #76)
+
+- [x] **#75 — Windows JSON config paths: backslash escaping rule** ([#81](https://github.com/RoboNater/robo-agents/pull/81), pending merge)
+
+  `runtimes/README.md` recommends forward slashes and shows the escaped `C:\\work\\robo-agents` form: an unescaped backslash either fails to parse (`\w`) or silently corrupts the value (`C:\n\robo-agents` parses to `C:` + newline + carriage-return + `obo-agents`, a plausible-looking path rather than obvious garbage). `docs/user-guide.md` carries the same note where Windows paths first appear (Steps 2–4: `HUB_STATE_DIR`, `HUB_WORKSPACE`, `HUB_TELEMETRY_LOG`, `--mcp-config`), plus Git Bash `/c/` spellings, bootstrap drive-letter case, `uv` on the runtime PATH, and a troubleshooting row for paths the config sets but the hub/`uv` reports missing. Docs only; the JSON parse table was reviewer-verified. ✔
+
+- [x] **#76 — `scripts/prepare-run.py` generates a whole user run directory** ([#81](https://github.com/RoboNater/robo-agents/pull/81), pending merge)
+
+  One command bootstraps both clones (never touching existing ones), reuses `hub-state/token`, renders `alice.mcp.json` / worker configs / run-local Codex home from the `runtimes/` templates with CLI-probed harness versions, links Codex `auth.json`, renders worker prompts, checks `gh` auth / harness versions / merge-method permission / CI workflows (deciding `allow_no_ci`), and prints paste-ready launch lines plus the Alice kickoff prompt. Generic rendering lives in shared `scripts/run_common.py` (imported by `step6.py`, no behavior change); harness flags default to the mixed pair but were narrowed during review to `claude-code` and `codex` only, with the opencode and gemini renderers removed rather than left half-supported (opencode needs its serve/attach supervisor; gemini's flags are unverified). Reruns are idempotent and nothing is written inside either clone. `docs/user-guide.md` gained a quickstart with the manual Steps 1–5 kept as an appendix. Acceptance: throwaway repo `RoboNater/acceptance-pr81` issue #1 → PR #2 → squash-merged with matching reviewed head, issue auto-closed, workflow done — via the guide's all-Claude topology, with both workers driven through `supervise-claude-code.sh` and Alice as repeated `claude -p` turns rather than the printed interactive commands. That run exposed two fixed supervisor defects (`=` flag forms for `claude -p`; full JSON short escapes for CRLF prompts) and a Windows-specific Codex 0.155.1 defect (on Windows an extra `--add-dir` withholds the hub MCP tools, while without it `.git` stays invisible to the sandbox; not reproducible on Linux with the same CLI version), tracked in [#84](https://github.com/RoboNater/robo-agents/issues/84). ✔
 
 ---
 
