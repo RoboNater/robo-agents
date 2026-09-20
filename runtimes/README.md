@@ -14,8 +14,8 @@ All templates use `uv run --directory /path/to/agent-hub worker-mcp` so worker r
 
 Before using a template:
 1. Replace `/path/to/agent-hub` with the absolute path to the `agent-hub` workspace checkout:
-   - **Linux / macOS**: `/home/user/path/to/robo-agents`
-   - **Windows**: Use a Windows absolute path, either with forward slashes (e.g., `C:/work/robo-agents`) or escaped backslashes (e.g., `C:\work\robo-agents`).
+    - **Linux / macOS**: `/home/user/path/to/robo-agents`
+    - **Windows**: Prefer forward slashes (e.g., `C:/work/robo-agents`). A backslash must be escaped as `\\` in JSON (e.g., `C:\\work\\robo-agents`): a single unescaped `\` either fails to parse (`\w` is an `Invalid \escape`) or silently corrupts the value (`\n` and `\r` become newline/carriage-return control characters).
 2. Replace `http://alice-host:8420` with your hub's public address (e.g., `http://127.0.0.1:8420` for local runs).
 3. Replace `HUB_TOKEN` with the shared bearer token (from `$HUB_STATE_DIR/token` or `.env`).
 4. Ensure `AGENT_NAME` names the assigned worker.
