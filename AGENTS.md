@@ -14,7 +14,9 @@ need no inbound port. Alice drives a GitHub issue to a merged PR.
 protocol, data model, the 8-step plan (§7), locked decisions (§8). Read the
 section covering what you are changing; its §-numbers are the shared vocabulary
 in issues and commits. [Issue #2](https://github.com/RoboNater/robo-agents/issues/2)
-tracks which of those steps are done.
+tracks which of those steps are done and active reservations, while
+[`docs/worklog.md`](docs/worklog.md) records the completed step history and decision
+rationales.
 
 ## Layout
 
