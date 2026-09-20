@@ -89,6 +89,65 @@ To keep credentials, MCP configurations, and worker clones cleanly separated, cr
 
 ---
 
+## Quickstart with `scripts/prepare-run.py`
+
+For the standard topology, generate the whole run directory in one command
+instead of assembling Steps 1-5 by hand:
+
+```sh
+uv run --locked python scripts/prepare-run.py \
+  --repository git@github.com:your-org/your-repo.git \
+  --run-dir /absolute/path/to/my-run \
+  --issue 42 --account your-github-username
+```
+
+It produces the layout above (plus `alice.prompt.md`, `run.json`, and
+`hub-state/token`), sharing its rendering code with the Step 6 demo so the two
+paths cannot drift. Specifically it:
+
+1. Bootstraps the `bob` and `charlie` clones via `scripts/bootstrap-workspace.py`,
+   never touching an existing clone.
+2. Creates `hub-state/` and generates `hub-state/token`, reusing an existing token.
+3. Renders `configs/alice.mcp.json`, `configs/bob.mcp.json`, and
+   `configs/codex/config.toml` from the `runtimes/` templates, with paths, token,
+   and the identity profile filled from what the CLIs actually report
+   (`<cli> --version` for `HUB_HARNESS_VERSION`; pass `--bob-model` /
+   `--charlie-model` to pin `HUB_MODEL`, otherwise it stays empty and the worker
+   declares its own model at check-in).
+4. Links `~/.codex/auth.json` into the run-local `CODEX_HOME` and reports whether
+   that home is authenticated (`codex login status`).
+5. Renders `bob.prompt.md` / `charlie.prompt.md` from `prompts/worker.md` with
+   `$AGENT_NAME` substituted.
+6. Checks `gh auth status`, each harness's `--version`, whether the repository
+   allows `--merge-method` (default `squash`), and whether it has CI workflows
+   (which decides `allow_no_ci` when `--allow-no-ci auto`).
+7. Prints the three launch commands below plus the Alice kickoff prompt
+   (`alice.prompt.md`) with the issue and account filled in.
+
+Then paste the three commands it prints:
+
+```sh
+cd /absolute/path/to/my-run
+claude --strict-mcp-config --mcp-config /absolute/path/to/my-run/configs/alice.mcp.json
+
+cd /absolute/path/to/my-run/bob
+claude --strict-mcp-config --mcp-config /absolute/path/to/my-run/configs/bob.mcp.json
+
+cd /absolute/path/to/my-run/charlie
+CODEX_HOME=/absolute/path/to/my-run/configs/codex codex exec --ephemeral -C . \
+  --add-dir "/absolute/path/to/my-run/charlie/.git" --approve-for-me - \
+  < /absolute/path/to/my-run/charlie.prompt.md
+```
+
+Harness choice is a flag (`--bob claude-code --charlie codex`, the default mixed
+pair); `--bob-provider` / `--charlie-provider` and `--bob-capabilities` /
+`--charlie-capabilities` override the identity profile. Reruns against the same
+`--run-dir` are idempotent and never rewrite an existing clone, token, or
+identity file. Nothing is ever written inside either clone. The manual
+walkthrough in Steps 1-5 below is kept as an appendix for custom topologies.
+
+---
+
 ## Step 1: Bootstrap Worker Workspaces
 
 Each worker needs its own isolated, non-shallow git clone of your target repository.
@@ -151,6 +210,27 @@ The hub and all workers communicate securely using a pre-shared bearer token.
 | `HUB_HOST` | No | Bind host (`0.0.0.0` for remote workers) | `127.0.0.1` |
 | `HUB_PORT` | No | Bind port | `8420` |
 
+### Windows paths in JSON configs (Steps 2-4)
+
+Prefer forward slashes in every JSON file (`C:/my-run/hub-state`,
+`C:/workspaces/bob-repo`). A backslash must be escaped as `\\` in JSON
+(e.g., `C:\\my-run\\hub-state`): a single unescaped `\` either fails to parse
+(`\w` is an `Invalid \escape`) or silently corrupts the value — `C:\n\robo-agents`
+parses without error as `C:` + newline + carriage-return + `obo-agents`, so the
+failure surfaces later as `uv` or the hub reporting a missing directory.
+
+This covers `HUB_STATE_DIR`, `HUB_WORKSPACE`, `HUB_TELEMETRY_LOG`, and every
+checkout/config path inside `--mcp-config` files (`alice.mcp.json`,
+`bob.mcp.json`):
+
+- Git Bash spellings such as `/c/work/robo-agents` do not work inside these JSON
+  files; Claude Code and `uv` are native Windows programs, so use a Windows path.
+- Keep the drive-letter case that `bootstrap-workspace.py` printed for
+  `HUB_WORKSPACE`: `read_identity` compares the stored `path` string against the
+  configured value.
+- `uv` must be on the PATH of the shell that starts the runtime (Claude Code /
+  Codex), because the MCP config invokes it by bare name (`"command": "uv"`).
+
 ---
 
 ## Step 3: Configure Alice (Claude Code Orchestrator)
@@ -196,7 +276,7 @@ In your run directory (e.g. `/path/to/my-run/configs/`), create `alice.mcp.json`
 }
 ```
 
-*Replace `/absolute/path/to/robo-agents` with the absolute path to this repository checkout, and `/path/to/my-run/hub-state` with your state directory.*
+*Replace `/absolute/path/to/robo-agents` with the absolute path to this repository checkout, and `/path/to/my-run/hub-state` with your state directory. On Windows, use forward slashes (`C:/my-run/hub-state`) or escaped backslashes (`C:\\my-run\\hub-state`) — see "Windows paths in JSON configs" above.*
 
 ### 3. Launch Alice
 Launch Claude Code in a clean working directory (such as your run directory) passing the MCP config:
@@ -270,7 +350,7 @@ Create `/path/to/my-run/configs/bob.mcp.json`:
 }
 ```
 
-*Note: Set `HUB_HARNESS_VERSION` to match your `claude --version`, and adjust `HUB_CAPABILITIES` to match your project needs. `HUB_TELEMETRY_LOG` is optional for manual interactive runs, but required when using the unattended supervisor so `worker-mcp` emits JSON Lines records and release events to the file the supervisor monitors.*
+*Note: Set `HUB_HARNESS_VERSION` to match your `claude --version`, and adjust `HUB_CAPABILITIES` to match your project needs. `HUB_TELEMETRY_LOG` is optional for manual interactive runs, but required when using the unattended supervisor so `worker-mcp` emits JSON Lines records and release events to the file the supervisor monitors. On Windows, write `HUB_WORKSPACE` and `HUB_TELEMETRY_LOG` with forward slashes or escaped backslashes — see "Windows paths in JSON configs" above.*
 
 ### 3. Start Bob in His Clone Directory
 Open a terminal, navigate to **Bob's clone directory**, and launch Claude pointing to the external MCP config:
@@ -588,6 +668,7 @@ If you prefer running both Bob and Charlie with Claude Code:
 | Codex worker fails with network errors | Sandbox disables network access | Add `[sandbox_workspace_write]\nnetwork_access = true` in Charlie's `CODEX_HOME/config.toml`. |
 | Codex worker hangs on MCP tool calls | Interactive approval prompt blocking | Add `approval_mode = "approve"` for all six hub tools in `config.toml` (see Step 5). |
 | Port 8420 already in use | Stale hub listener | Check running processes and stop the old hub listener (see Clean Shutdown below). |
+| Hub or `uv` reports a configured path as missing, though the JSON looks correct | Unescaped Windows backslash in a `*.mcp.json` file | Use forward slashes (`C:/my-run/hub-state`) or escaped backslashes (`C:\\my-run\\hub-state`). Verify with `python -c "import json; print(json.load(open('configs/bob.mcp.json'))['mcpServers']['hub']['env']['HUB_WORKSPACE'])"` — a value containing a newline or `r` where a drive letter should be means a `\n`/`\r` escape was parsed. Git Bash `/c/...` spellings also fail here; use a native Windows path. |
 | Alice restarts mid-workflow | Session dropped or restarted | Restart Alice pointing to the same `HUB_STATE_DIR`. Alice will call `get_state()`, reconcile with GitHub, and resume without re-running completed work. |
 
 ---
