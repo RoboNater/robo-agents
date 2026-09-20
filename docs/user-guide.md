@@ -113,7 +113,8 @@ the two paths cannot drift. Supported worker harnesses are `claude-code` and
 
 1. Bootstraps the `bob` and `charlie` clones via `scripts/bootstrap-workspace.py`,
    never touching an existing clone. `--repository` accepts a clone URL or a
-   bare `owner/repo` slug, which is expanded to its https clone URL.
+   bare `owner/repo` slug, which is expanded to the clone URL matching `gh`'s
+   configured protocol (`ssh` or `https`).
 2. Creates `hub-state/` and generates `hub-state/token`, reusing an existing token.
 3. Renders `configs/alice.mcp.json`, `configs/bob.mcp.json`, and
    `configs/codex/config.toml` from the `runtimes/` templates, with paths, token,
@@ -129,7 +130,7 @@ the two paths cannot drift. Supported worker harnesses are `claude-code` and
 6. Checks `gh auth status`, each harness's `--version`, whether the repository
    allows `--merge-method` (default `squash`), and whether it has CI workflows
    (which decides `allow_no_ci` when `--allow-no-ci auto`). Failures exit as a
-   one-line `prepare-run: error: ...` message, not a traceback.
+   `prepare-run: error: ...` message (exit 1), not a traceback.
 7. Prints the three launch commands below plus the Alice kickoff prompt
    (`alice.prompt.md`) with the issue and account filled in.
 

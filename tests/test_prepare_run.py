@@ -18,6 +18,7 @@ SPEC = importlib.util.spec_from_file_location("prepare_run", ROOT / "scripts/pre
 assert SPEC and SPEC.loader
 PREPARE_RUN = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PREPARE_RUN)
+RUN_COMMON = sys.modules["run_common"]
 
 
 def make_origin(tmp_path: Path) -> Path:
@@ -45,7 +46,9 @@ def make_origin(tmp_path: Path) -> Path:
     return origin
 
 
-def fake_runner(monkeypatch: pytest.MonkeyPatch, *, gh_auth_ok: bool = True) -> Any:
+def fake_runner(
+    monkeypatch: pytest.MonkeyPatch, *, gh_auth_ok: bool = True, git_protocol: str = "https"
+) -> Any:
     original_run = PREPARE_RUN.run
     original_output = PREPARE_RUN.run_output
 
@@ -58,6 +61,8 @@ def fake_runner(monkeypatch: pytest.MonkeyPatch, *, gh_auth_ok: bool = True) -> 
             if not gh_auth_ok:
                 raise subprocess.CalledProcessError(1, list(args))
             return ""
+        if args[:3] == ("gh", "config", "get"):
+            return git_protocol
         if args[:3] == ("gh", "repo", "view"):
             return json.dumps(
                 {
@@ -80,6 +85,8 @@ def fake_runner(monkeypatch: pytest.MonkeyPatch, *, gh_auth_ok: bool = True) -> 
 
     monkeypatch.setattr(PREPARE_RUN, "run", runner)
     monkeypatch.setattr(PREPARE_RUN, "run_output", output_runner)
+    # slug_clone_url resolves run() from run_common's namespace, not this module's.
+    monkeypatch.setattr(RUN_COMMON, "run", runner)
     return runner
 
 
@@ -326,7 +333,7 @@ def test_launch_lines_quote_paths_with_spaces(tmp_path: Path) -> None:
             assert line.count('"') >= 2, line
 
 
-def test_bare_slug_expands_to_https_clone_url(
+def test_bare_slug_expands_via_gh_protocol(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake_runner(monkeypatch)
@@ -347,17 +354,17 @@ def test_bare_slug_expands_to_https_clone_url(
         ("bob", "https://github.com/test-org/test-repo.git"),
         ("charlie", "https://github.com/test-org/test-repo.git"),
     ]
+    ssh_dir = (tmp_path / "ssh-run").resolve()
+    fake_runner(monkeypatch, git_protocol="ssh")
+    ssh_manifest = PREPARE_RUN.prepare(
+        "test-org/test-repo", ssh_dir, skip_github_checks=True
+    )
+    assert ssh_manifest["clone_repository"] == "git@github.com:test-org/test-repo.git"
 
 
 @pytest.mark.parametrize(
     "repository,slug,expected",
     [
-        ("test-org/test-repo", "test-org/test-repo", "https://github.com/test-org/test-repo.git"),
-        (
-            "test-org/test-repo.git",
-            "test-org/test-repo",
-            "https://github.com/test-org/test-repo.git",
-        ),
         (
             "git@github.com:test-org/test-repo.git",
             "test-org/test-repo",
@@ -370,8 +377,87 @@ def test_bare_slug_expands_to_https_clone_url(
         ),
     ],
 )
-def test_clone_source_derivation(repository: str, slug: str, expected: str) -> None:
+def test_clone_source_passes_through_urls(repository: str, slug: str, expected: str) -> None:
     assert PREPARE_RUN.clone_source(repository, slug) == expected
+
+
+def test_clone_source_passes_through_local_paths(tmp_path: Path) -> None:
+    local = tmp_path / "local"
+    local.mkdir()
+    assert PREPARE_RUN.clone_source(str(local), None) == str(local)
+
+
+@pytest.mark.parametrize(
+    "protocol,expected",
+    [
+        ("https", "https://github.com/test-org/test-repo.git"),
+        ("ssh", "git@github.com:test-org/test-repo.git"),
+        ("", "https://github.com/test-org/test-repo.git"),
+    ],
+)
+def test_slug_clone_url_honors_gh_protocol(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, expected: str
+) -> None:
+    fake_runner(monkeypatch, git_protocol=protocol)
+    assert RUN_COMMON.slug_clone_url("test-org/test-repo") == expected
+    assert PREPARE_RUN.clone_source("test-org/test-repo", "test-org/test-repo") == expected
+
+
+def test_slug_clone_url_falls_back_without_gh(monkeypatch: pytest.MonkeyPatch) -> None:
+    def runner(*args: Any, **kwargs: Any) -> str:
+        raise OSError("no gh on PATH")
+
+    monkeypatch.setattr(RUN_COMMON, "run", runner)
+    assert RUN_COMMON.slug_clone_url("test-org/test-repo") == (
+        "https://github.com/test-org/test-repo.git"
+    )
+
+
+def test_codex_login_status_skips_warning_preamble(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        PREPARE_RUN,
+        "run_output",
+        lambda *args, **kwargs: ("", "WARNING: proceeding anyway\nLogged in using ChatGPT\n"),
+    )
+    assert PREPARE_RUN.codex_login_status(Path("/tmp/home")) == "Logged in using ChatGPT"
+
+
+def test_bootstrap_failure_message_keeps_tail_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "bootstrap-workspace.py", line 1, in <module>\n'
+        "    subprocess.run(...)\n"
+        "Cloning into 'x'...\n"
+        "fatal: could not read Username for 'https://github.com': No such device\n"
+    )
+
+    def runner(*args: Any, **kwargs: Any) -> str:
+        raise subprocess.CalledProcessError(1, list(args), output="", stderr=stderr)
+
+    monkeypatch.setattr(RUN_COMMON, "run", runner)
+    with pytest.raises(ValueError, match="could not read Username") as exc:
+        PREPARE_RUN.bootstrap_clone("bob", tmp_path / "bob", "test-org/test-repo")
+    assert "Traceback" not in str(exc.value)
+    assert "subprocess.py" not in str(exc.value)
+
+
+def test_failed_bootstrap_leaves_no_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_runner(monkeypatch)
+
+    def failing_bootstrap(agent: str, destination: Path, repository: str) -> dict[str, str]:
+        raise ValueError("boom")
+
+    monkeypatch.setattr(PREPARE_RUN, "bootstrap_clone", failing_bootstrap)
+    run_dir = (tmp_path / "run").resolve()
+    with pytest.raises(ValueError, match="boom"):
+        PREPARE_RUN.prepare(
+            str((tmp_path / "origin").resolve()), run_dir, skip_github_checks=True
+        )
+    assert not (run_dir / "hub-state" / "token").exists()
 
 
 def test_both_codex_workers_report_each_login(

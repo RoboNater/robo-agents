@@ -130,9 +130,13 @@ def codex_login_status(home: Path) -> str:
         )
     except (OSError, subprocess.CalledProcessError):
         return "not logged in (codex login status failed)"
-    # Codex CLI prints its status line to stderr on some platforms (exit 0).
+    # Codex CLI prints its status line to stderr on some platforms (exit 0),
+    # possibly after WARNING preamble lines; prefer the first non-warning line.
     output = stdout or stderr
-    return output.splitlines()[0] if output else "logged in (empty status)"
+    candidates = [line for line in output.splitlines() if line.strip()]
+    preferred = [line for line in candidates if not line.lstrip().startswith("WARNING:")]
+    line = (preferred or candidates or [""])[0]
+    return line if line else "logged in (empty status)"
 
 
 def render_alice_prompt(
@@ -353,11 +357,12 @@ def prepare(
                 "run directory already prepared for another repository; use a fresh one"
             )
 
-    token = ensure_token(resolved_state / "token")
+    # Bootstrap before minting the token so a failed clone leaves no state behind.
     workspaces = {
         "bob": bootstrap_clone("bob", bob_path, clone_from),
         "charlie": bootstrap_clone("charlie", charlie_path, clone_from),
     }
+    token = ensure_token(resolved_state / "token")
     if workspaces["bob"]["workspace_id"] == workspaces["charlie"]["workspace_id"]:
         raise ValueError("bob and charlie must have distinct workspace IDs")
     # Keep the drive-letter case bootstrap printed; read_identity compares the string.

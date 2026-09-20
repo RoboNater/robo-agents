@@ -212,9 +212,18 @@ def bootstrap_clone(agent: str, destination: Path, repository: str) -> dict[str,
         )
     except subprocess.CalledProcessError as exc:
         detail = ((exc.stderr or "") + "\n" + (exc.stdout or "")).strip()
+        # The child (e.g. an uncaught git failure) may dump a full traceback;
+        # drop its frame lines so only the actionable lines survive, no stack.
+        nonempty = [line for line in detail.splitlines() if line.strip()]
+        substantive = [
+            line
+            for line in nonempty
+            if line != "Traceback (most recent call last):" and not line.startswith("  ")
+        ]
+        tail = "\n".join((substantive or nonempty)[-3:])
         raise ValueError(
             f"bootstrap failed for {agent} at {destination}"
-            + (f": {detail}" if detail else "")
+            + (f": {tail}" if tail else "")
         ) from exc
     value = json.loads(raw)
     if not isinstance(value, dict):
@@ -271,17 +280,35 @@ def parse_github_slug(repository: str) -> str | None:
     return f"{parts[0]}/{parts[1]}"
 
 
+def slug_clone_url(slug: str) -> str:
+    """Clone URL for a bare ``owner/repo`` slug honoring gh's protocol.
+
+    ``gh`` is already a hard dependency of the run preparation path, so ask it
+    which protocol it uses for github.com: an ssh-configured ``gh`` has no
+    https credential helper and cannot clone the https URL. Anything
+    unexpected (no ``gh``, no configured protocol) falls back to https.
+    """
+    try:
+        protocol = run("gh", "config", "get", "-h", "github.com", "git_protocol")
+    except (OSError, subprocess.CalledProcessError):
+        protocol = ""
+    if protocol.strip().lower() == "ssh":
+        return f"git@github.com:{slug}.git"
+    return f"https://github.com/{slug}.git"
+
+
 def clone_source(repository: str, slug: str | None) -> str:
     """Return a cloneable source for a repository argument.
 
     A bare ``owner/repo`` slug (or ``slug.git`` spelling) passes the ``gh``
-    preflight checks but is not a valid ``git clone`` argument, so expand it to
-    its https URL. Anything already URL-shaped (``://``, ``git@``) or an
-    existing local path passes through for bootstrap-workspace.py to validate.
+    preflight checks but is not a valid ``git clone`` argument, so expand it
+    via :func:`slug_clone_url`. Anything already URL-shaped (``://``,
+    ``git@``) or an existing local path passes through for
+    bootstrap-workspace.py to validate.
     """
     if slug is None:
         return repository
     text = repository.strip()
     if "://" in text or text.startswith("git@") or Path(text).exists():
         return repository
-    return f"https://github.com/{slug}.git"
+    return slug_clone_url(slug)
