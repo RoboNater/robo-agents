@@ -27,7 +27,9 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
-from step6 import executable, load_manifest, topology
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_common import executable
+from step6 import load_manifest, topology
 
 HUB = "http://127.0.0.1:8420"
 ALICE_CONTINUE = (

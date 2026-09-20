@@ -14,24 +14,27 @@ import os
 import re
 import secrets
 import shlex
-import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_common import (
+    TOOLS,
+    codex_home,
+    codex_mcp,
+    codex_sandbox,
+    link_or_copy,
+    run,
+    save,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 SANDBOX = "RoboNater/robo-agents-sandbox"
-TOOLS = [
-    "check_in",
-    "get_role_guide",
-    "await_assignment",
-    "report_progress",
-    "ask_alice",
-    "submit_result",
-]
 
 
 # Default topology: Claude Alice/Bob and Codex Charlie. Launch-time overrides
@@ -40,22 +43,6 @@ HARNESSES = {"alice": ("claude-code", "codex"), "charlie": ("codex", "opencode")
 PROVIDERS = {"claude-code": "anthropic", "codex": "openai"}
 DEFAULT_MODELS = {"claude-code": "claude-sonnet-5", "codex": "gpt-5.6-sol"}
 VERSION_COMMANDS = {"claude-code": "claude", "codex": "codex", "opencode": "opencode"}
-
-
-def executable(name):
-    """Resolve PATHEXT shims (npm .cmd, pyenv .bat) that CreateProcess cannot find alone."""
-    return shutil.which(name) or name
-
-
-def run(*args, cwd=None):
-    return subprocess.run(
-        [executable(args[0]), *args[1:]],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
 
 
 def topology(manifest):
@@ -98,28 +85,8 @@ def within(path, directory):
     return path == directory or path.startswith(directory.rstrip(os.sep) + os.sep)
 
 
-def link_or_copy(source, destination):
-    """Expose a checked-in directory; unprivileged Windows accounts cannot symlink."""
-    if destination.exists():
-        return
-    try:
-        destination.symlink_to(source, target_is_directory=True)
-    except OSError:
-        shutil.copytree(source, destination)
-
-
 def gh(*args):
     return json.loads(run("gh", *args))
-
-
-def save(path, value):
-    """Atomic private checkpoint; all generated run artifacts remain untracked."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        os.chmod(temporary, 0o600)
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-    temporary.replace(path)
 
 
 def load_manifest(directory):
@@ -491,48 +458,6 @@ OPENCODE_BASH = [
     "diff *",
     "echo *",
 ]
-
-
-def codex_home(directory, name):
-    """Run-local CODEX_HOME that reuses login without copying it into a second file."""
-    home = directory / name
-    home.mkdir(exist_ok=True, mode=0o700)
-    auth = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
-    if auth.exists() and not (home / "auth.json").exists():
-        try:
-            (home / "auth.json").symlink_to(auth)
-        except OSError:
-            # Hard link: no extra copy of the credential and no symlink privilege.
-            try:
-                os.link(auth, home / "auth.json")
-            except OSError as exc:
-                raise ValueError(
-                    f"cannot link {auth} into {home}; hard links need the same volume, "
-                    "so place RUN_DIR on the drive holding CODEX_HOME"
-                ) from exc
-    return home
-
-
-def codex_mcp(command, args, env, tools, timeout):
-    config = f'[mcp_servers.hub]\ncommand = "{command}"\n'
-    config += "args = " + json.dumps(args) + "\n"
-    config += f"startup_timeout_sec = 120\ntool_timeout_sec = {timeout}\n"
-    config += "enabled_tools = " + json.dumps(tools) + "\n"
-    config += (
-        "env = { "
-        + ", ".join(key + " = " + json.dumps(value) for key, value in env.items())
-        + " }\n"
-    )
-    for tool in tools:
-        config += f'\n[mcp_servers.hub.tools.{tool}]\napproval_mode = "approve"\n'
-    return config
-
-
-def codex_sandbox():
-    config = 'sandbox_mode = "workspace-write"\n'
-    if os.name == "nt":
-        config += '[windows]\nsandbox = "unelevated"\n'
-    return config + "[sandbox_workspace_write]\nnetwork_access = true\n"
 
 
 def render(directory, manifest, scenario):
