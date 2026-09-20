@@ -64,6 +64,28 @@ def run(*args: Any, cwd: Path | str | None = None, env: dict[str, str] | None = 
     ).stdout.strip()
 
 
+def run_output(
+    *args: Any, cwd: Path | str | None = None, env: dict[str, str] | None = None
+) -> tuple[str, str]:
+    """Run a subprocess, returning stripped (stdout, stderr); raises on failure.
+
+    Some CLIs report status on stderr with exit code 0 (e.g. ``codex login
+    status`` on Windows), so callers that need the human-readable status use
+    this instead of :func:`run`.
+    """
+    merged = None if env is None else {**os.environ, **env}
+    proc = subprocess.run(
+        [executable(str(args[0])), *[str(arg) for arg in args[1:]]],
+        cwd=cwd,
+        env=merged,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return proc.stdout.strip(), proc.stderr.strip()
+
+
 def save(path: Path, value: Any) -> None:
     """Atomic private checkpoint; all generated run artifacts remain untracked."""
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -247,3 +269,19 @@ def parse_github_slug(repository: str) -> str | None:
     if len(parts) != 2 or not all(parts):
         return None
     return f"{parts[0]}/{parts[1]}"
+
+
+def clone_source(repository: str, slug: str | None) -> str:
+    """Return a cloneable source for a repository argument.
+
+    A bare ``owner/repo`` slug (or ``slug.git`` spelling) passes the ``gh``
+    preflight checks but is not a valid ``git clone`` argument, so expand it to
+    its https URL. Anything already URL-shaped (``://``, ``git@``) or an
+    existing local path passes through for bootstrap-workspace.py to validate.
+    """
+    if slug is None:
+        return repository
+    text = repository.strip()
+    if "://" in text or text.startswith("git@") or Path(text).exists():
+        return repository
+    return f"https://github.com/{slug}.git"

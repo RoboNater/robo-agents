@@ -13,12 +13,16 @@ Example:
         --repository git@github.com:your-org/your-repo.git \\
         --run-dir /absolute/path/to/my-run \\
         --issue 42 --account your-github-username
+
+Supported worker harnesses are ``claude-code`` and ``codex`` (the paste-ready
+pair); anything else fails up front with an actionable message.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,20 +34,28 @@ from run_common import (  # noqa: E402
     ROOT,
     VERSION_COMMANDS,
     bootstrap_clone,
+    clone_source,
     codex_home,
     ensure_token,
+    link_or_copy,
     parse_github_slug,
     parse_harness_version,
     render_claude_mcp,
     render_codex_config,
     render_worker_prompt,
     run,
+    run_output,
     save,
     write_private_text,
 )
 
 DEFAULT_BOB_HARNESS = "claude-code"
 DEFAULT_CHARLIE_HARNESS = "codex"
+#: Worker harnesses prepare-run can render configs *and* print verified
+#: paste-ready launch lines for. opencode needs its serve/attach supervisor
+#: loop and gemini CLI flags are unverified, so those topologies stay on the
+#: manual walkthrough in docs/user-guide.md.
+SUPPORTED_HARNESSES = ("claude-code", "codex")
 
 
 def worker_env(
@@ -113,9 +125,13 @@ def repo_has_workflows(slug: str) -> bool:
 
 def codex_login_status(home: Path) -> str:
     try:
-        output = run("codex", "login", "status", env={"CODEX_HOME": str(home)})
+        stdout, stderr = run_output(
+            "codex", "login", "status", env={"CODEX_HOME": str(home)}
+        )
     except (OSError, subprocess.CalledProcessError):
         return "not logged in (codex login status failed)"
+    # Codex CLI prints its status line to stderr on some platforms (exit 0).
+    output = stdout or stderr
     return output.splitlines()[0] if output else "logged in (empty status)"
 
 
@@ -153,42 +169,57 @@ def render_alice_prompt(
     return prompt
 
 
+def codex_launch(home: Path, git_dir: Path, prompt: Path) -> list[str]:
+    """Paste-ready ``codex exec`` lines for the current platform.
+
+    The ``VAR=value cmd ... < file`` prefix and ``<`` redirection are POSIX
+    shell syntax; PowerShell needs ``$env:`` assignments and pipes the prompt
+    through ``Get-Content`` instead.
+    """
+    if os.name == "nt":
+        return [
+            f'$env:CODEX_HOME = "{home}"',
+            f'Get-Content -Raw "{prompt}" | codex exec --ephemeral -C . '
+            f'--add-dir "{git_dir}" --approve-for-me -',
+        ]
+    return [
+        f'CODEX_HOME="{home}" codex exec --ephemeral -C . '
+        f'--add-dir "{git_dir}" --approve-for-me - < "{prompt}"',
+    ]
+
+
 def launch_lines(
     run_dir: Path,
     configs: Path,
+    alice_runtime: Path,
     bob_dir: Path,
     charlie_dir: Path,
     bob_harness: str,
     charlie_harness: str,
 ) -> list[str]:
+    """Paste-ready launch commands, one block per agent; paths are quoted."""
     lines = [
-        f"cd {run_dir}",
-        f"claude --strict-mcp-config --mcp-config {configs / 'alice.mcp.json'}",
+        f'cd "{alice_runtime}"',
+        f'claude --strict-mcp-config --mcp-config "{configs / "alice.mcp.json"}"',
         "",
-        f"cd {bob_dir}",
+        f'cd "{bob_dir}"',
     ]
     if bob_harness == "codex":
-        lines.append(
-            f"CODEX_HOME={configs / 'bob-codex'} codex exec --ephemeral -C . "
-            f"--add-dir \"{bob_dir / '.git'}\" --approve-for-me - "
-            f"< {run_dir / 'bob.prompt.md'}"
+        lines += codex_launch(
+            configs / "bob-codex", bob_dir / ".git", run_dir / "bob.prompt.md"
         )
     else:
         lines.append(
-            f"claude --strict-mcp-config --mcp-config {configs / 'bob.mcp.json'}"
+            f'claude --strict-mcp-config --mcp-config "{configs / "bob.mcp.json"}"'
         )
-    lines += ["", f"cd {charlie_dir}"]
+    lines += ["", f'cd "{charlie_dir}"']
     if charlie_harness == "codex":
-        lines.append(
-            f"CODEX_HOME={configs / 'codex'} codex exec --ephemeral -C . "
-            f"--add-dir \"{charlie_dir / '.git'}\" --approve-for-me - "
-            f"< {run_dir / 'charlie.prompt.md'}"
+        lines += codex_launch(
+            configs / "codex", charlie_dir / ".git", run_dir / "charlie.prompt.md"
         )
-    elif charlie_harness == "opencode":
-        lines.append(f"# opencode with OPENCODE_CONFIG={configs / 'charlie.opencode.json'}")
     else:
         lines.append(
-            f"claude --strict-mcp-config --mcp-config {configs / 'charlie.mcp.json'}"
+            f'claude --strict-mcp-config --mcp-config "{configs / "charlie.mcp.json"}"'
         )
     return lines
 
@@ -221,10 +252,12 @@ def prepare(
     if not repository:
         raise ValueError("--repository must not be empty")
     for label, harness in (("bob", bob_harness), ("charlie", charlie_harness)):
-        if harness not in VERSION_COMMANDS:
+        if harness not in SUPPORTED_HARNESSES:
             raise ValueError(
-                f"unknown --{label} harness {harness!r}; "
-                f"expected one of {sorted(VERSION_COMMANDS)}"
+                f"--{label} harness {harness!r} is not yet supported by prepare-run; "
+                f"expected one of {list(SUPPORTED_HARNESSES)} "
+                "(assemble other topologies via the manual walkthrough in "
+                "docs/user-guide.md)"
             )
     if merge_method not in ("squash", "merge", "rebase"):
         raise ValueError("--merge-method must be one of squash, merge, rebase")
@@ -232,15 +265,9 @@ def prepare(
         raise ValueError("--allow-no-ci must be one of auto, true, false")
 
     providers = {
-        "bob": bob_provider or PROVIDERS.get(bob_harness, ""),
-        "charlie": charlie_provider or PROVIDERS.get(charlie_harness, ""),
+        "bob": bob_provider or PROVIDERS[bob_harness],
+        "charlie": charlie_provider or PROVIDERS[charlie_harness],
     }
-    for name in ("bob", "charlie"):
-        harness = bob_harness if name == "bob" else charlie_harness
-        if not providers[name]:
-            raise ValueError(
-                f"--{name}-provider is required for the {harness!r} harness"
-            )
 
     bob_path = bob_dir or (run_dir / "bob")
     charlie_path = charlie_dir or (run_dir / "charlie")
@@ -269,6 +296,9 @@ def prepare(
         parsed_versions[harness] = parse_harness_version(harness, output)
 
     slug = parse_github_slug(repository)
+    # A bare owner/repo slug passes the gh checks below but is not a valid
+    # `git clone` argument; expand it to its https URL for bootstrapping.
+    clone_from = clone_source(repository, slug)
     if slug is None and not skip_github_checks:
         # Local paths (e.g. disposable test origins) have no GitHub API surface.
         skip_github_checks = True
@@ -325,8 +355,8 @@ def prepare(
 
     token = ensure_token(resolved_state / "token")
     workspaces = {
-        "bob": bootstrap_clone("bob", bob_path, repository),
-        "charlie": bootstrap_clone("charlie", charlie_path, repository),
+        "bob": bootstrap_clone("bob", bob_path, clone_from),
+        "charlie": bootstrap_clone("charlie", charlie_path, clone_from),
     }
     if workspaces["bob"]["workspace_id"] == workspaces["charlie"]["workspace_id"]:
         raise ValueError("bob and charlie must have distinct workspace IDs")
@@ -363,45 +393,6 @@ def prepare(
             worker_args = ["run", "--locked", "--directory", str(ROOT), "worker-mcp"]
             write_private_text(home / "config.toml", render_codex_config(env, worker_args))
             rendered_configs[name] = str(home / "config.toml")
-        elif harness == "opencode":
-            save(
-                configs / f"{name}.opencode.json",
-                {
-                    "$schema": "https://opencode.ai/config.json",
-                    "model": models[name],
-                    "share": "disabled",
-                    "autoupdate": False,
-                    "mcp": {
-                        "hub": {
-                            "type": "local",
-                            "command": [
-                                "uv",
-                                "run",
-                                "--locked",
-                                "--directory",
-                                str(ROOT),
-                                "worker-mcp",
-                            ],
-                            "environment": env,
-                            "enabled": True,
-                            "timeout": 330000,
-                        }
-                    },
-                },
-            )
-            rendered_configs[name] = str(configs / f"{name}.opencode.json")
-        elif harness == "gemini":
-            template = json.loads(
-                (ROOT / "runtimes/gemini.settings.json").read_text(encoding="utf-8")
-            )
-            template["mcpServers"]["hub"].update(
-                {
-                    "args": ["run", "--locked", "--directory", str(ROOT), "worker-mcp"],
-                    "env": env,
-                }
-            )
-            save(configs / f"{name}.mcp.json", template)
-            rendered_configs[name] = str(configs / f"{name}.mcp.json")
         else:
             save(configs / f"{name}.mcp.json", render_claude_mcp(env))
             rendered_configs[name] = str(configs / f"{name}.mcp.json")
@@ -419,6 +410,16 @@ def prepare(
         {"mcpServers": {"hub": {"command": "uv", "args": hub_args, "env": hub_env}}},
     )
 
+    # Alice's working directory, kept apart from the worker clones and the
+    # token: the orchestrator skill is linked in run-locally (as in step6), so
+    # the quickstart needs no user-wide skill installation.
+    alice_runtime = run_dir / "alice-runtime"
+    (alice_runtime / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
+    link_or_copy(
+        ROOT / "skills/alice-orchestrator",
+        alice_runtime / ".claude" / "skills" / "alice-orchestrator",
+    )
+
     for name in ("bob", "charlie"):
         (run_dir / f"{name}.prompt.md").write_text(
             render_worker_prompt(name), encoding="utf-8"
@@ -430,6 +431,8 @@ def prepare(
         "allow_no_ci": policy_allow_no_ci,
         "role_policy": {
             "reviewer_harness_differs": bob_harness != charlie_harness,
+            # Baseline from prompts/alice.md; Alice still observes any real
+            # provider difference at pairing time via check-in profiles.
             "reviewer_provider_differs": False,
             "implementer_capabilities": capabilities["bob"].split(",")
             if capabilities["bob"]
@@ -449,6 +452,7 @@ def prepare(
     manifest = {
         "schema_version": 1,
         "repository": repository,
+        "clone_repository": clone_from,
         "slug": slug,
         "run_dir": str(run_dir),
         "state_dir": str(resolved_state),
@@ -465,11 +469,13 @@ def prepare(
     }
     save(manifest_path, manifest)
 
-    codex_report = "no codex worker in this topology"
+    codex_auth: dict[str, str] = {}
     for name in ("bob", "charlie"):
         if harnesses[name] == "codex":
             home_name = "codex" if name == "charlie" else "bob-codex"
-            codex_report = f"{home_name}: {codex_login_status(configs / home_name)}"
+            codex_auth[name] = f"{home_name}: {codex_login_status(configs / home_name)}"
+    if not codex_auth:
+        codex_auth = {"codex": "no codex worker in this topology"}
 
     print(
         json.dumps(
@@ -490,7 +496,7 @@ def prepare(
                     "versions": versions,
                     "merge": merge_note,
                     "ci": ci_note,
-                    "codex_auth": codex_report,
+                    "codex_auth": codex_auth,
                 },
             },
             indent=2,
@@ -499,7 +505,13 @@ def prepare(
     )
     print("\nLaunch commands (paste in order):")
     for line in launch_lines(
-        run_dir, configs, Path(bob_workspace), Path(charlie_workspace), bob_harness, charlie_harness
+        run_dir,
+        configs,
+        alice_runtime,
+        Path(bob_workspace),
+        Path(charlie_workspace),
+        bob_harness,
+        charlie_harness,
     ):
         print(line if line else "")
     print(f"\nAlice kickoff prompt: {run_dir / 'alice.prompt.md'}")
@@ -530,27 +542,30 @@ def main() -> None:
     parser.add_argument("--skip-github-checks", action="store_true")
     parser.add_argument("--public-url", default="http://127.0.0.1:8420")
     args = parser.parse_args()
-    prepare(
-        args.repository,
-        args.run_dir,
-        args.issue,
-        args.account,
-        args.bob,
-        args.charlie,
-        args.bob_model,
-        args.charlie_model,
-        args.bob_provider,
-        args.charlie_provider,
-        args.bob_capabilities,
-        args.charlie_capabilities,
-        args.bob_dir,
-        args.charlie_dir,
-        args.state_dir,
-        args.merge_method,
-        args.allow_no_ci,
-        args.skip_github_checks,
-        args.public_url,
-    )
+    try:
+        prepare(
+            args.repository,
+            args.run_dir,
+            args.issue,
+            args.account,
+            args.bob,
+            args.charlie,
+            args.bob_model,
+            args.charlie_model,
+            args.bob_provider,
+            args.charlie_provider,
+            args.bob_capabilities,
+            args.charlie_capabilities,
+            args.bob_dir,
+            args.charlie_dir,
+            args.state_dir,
+            args.merge_method,
+            args.allow_no_ci,
+            args.skip_github_checks,
+            args.public_url,
+        )
+    except ValueError as exc:
+        sys.exit(f"prepare-run: error: {exc}")
 
 
 if __name__ == "__main__":

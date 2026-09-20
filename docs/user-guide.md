@@ -78,13 +78,19 @@ To keep credentials, MCP configurations, and worker clones cleanly separated, cr
 ├── hub-state/               # HUB_STATE_DIR (SQLite database hub.db and token)
 ├── configs/
 │   ├── alice.mcp.json       # Alice's stdio hub MCP configuration
-│   ├── bob.mcp.json         # Bob's worker-mcp configuration
-│   └── codex/               # Charlie's CODEX_HOME
+│   ├── bob.mcp.json         # Bob's worker-mcp configuration (claude-code harness)
+│   └── codex/               # Charlie's CODEX_HOME (codex harness)
 │       ├── config.toml      # Charlie's Codex MCP and sandbox configuration
 │       └── auth.json        # Linked authentication credentials
-├── bob.prompt.md            # Bob's rendered launch prompt (if supervised)
-├── bob-telemetry.jsonl      # Bob's worker telemetry log (if supervised)
-└── charlie.prompt.md        # Charlie's rendered launch prompt
+├── alice-runtime/           # Alice's working directory
+│   └── .claude/skills/alice-orchestrator/  # Linked orchestrator skill
+├── bob/                     # Bob's clone (default --bob-dir)
+├── charlie/                 # Charlie's clone (default --charlie-dir)
+├── alice.prompt.md          # Alice's rendered kickoff prompt
+├── bob.prompt.md            # Bob's rendered launch prompt
+├── bob-telemetry.jsonl      # Bob's worker telemetry log
+├── charlie.prompt.md        # Charlie's rendered launch prompt
+└── run.json                 # Preparation manifest (workspaces, versions, policy)
 ```
 
 ---
@@ -101,12 +107,13 @@ uv run --locked python scripts/prepare-run.py \
   --issue 42 --account your-github-username
 ```
 
-It produces the layout above (plus `alice.prompt.md`, `run.json`, and
-`hub-state/token`), sharing its rendering code with the Step 6 demo so the two
-paths cannot drift. Specifically it:
+It produces the layout above, sharing its rendering code with the Step 6 demo so
+the two paths cannot drift. Supported worker harnesses are `claude-code` and
+`codex` (the paste-ready pair). Specifically it:
 
 1. Bootstraps the `bob` and `charlie` clones via `scripts/bootstrap-workspace.py`,
-   never touching an existing clone.
+   never touching an existing clone. `--repository` accepts a clone URL or a
+   bare `owner/repo` slug, which is expanded to its https clone URL.
 2. Creates `hub-state/` and generates `hub-state/token`, reusing an existing token.
 3. Renders `configs/alice.mcp.json`, `configs/bob.mcp.json`, and
    `configs/codex/config.toml` from the `runtimes/` templates, with paths, token,
@@ -117,17 +124,20 @@ paths cannot drift. Specifically it:
 4. Links `~/.codex/auth.json` into the run-local `CODEX_HOME` and reports whether
    that home is authenticated (`codex login status`).
 5. Renders `bob.prompt.md` / `charlie.prompt.md` from `prompts/worker.md` with
-   `$AGENT_NAME` substituted.
+   `$AGENT_NAME` substituted, and links the `alice-orchestrator` skill into
+   `alice-runtime/.claude/skills/` so Alice needs no user-wide skill install.
 6. Checks `gh auth status`, each harness's `--version`, whether the repository
    allows `--merge-method` (default `squash`), and whether it has CI workflows
-   (which decides `allow_no_ci` when `--allow-no-ci auto`).
+   (which decides `allow_no_ci` when `--allow-no-ci auto`). Failures exit as a
+   one-line `prepare-run: error: ...` message, not a traceback.
 7. Prints the three launch commands below plus the Alice kickoff prompt
    (`alice.prompt.md`) with the issue and account filled in.
 
-Then paste the three commands it prints:
+Then paste the three commands it prints (Linux / macOS shown; Windows
+PowerShell equivalent for the Codex line follows):
 
 ```sh
-cd /absolute/path/to/my-run
+cd /absolute/path/to/my-run/alice-runtime
 claude --strict-mcp-config --mcp-config /absolute/path/to/my-run/configs/alice.mcp.json
 
 cd /absolute/path/to/my-run/bob
@@ -137,6 +147,14 @@ cd /absolute/path/to/my-run/charlie
 CODEX_HOME=/absolute/path/to/my-run/configs/codex codex exec --ephemeral -C . \
   --add-dir "/absolute/path/to/my-run/charlie/.git" --approve-for-me - \
   < /absolute/path/to/my-run/charlie.prompt.md
+```
+
+On Windows PowerShell, the Codex launch is instead:
+
+```powershell
+cd C:\my-run\charlie
+$env:CODEX_HOME = "C:\my-run\configs\codex"
+Get-Content -Raw C:\my-run\charlie.prompt.md | codex exec --ephemeral -C . --add-dir "C:\my-run\charlie\.git" --approve-for-me -
 ```
 
 Harness choice is a flag (`--bob claude-code --charlie codex`, the default mixed
