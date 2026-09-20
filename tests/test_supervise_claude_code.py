@@ -82,6 +82,8 @@ done
     messages = input_log.read_text(encoding="utf-8").splitlines()
     assert len(messages) == 2
     prompts = [json.loads(message)["message"]["content"][0]["text"] for message in messages]
-    assert prompts[0] == "You are bob.\r\nUse\tTabs.\r\n"
+    # Command substitution strips the file's trailing newline, but every other
+    # byte (CR, TAB, quotes) must survive the stream-json round trip exactly.
+    assert prompts[0] == "You are bob.\r\nUse\tTabs.\r"
     assert "Continue the unattended worker loop" in prompts[1]
     assert "path/URL" in prompts[1]
