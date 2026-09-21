@@ -191,7 +191,7 @@ def test_alice_skill_documents_resume_and_redelivery_guards() -> None:
     )
 
     for title_form in (
-        "IMPLEMENT for <issue owner/repository#number>",
+        "IMPLEMENT for <work label>",
         "REVIEW for <source task id> @ <head sha7> [findings r<number>-]",
         "ADDRESS for <review task id>",
         "NONBLOCKING for <review task id>",
@@ -204,6 +204,36 @@ def test_alice_skill_documents_resume_and_redelivery_guards() -> None:
         "ROADMAP-CORRECTION for <close-out task id>",
     ):
         assert f"`{title_form}`" in skill
+
+
+
+def test_alice_skill_takes_a_statement_of_work() -> None:
+    """A goal naming two issues landing in one PR closes both of them (#101)."""
+    skill = read("skills/alice-orchestrator/SKILL.md")
+    kickoff = section(skill, "## KICKOFF and PLAN", "## Choose the worker pair")
+    assert_fragments(
+        kickoff,
+        (
+            "The goal is a statement of work",
+            "Read every issue the statement names",
+            "acceptance criteria from the statement text, those issues",
+            "or any named issue may touch",
+            "`work-label:<label>`",
+            "ask the operator to split it into one run per PR",
+            "Repeat the `Closes` line once per issue the statement names",
+            "omit it when the statement names none",
+            "gives both `Closes acme/app#7` and `Closes acme/app#9`",
+        ),
+    )
+    wrap_up = section(skill, "## WRAP-UP", "Ack the final processed event")
+    assert_fragments(wrap_up, ("listing every issue the statement names and every PR",))
+
+    prompt = read("prompts/alice.md")
+    durable_goal = section(prompt, "Goal:", "GitHub comment identity account:")
+    assert_fragments(
+        durable_goal,
+        ("replace that sentence with the statement text itself", "one run per pull request"),
+    )
 
 
 def test_decision_comments_reference_the_governing_spec_and_issues() -> None:
