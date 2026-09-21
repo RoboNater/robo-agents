@@ -52,7 +52,7 @@ def create_mcp(store: HubStore, gate: MergeGate | None = None) -> FastMCP:
 
     @server.tool()
     async def wait_for_event(
-        timeout_s: Timeout = 120, ack: str | None = None
+        timeout_s: Timeout = 100, ack: str | None = None
     ) -> dict[str, Any]:
         """Wait for and lease the oldest event. On event=null, call again.
 

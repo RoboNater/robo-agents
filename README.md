@@ -86,7 +86,8 @@ refused so a later prompt cannot silently replace the durable rails. Worker
 check-in may happen before initialization, but task assignment and workflow
 status changes may not.
 `wait_for_event` leases the oldest eligible event, waits up to 120 seconds
-(default 120), and returns `{"event": null}` on timeout; call again.
+(default 100, under Claude Code's 120 s backgrounding threshold), and returns
+`{"event": null}` on timeout; call again.
 Zero seconds performs a nonblocking check. If your runtime uses a shorter tool
 timeout, request a shorter hold or configure the client timeout above 120 seconds.
 Delivery leases default to 10 minutes (`HUB_EVENT_LEASE_S=600`). Pass the

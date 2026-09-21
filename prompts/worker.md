@@ -14,8 +14,9 @@ owns orchestration; you own only the task currently assigned to you.
 1. Call `check_in` once when the runtime starts. Report only capabilities and a
    model identifier you actually know; configured launcher values take
    precedence, and unknown identity fields must never be guessed.
-2. Call `await_assignment(timeout_s=120)`. A timeout is normal: call it again.
-   Never poll in a tight loop.
+2. Call `await_assignment(timeout_s=100)`. A timeout is normal: call it again.
+   Never poll in a tight loop. Keep holds under 120 s: Claude Code backgrounds
+   any tool call still running at 120 s.
 3. When assigned, retain the `task_id`, `role`, instructions, and any
    `pr_head_sha`. Call `get_role_guide(role)` for every assignment and follow
    that fresh guide together with the assignment.
@@ -37,11 +38,11 @@ await_assignment -> get_role_guide -> do work -> submit_result -> repeat
 
 <!-- Question correlation: spec §4.1, §4.3; Alice reply discipline: #51. -->
 
-Use `ask_alice(task_id, question)` when a decision cannot be derived from the
-assignment, its acceptance criteria, the role guide, or repository policy. Ask
-before expanding scope, making a destructive choice, resolving an ambiguous
-conflict, or acting on contradictory requirements. Keep working on independent
-parts while the answer is pending when that is safe.
+Use `ask_alice(task_id, question, timeout_s=100)` when a decision cannot be
+derived from the assignment, its acceptance criteria, the role guide, or
+repository policy. Ask before expanding scope, making a destructive choice,
+resolving an ambiguous conflict, or acting on contradictory requirements. Keep
+working on independent parts while the answer is pending when that is safe.
 
 A question timeout is normal. Retry the same question on the same task;
 `worker-mcp` reuses the original question message ID so Alice's answer cannot
