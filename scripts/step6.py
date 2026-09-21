@@ -89,6 +89,32 @@ def gh(*args):
     return json.loads(run("gh", *args))
 
 
+def extract_single_json_object(text):
+    """Extract exactly one top-level embedded JSON object from text.
+
+    Fails closed (returns None) if there is no JSON object, if the JSON is
+    malformed, or if multiple JSON objects or unmatched braces are present.
+    """
+    if not isinstance(text, str):
+        return None
+    start = text.find("{")
+    if start == -1:
+        return None
+    if "}" in text[:start]:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        obj, end = decoder.raw_decode(text, start)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    remaining = text[end:]
+    if "{" in remaining or "}" in remaining:
+        return None
+    return obj
+
+
 def load_manifest(directory):
     if not directory.is_absolute() or directory != directory.resolve():
         raise ValueError("RUN_DIR must be absolute and canonical")
@@ -1341,10 +1367,11 @@ def evaluate(manifest, snapshot, facts, traces):
         ("final", final_head),
     ):
         row = decisions.get("step6:gate:" + label)
-        try:
-            gate = json.loads(row["rationale"]) if row else {}
-        except ValueError:
-            gate = {}
+        gate = (
+            extract_single_json_object(row["rationale"])
+            if row and isinstance(row.get("rationale"), str)
+            else {}
+        ) or {}
         actual_calls = traces.get("alice", [])
         called = any(
             call["name"].endswith("check_merge_gate")
@@ -1675,10 +1702,12 @@ def evaluate(manifest, snapshot, facts, traces):
             ),
         )
     follow = decisions.get("step6:follow-ups")
-    try:
-        urls = json.loads(follow["rationale"])["urls"] if follow else None
-    except (ValueError, KeyError, TypeError):
-        urls = None
+    follow_payload = (
+        extract_single_json_object(follow["rationale"])
+        if follow and isinstance(follow.get("rationale"), str)
+        else None
+    )
+    urls = follow_payload.get("urls") if isinstance(follow_payload, dict) else None
     require(
         "follow_ups_verified",
         isinstance(urls, list)
@@ -1783,7 +1812,16 @@ def collect(directory):
     )
     try:
         # A malformed record fails follow_ups_verified in evaluate(); never crash collection.
-        follow_urls = json.loads(follow["rationale"])["urls"] if follow else []
+        follow_payload = (
+            extract_single_json_object(follow["rationale"])
+            if follow and isinstance(follow.get("rationale"), str)
+            else None
+        )
+        follow_urls = (
+            follow_payload["urls"]
+            if isinstance(follow_payload, dict) and isinstance(follow_payload.get("urls"), list)
+            else []
+        )
     except (ValueError, KeyError, TypeError):
         follow_urls = []
     if follow_urls:
