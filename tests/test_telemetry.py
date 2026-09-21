@@ -153,8 +153,42 @@ async def test_exchanges_are_charged_only_to_the_call_in_progress() -> None:
         finally:
             current_http_io.reset(token)
 
-    # One completed exchange after one retried 503: the bodies of the final attempt.
-    assert io == HttpIO(requests=1, request_bytes=7, response_bytes=7, status=200, retries=1)
+    # Both attempts crossed the wire: 7 + 7 bytes sent, a 4-byte 503 and a 7-byte 200 back.
+    assert io == HttpIO(requests=2, request_bytes=14, response_bytes=11, status=200, retries=1)
+
+
+async def test_a_retried_stream_and_a_transport_retry_are_charged() -> None:
+    sse = b'data: {"jsonrpc": "2.0", "id": "1", "result": {"ok": true}}\n\n'
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("refused", request=request)
+        if attempts == 2:
+            return httpx.Response(503, content=b"busy")
+        return httpx.Response(200, content=sse, headers={"content-type": "text/event-stream"})
+
+    settings = WorkerSettings(
+        hub_url="http://hub", token="t", agent_name="bob", backoff_factor_s=0.001
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://hub"
+    ) as http:
+        worker = WorkerHubClient(settings, http_client=http)
+        io = HttpIO()
+        token = current_http_io.set(io)
+        try:
+            assert await worker._stream_rpc("message/stream", {}, 1) == {"ok": True}
+        finally:
+            current_http_io.reset(token)
+
+    # The refused attempt left no response; the 503 and the stream both count.
+    assert io.requests == 2
+    assert io.retries == 2
+    assert io.response_bytes == len(b"busy") + len(sse)
+    assert io.status == 200
 
 
 def test_nothing_is_written_when_telemetry_is_off(

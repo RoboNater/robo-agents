@@ -24,7 +24,7 @@ from agent_hub_common import (
 )
 
 from .config import WorkerSettings
-from .telemetry import TelemetryLog, count_http_exchange
+from .telemetry import TelemetryLog, count_http_exchange, count_http_retry
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +210,7 @@ class WorkerHubClient:
                 )
                 if retryable:
                     attempts += 1
+                    count_http_exchange(response, retried=True)
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
                     self.telemetry.emit(
                         "retry",
@@ -230,11 +231,12 @@ class WorkerHubClient:
                     )
                     await asyncio.sleep(delay)
                     continue
-                count_http_exchange(response, attempts)
+                count_http_exchange(response)
                 return response
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempts < self.settings.max_retries:
                     attempts += 1
+                    count_http_retry()
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
                     self.telemetry.emit(
                         "retry",
@@ -326,6 +328,9 @@ class WorkerHubClient:
                     )
                     if retryable:
                         attempts += 1
+                        # Read the retried body so its bytes count too.
+                        await response.aread()
+                        count_http_exchange(response, retried=True)
                         delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
                         self.telemetry.emit(
                             "retry",
@@ -414,10 +419,11 @@ class WorkerHubClient:
                             None, "SSE stream closed without delivering a data event"
                         )
                     finally:
-                        count_http_exchange(response, attempts)
+                        count_http_exchange(response)
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempts < self.settings.max_retries:
                     attempts += 1
+                    count_http_retry()
                     delay = self.settings.backoff_factor_s * (2 ** (attempts - 1))
                     self.telemetry.emit(
                         "retry",

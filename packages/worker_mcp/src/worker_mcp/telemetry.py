@@ -35,8 +35,9 @@ def _timestamp() -> str:
 class HttpIO:
     """The hub exchanges one MCP tool call made, summed.
 
-    Bytes are the request and response bodies of each exchange's final
-    attempt; `retries` counts the attempts that were retried before it.
+    Every completed attempt counts, a retried 502/503/504 included: its bodies
+    crossed the wire. `retries` counts the attempts that were retried, whether
+    after such a response or after a transport error that left no response.
     """
 
     requests: int = 0
@@ -51,13 +52,14 @@ class HttpIO:
 current_http_io: ContextVar[HttpIO | None] = ContextVar("current_http_io", default=None)
 
 
-def count_http_exchange(response: httpx.Response, retries: int) -> None:
-    """Charge one completed exchange to the tool call in progress, if any."""
+def count_http_exchange(response: httpx.Response, *, retried: bool = False) -> None:
+    """Charge one completed attempt to the tool call in progress, if any."""
 
     io = current_http_io.get()
     if io is None:
         return
     io.requests += 1
+    io.retries += int(retried)
     with suppress(httpx.RequestNotRead):
         io.request_bytes += len(response.request.content)
     try:
@@ -66,7 +68,14 @@ def count_http_exchange(response: httpx.Response, retries: int) -> None:
         # A held stream is left once its data event arrives: what was read.
         io.response_bytes += response.num_bytes_downloaded
     io.status = response.status_code
-    io.retries += retries
+
+
+def count_http_retry() -> None:
+    """Charge a retry after a transport error, which leaves no response to count."""
+
+    io = current_http_io.get()
+    if io is not None:
+        io.retries += 1
 
 
 def _json_bytes(value: Any, *, indent: int | None = None) -> int:
