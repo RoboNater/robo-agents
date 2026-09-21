@@ -77,7 +77,7 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> bool:
                 await http
                 raise RuntimeError("HTTP server stopped before startup")
             await asyncio.sleep(0.01)
-        mcp = asyncio.create_task(run_mcp(app.state.store, stdout))
+        mcp = asyncio.create_task(run_mcp(app.state.store, stdout, app.state.accounting))
         done, _ = await asyncio.wait((http, mcp), return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             await task

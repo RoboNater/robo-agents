@@ -19,13 +19,13 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-# v9 is #51's durable binding from an assignment to its triggering event,
-# after #59's v8 canonical table rebuild.
+# v10 is #78's `call_log` byte accounting, after #51's v9 durable binding from
+# an assignment to its triggering event.
 # Bumping this means first dumping the version it replaces:
 # `uv run python scripts/dump-schema.py` writes tests/fixtures/schema_v<N>.sql,
 # which is what the migration tests replay instead of a fixture written from
 # memory (#54).
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class DatabaseVersionError(RuntimeError):
@@ -138,6 +138,23 @@ CREATE TABLE IF NOT EXISTS operation (
     PRIMARY KEY (actor, operation_id)
 );
 
+CREATE TABLE IF NOT EXISTS call_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    boundary TEXT NOT NULL CHECK (boundary IN ('a2a', 'mcp')),
+    actor TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    status INTEGER,
+    bytes_in INTEGER NOT NULL,
+    bytes_out INTEGER NOT NULL,
+    content_bytes INTEGER,
+    repeat_bytes INTEGER,
+    task_id TEXT,
+    workflow_id TEXT,
+    started TEXT NOT NULL,
+    finished TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_task_workflow_state ON task(workflow_id, state);
 CREATE INDEX IF NOT EXISTS idx_task_assignee ON task(assignee);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_task_source_event_id
@@ -146,6 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_message_context_ts ON message(context_id, ts);
 CREATE INDEX IF NOT EXISTS idx_event_state_id ON event(state, id);
 CREATE INDEX IF NOT EXISTS idx_event_delivery_id ON event(delivery_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_key ON decision(key) WHERE key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_call_log_actor ON call_log(actor, tool);
 """
 # `idx_decision_key` — not a column-level UNIQUE on `decision.key` — is what
 # makes `log_decision` idempotent. It is partial (`key IS NOT NULL`), which is
@@ -222,7 +240,7 @@ def initialize_database(path: Path) -> None:
             )
         # Each step inspects the table rather than trusting the version number,
         # so it is safe to re-run and migrations compose across schema versions
-        # (any of v1-v6 -> v7).
+        # (any of v1-v9 -> v10).
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
         _migrate_worker_heartbeat(connection)
@@ -230,6 +248,7 @@ def initialize_database(path: Path) -> None:
         _migrate_decision_key(connection)
         _migrate_task_pr_head_sha(connection)
         _migrate_task_source_event_id(connection)
+        _migrate_call_log(connection)
 
     # v8 (#59). Outside the transaction above: the rebuild needs its own
     # connection, because `PRAGMA foreign_keys` is a no-op inside one. The
@@ -379,6 +398,18 @@ def _migrate_task_source_event_id(connection: sqlite3.Connection) -> None:
 
     if "source_event_id" not in _columns(connection, "task"):
         connection.execute("ALTER TABLE task ADD COLUMN source_event_id INTEGER")
+
+
+def _migrate_call_log(connection: sqlite3.Connection) -> None:
+    """Add the per-call byte accounting table for schema v10 (#78).
+
+    The table is new rather than altered, so it arrives in its declared shape
+    and needs no rebuild. Hub calls before v10 were never measured, so it
+    starts empty.
+    """
+
+    connection.execute(_canonical_tables()["call_log"])
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_call_log_actor ON call_log(actor, tool)")
 
 
 def _rebuild_drifted_tables(path: Path) -> None:

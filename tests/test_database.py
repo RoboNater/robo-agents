@@ -689,3 +689,41 @@ def test_the_rebuild_keeps_the_autoincrement_high_water_mark(
     store = HubStore(path)
     assert store.append_event(EventKind.AGENT_CHECKED_IN, {"agent": "bob"}).id == 101
     assert store.log_decision("After", "the rebuild", key="k-1") == 101
+
+
+def test_migration_from_v9_adds_an_empty_call_log_and_keeps_existing_rows(
+    tmp_path: Path,
+) -> None:
+    """#78's v10: calls before accounting existed were never measured."""
+
+    path = tmp_path / "v9_hub.db"
+    _legacy_database(path, 9)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO workflow (id, goal, status, created)"
+            " VALUES ('wf', 'goal', 'active', '2026-09-19T00:00:00Z')"
+        )
+        connection.execute(
+            "INSERT INTO decision (ts, summary, rationale) VALUES ('t', 'kept', 'because')"
+        )
+
+    initialize_database(path)
+    initialize_database(path)
+
+    with database(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert connection.execute("SELECT COUNT(*) FROM call_log").fetchone()[0] == 0
+        assert connection.execute("SELECT summary FROM decision").fetchone()[0] == "kept"
+        indexes = {row["name"] for row in connection.execute("PRAGMA index_list(call_log)")}
+    assert "idx_call_log_actor" in indexes
+
+
+def test_call_log_accepts_only_known_boundaries(tmp_path: Path) -> None:
+    path = tmp_path / "hub.db"
+    initialize_database(path)
+
+    with pytest.raises(sqlite3.IntegrityError), database(path) as connection:
+        connection.execute(
+            "INSERT INTO call_log (boundary, actor, tool, outcome, bytes_in, bytes_out,"
+            " started, finished) VALUES ('smtp', 'bob', 'x', 'ok', 1, 1, 't', 't')"
+        )

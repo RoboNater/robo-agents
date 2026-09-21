@@ -24,7 +24,7 @@ from agent_hub_common import (
 )
 
 from .config import WorkerSettings
-from .telemetry import TelemetryLog
+from .telemetry import TelemetryLog, count_http_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,14 @@ class WorkerHubClient:
             raise WorkerProtocolError(None, "heartbeat response was not a dict")
         return (result.get("metadata") or {}).get(MetaKeys.ACCEPTED) is True
 
+    def _headers(self) -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.settings.token}"}
+        # Names the caller of the identity-less guide route for the hub's
+        # call accounting (#78); the hub counts it only for a registered agent.
+        if self.settings.agent_name.isascii():
+            headers["X-Hub-Agent"] = self.settings.agent_name
+        return headers
+
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
@@ -194,7 +202,7 @@ class WorkerHubClient:
                     path,
                     json=json_body,
                     timeout=timeout,
-                    headers={"Authorization": f"Bearer {self.settings.token}"},
+                    headers=self._headers(),
                 )
                 retryable = (
                     response.status_code in RETRYABLE_STATUS_CODES
@@ -222,6 +230,7 @@ class WorkerHubClient:
                     )
                     await asyncio.sleep(delay)
                     continue
+                count_http_exchange(response, attempts)
                 return response
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempts < self.settings.max_retries:
@@ -309,7 +318,7 @@ class WorkerHubClient:
                     "/a2a",
                     json=payload,
                     timeout=client_timeout,
-                    headers={"Authorization": f"Bearer {self.settings.token}"},
+                    headers=self._headers(),
                 ) as response:
                     retryable = (
                         response.status_code in RETRYABLE_STATUS_CODES
@@ -335,10 +344,36 @@ class WorkerHubClient:
                         )
                         await asyncio.sleep(delay)
                         continue
-                    if response.status_code >= 400:
-                        content = await response.aread()
-                        try:
-                            data = json.loads(content)
+                    # Counted however the body ends: a result, an error or a
+                    # closed stream all cost the bytes read so far.
+                    try:
+                        if response.status_code >= 400:
+                            content = await response.aread()
+                            try:
+                                data = json.loads(content)
+                                if isinstance(data, dict) and "error" in data:
+                                    err = data["error"]
+                                    code = err.get("code") if isinstance(err, dict) else None
+                                    msg = (
+                                        err.get("message", "Unknown JSON-RPC error")
+                                        if isinstance(err, dict)
+                                        else str(err)
+                                    )
+                                    raise WorkerProtocolError(code, msg)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                            response.raise_for_status()
+                        content_type = response.headers.get("content-type", "")
+                        if "text/event-stream" not in content_type:
+                            content = await response.aread()
+                            try:
+                                data = json.loads(content)
+                            except Exception as exc:
+                                raw = content.decode("utf-8", errors="replace")[:200]
+                                raise WorkerProtocolError(
+                                    None,
+                                    f"Hub returned non-SSE response: {raw}",
+                                ) from exc
                             if isinstance(data, dict) and "error" in data:
                                 err = data["error"]
                                 code = err.get("code") if isinstance(err, dict) else None
@@ -348,57 +383,38 @@ class WorkerHubClient:
                                     else str(err)
                                 )
                                 raise WorkerProtocolError(code, msg)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-                        response.raise_for_status()
-                    content_type = response.headers.get("content-type", "")
-                    if "text/event-stream" not in content_type:
-                        content = await response.aread()
-                        try:
-                            data = json.loads(content)
-                        except Exception as exc:
-                            raw = content.decode("utf-8", errors="replace")[:200]
+                            if isinstance(data, dict) and "result" in data:
+                                return data["result"]
                             raise WorkerProtocolError(
-                                None,
-                                f"Hub returned non-SSE response: {raw}",
-                            ) from exc
-                        if isinstance(data, dict) and "error" in data:
-                            err = data["error"]
-                            code = err.get("code") if isinstance(err, dict) else None
-                            msg = (
-                                err.get("message", "Unknown JSON-RPC error")
-                                if isinstance(err, dict)
-                                else str(err)
+                                None, f"Hub returned unexpected non-streaming response: {data}"
                             )
-                            raise WorkerProtocolError(code, msg)
-                        if isinstance(data, dict) and "result" in data:
-                            return data["result"]
-                        raise WorkerProtocolError(
-                            None, f"Hub returned unexpected non-streaming response: {data}"
-                        )
 
-                    async for line in response.aiter_lines():
-                        line = line.strip()
-                        if line.startswith("data:"):
-                            raw = line.removeprefix("data:").strip()
-                            if not raw:
-                                continue
-                            data = json.loads(raw)
-                            if not isinstance(data, dict):
-                                raise WorkerProtocolError(None, "SSE chunk was not a JSON object")
-                            if "error" in data:
-                                err = data["error"]
-                                code = err.get("code") if isinstance(err, dict) else None
-                                msg = (
-                                    err.get("message", "Unknown JSON-RPC error")
-                                    if isinstance(err, dict)
-                                    else str(err)
+                        async for line in response.aiter_lines():
+                            line = line.strip()
+                            if line.startswith("data:"):
+                                raw = line.removeprefix("data:").strip()
+                                if not raw:
+                                    continue
+                                data = json.loads(raw)
+                                if not isinstance(data, dict):
+                                    raise WorkerProtocolError(
+                                    None, "SSE chunk was not a JSON object"
                                 )
-                                raise WorkerProtocolError(code, msg)
-                            return data.get("result")
-                    raise WorkerProtocolError(
-                        None, "SSE stream closed without delivering a data event"
-                    )
+                                if "error" in data:
+                                    err = data["error"]
+                                    code = err.get("code") if isinstance(err, dict) else None
+                                    msg = (
+                                        err.get("message", "Unknown JSON-RPC error")
+                                        if isinstance(err, dict)
+                                        else str(err)
+                                    )
+                                    raise WorkerProtocolError(code, msg)
+                                return data.get("result")
+                        raise WorkerProtocolError(
+                            None, "SSE stream closed without delivering a data event"
+                        )
+                    finally:
+                        count_http_exchange(response, attempts)
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempts < self.settings.max_retries:
                     attempts += 1

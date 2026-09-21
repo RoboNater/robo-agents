@@ -25,6 +25,18 @@ DEFAULT_SWEEP_INTERVAL_S = 10.0
 DEFAULT_EVENT_LEASE_S = 600.0
 
 
+_FLAG_VALUES = {
+    "": False,
+    "0": False,
+    "false": False,
+    "off": False,
+    "no": False,
+    "1": True,
+    "true": True,
+    "on": True,
+    "yes": True,
+}
+
 _HostAddress = ipaddress.IPv4Address | ipaddress.IPv6Address | None
 
 
@@ -172,6 +184,10 @@ class HubSettings:
     lost_after_s: float = DEFAULT_LOST_AFTER_S
     sweep_interval_s: float = 10.0
     event_lease_s: float = DEFAULT_EVENT_LEASE_S
+    # Per-call byte accounting (#78) is off unless asked for: rows in the
+    # `call_log` table, plus an optional raw JSONL stream.
+    call_accounting: bool = False
+    call_log_jsonl: Path | None = None
 
     def bounded_wait(self, requested: float | None) -> float:
         """Clamp a caller-requested hold to the configured ceiling."""
@@ -245,6 +261,24 @@ class HubSettings:
                 "HUB_MAX_WAIT_S must be at least HUB_DEFAULT_WAIT_S; "
                 "the ceiling cannot be below the default hold"
             )
+        raw_accounting = env.get("HUB_CALL_ACCOUNTING", "").strip().lower()
+        if raw_accounting not in _FLAG_VALUES:
+            raise ConfigurationError(
+                "HUB_CALL_ACCOUNTING must be 1/0, true/false, on/off or yes/no"
+            )
+        raw_jsonl = env.get("HUB_CALL_LOG_JSONL", "").strip()
+        call_log_jsonl = None
+        if raw_jsonl:
+            call_log_jsonl = Path(raw_jsonl).expanduser()
+            if not call_log_jsonl.is_absolute():
+                raise ConfigurationError(
+                    f"HUB_CALL_LOG_JSONL must be an absolute path, got {raw_jsonl!r}"
+                )
+            if not _FLAG_VALUES[raw_accounting]:
+                raise ConfigurationError(
+                    "HUB_CALL_LOG_JSONL requires HUB_CALL_ACCOUNTING=1; "
+                    "the raw stream is written only while accounting is on"
+                )
         return cls(
             host=host,
             port=port,
@@ -263,4 +297,6 @@ class HubSettings:
             event_lease_s=_positive_seconds(
                 env, "HUB_EVENT_LEASE_S", DEFAULT_EVENT_LEASE_S
             ),
+            call_accounting=_FLAG_VALUES[raw_accounting],
+            call_log_jsonl=call_log_jsonl,
         )
