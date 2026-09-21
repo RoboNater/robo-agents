@@ -21,7 +21,7 @@ def test_worker_settings_parses_valid_env() -> None:
     assert settings.agent_name == "bob"
     # Nothing the launcher left unset is guessed, not even the harness.
     assert settings.profile == AgentProfile()
-    assert settings.default_wait_s == 120.0
+    assert settings.default_wait_s == 100.0
     assert settings.heartbeat_s == 30.0
     assert settings.max_retries == 3
     assert settings.backoff_factor_s == 0.5

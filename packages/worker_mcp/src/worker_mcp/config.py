@@ -10,7 +10,7 @@ from pathlib import Path
 from agent_hub_common import AgentProfile, ConfigurationError, profile_from_env
 from agent_hub_common.workspace import canonical_workspace, read_identity
 
-DEFAULT_WAIT_S = 120.0
+DEFAULT_WAIT_S = 100.0
 DEFAULT_HEARTBEAT_S = 30.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_FACTOR_S = 0.5

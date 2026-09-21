@@ -39,6 +39,10 @@ uv run --locked mypy
 uv run --locked pytest
 ```
 
+Don't pipe a check through `tail` or `head` to shorten it: the pipeline
+returns the last command's exit status, so a failing suite looks green. Use
+`set -o pipefail`, or redirect to a file and check `$?`.
+
 Verbatim what CI runs, in order. `--locked` fails instead of silently
 relocking, so an error there means `pyproject.toml` and `uv.lock` disagree —
 resolve that with uv, never by hand-editing the lockfile.
