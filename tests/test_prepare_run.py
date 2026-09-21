@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -493,3 +494,109 @@ def test_main_reports_actionable_error_without_traceback(
         PREPARE_RUN.main()
     assert "prepare-run: error:" in str(exc.value.code)
     assert "not yet supported" in str(exc.value.code)
+
+
+STATEMENT = """# Land acme/app#7 and acme/app#9 together
+
+Address `acme/app#7` and `acme/app#9` in one pull request.
+
+Acceptance criteria:
+- the parser accepts both forms
+"""
+
+
+def durable_goal(run_dir: Path) -> str:
+    prompt = (run_dir / "alice.prompt.md").read_text(encoding="utf-8")
+    return prompt.split("Goal: ", 1)[1].split("GitHub comment identity account:", 1)[0]
+
+
+def test_work_file_becomes_the_goal_and_manifest_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    work_file = tmp_path / "sow.md"
+    work_file.write_text(STATEMENT, encoding="utf-8")
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(
+        str(origin), run_dir, account="testuser", work_file=work_file
+    )
+
+    goal = durable_goal(run_dir)
+    assert goal.startswith(STATEMENT.strip())
+    assert "no roadmap edit" in goal
+    assert "Address issue" not in goal
+    assert "<issue" not in goal
+    assert manifest["issue"] is None
+    assert manifest["work"] == {
+        "goal": goal.strip(),
+        "path": str(work_file.resolve()),
+        "sha256": hashlib.sha256(STATEMENT.encode("utf-8")).hexdigest(),
+    }
+    saved = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert saved["work"] == manifest["work"]
+
+
+def test_issue_goal_is_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(str(origin), run_dir, issue=42, account="testuser")
+    expected = (
+        f"Address issue `{origin}#42`, merge its pull request, and close out with no "
+        "roadmap edit; record the merge only in the workflow summary.\n\n"
+    )
+    assert durable_goal(run_dir) == expected
+    assert manifest["issue"] == 42
+    assert manifest["work"] == {"goal": expected.strip(), "path": None, "sha256": None}
+    assert PREPARE_RUN.render_goal("acme/app", str(origin), 42, None) == (
+        "Address issue `acme/app#42`, merge its pull request, and close out with no "
+        "roadmap edit; record the merge only in the workflow summary."
+    )
+
+
+def run_main(monkeypatch: pytest.MonkeyPatch, run_dir: Path, *extra: str) -> str:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare-run.py",
+            "--repository",
+            "test-org/test-repo",
+            "--run-dir",
+            str(run_dir),
+            *extra,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        PREPARE_RUN.main()
+    return str(exc.value.code)
+
+
+def test_work_file_with_issue_fails_actionably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_file = tmp_path / "sow.md"
+    work_file.write_text(STATEMENT, encoding="utf-8")
+    run_dir = (tmp_path / "run").resolve()
+    message = run_main(monkeypatch, run_dir, "--work-file", str(work_file), "--issue", "42")
+    assert message.startswith("prepare-run: error:")
+    assert "mutually exclusive" in message
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [(None, "does not exist"), ("", "is empty"), ("  \n\t\n", "is empty")],
+)
+def test_missing_or_empty_work_file_fails_actionably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str | None, expected: str
+) -> None:
+    work_file = tmp_path / "sow.md"
+    if content is not None:
+        work_file.write_text(content, encoding="utf-8")
+    run_dir = (tmp_path / "run").resolve()
+    message = run_main(monkeypatch, run_dir, "--work-file", str(work_file))
+    assert message.startswith("prepare-run: error:")
+    assert expected in message
+    assert not run_dir.exists()

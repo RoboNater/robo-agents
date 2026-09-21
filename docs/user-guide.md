@@ -107,6 +107,34 @@ uv run --locked python scripts/prepare-run.py \
   --issue 42 --account your-github-username
 ```
 
+When the job is not exactly one issue (several issues landing together, a plan
+step, a job described in a paragraph), write a statement of work and pass
+`--work-file` instead of `--issue`; the two are mutually exclusive:
+
+```sh
+cat > /absolute/path/to/sow.md <<'SOW'
+# Land your-org/your-repo#42 and #43 together
+
+Address `your-org/your-repo#42` and `your-org/your-repo#43` in one pull request.
+
+Acceptance criteria:
+- the parser accepts both the old and the new config format
+- `uv run --locked pytest` passes
+SOW
+
+uv run --locked python scripts/prepare-run.py \
+  --repository git@github.com:your-org/your-repo.git \
+  --run-dir /absolute/path/to/my-run \
+  --work-file /absolute/path/to/sow.md --account your-github-username
+```
+
+The statement text becomes Alice's durable goal, followed by the throwaway
+close-out clause, and `run.json` records it under `work` with the file's path
+and SHA-256. Name issues repository-qualified: Alice reads every one for
+acceptance criteria and asks the implementer for a `Closes owner/repo#N` line
+per issue. One run delivers one pull request; work that needs several PRs takes
+one run per PR.
+
 It produces the layout above, sharing its rendering code with the Step 6 demo so
 the two paths cannot drift. Supported worker harnesses are `claude-code` and
 `codex` (the paste-ready pair). Specifically it:
@@ -132,7 +160,8 @@ the two paths cannot drift. Supported worker harnesses are `claude-code` and
    (which decides `allow_no_ci` when `--allow-no-ci auto`). Failures exit as a
    `prepare-run: error: ...` message (exit 1), not a traceback.
 7. Prints the three launch commands below plus the Alice kickoff prompt
-   (`alice.prompt.md`) with the issue and account filled in.
+   (`alice.prompt.md`) with the issue or statement of work and the account
+   filled in.
 
 Then paste the three commands it prints (Linux / macOS shown; Windows
 PowerShell equivalent for the Codex line follows):
@@ -522,7 +551,7 @@ Once Bob and Charlie are running and awaiting assignments, switch to Alice's Cla
 Prepare Alice's kickoff prompt using the authoritative format from [`prompts/alice.md`](../prompts/alice.md):
 
 ```markdown
-Use the `alice-orchestrator` skill to carry this issue through a reviewed,
+Use the `alice-orchestrator` skill to carry this work through a reviewed,
 gate-checked merge and roadmap close-out.
 
 Goal: Address issue `your-org/your-repo#42`, merge its pull request, and close out with no roadmap edit; record the merge only in the workflow summary.

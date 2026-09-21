@@ -14,6 +14,9 @@ Example:
         --run-dir /absolute/path/to/my-run \\
         --issue 42 --account your-github-username
 
+``--work-file PATH`` replaces ``--issue N`` when the job is not exactly one
+issue: the file's text or Markdown statement of work becomes Alice's goal.
+
 Supported worker harnesses are ``claude-code`` and ``codex`` (the paste-ready
 pair); anything else fails up front with an actionable message.
 """
@@ -21,6 +24,7 @@ pair); anything else fails up front with an actionable message.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -139,33 +143,46 @@ def codex_login_status(home: Path) -> str:
     return line if line else "logged in (empty status)"
 
 
-def render_alice_prompt(
-    slug: str | None,
-    repository: str,
-    issue: int | None,
-    account: str | None,
-    policy: dict[str, Any],
+THROWAWAY_CLOSE_OUT = (
+    "close out with no roadmap edit; record the merge only in the workflow summary"
+)
+
+
+def read_work_file(path: Path) -> dict[str, str]:
+    """The statement of work, stripped, with the file's path and sha256.
+
+    A missing, unreadable, or empty file is an error.
+    """
+    try:
+        data = path.read_bytes()
+        text = data.decode("utf-8").strip()
+    except FileNotFoundError as exc:
+        raise ValueError(f"--work-file {path} does not exist") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"--work-file {path} is not a readable UTF-8 text file") from exc
+    if not text:
+        raise ValueError(f"--work-file {path} is empty; write the statement of work first")
+    return {"text": text, "path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def render_goal(
+    slug: str | None, repository: str, issue: int | None, work: str | None
 ) -> str:
+    """The durable goal: the statement of work, or the one-issue sentence."""
+    if work is not None:
+        return f"{work}\n\nWhen done, {THROWAWAY_CLOSE_OUT}."
+    if issue is not None:
+        target = f"{slug or repository}#{issue}"
+    else:
+        target = "<issue-owner>/<issue-repository>#<issue>"
+    return f"Address issue `{target}`, merge its pull request, and {THROWAWAY_CLOSE_OUT}."
+
+
+def render_alice_prompt(goal: str, account: str | None, policy: dict[str, Any]) -> str:
     prompt = (ROOT / "prompts/alice.md").read_text(encoding="utf-8")
     begin = prompt.index("Goal:")
     end = prompt.index("GitHub comment identity account:")
-    if slug is not None and issue is not None:
-        goal = (
-            f"Address issue `{slug}#{issue}`, merge its pull request, "
-            "and close out with no roadmap edit; record the merge only in the workflow summary"
-        )
-    elif issue is not None:
-        goal = (
-            f"Address issue `{repository}#{issue}`, merge its pull request, "
-            "and close out with no roadmap edit; record the merge only in the workflow summary"
-        )
-    else:
-        goal = (
-            "Address issue `<issue-owner>/<issue-repository>#<issue>`, merge its pull "
-            "request, and close out with no roadmap edit; "
-            "record the merge only in the workflow summary"
-        )
-    prompt = prompt[:begin] + "Goal: " + goal + ".\n\n" + prompt[end:]
+    prompt = prompt[:begin] + "Goal: " + goal + "\n\n" + prompt[end:]
     prompt = prompt.replace("<account>", account if account else "<account>")
     begin = prompt.index("```json") + len("```json")
     end = prompt.index("```", begin)
@@ -248,7 +265,15 @@ def prepare(
     allow_no_ci: str = "auto",
     skip_github_checks: bool = False,
     public_url: str = "http://127.0.0.1:8420",
+    work_file: Path | None = None,
 ) -> dict[str, Any]:
+    if work_file is not None and issue is not None:
+        raise ValueError(
+            "--work-file and --issue are mutually exclusive; name the issue inside "
+            "the statement of work, or pass --issue alone"
+        )
+    statement = read_work_file(work_file.resolve()) if work_file is not None else None
+    work_text = statement["text"] if statement is not None else None
     if not run_dir.is_absolute() or run_dir != run_dir.resolve():
         raise ValueError("RUN_DIR must be absolute and canonical")
     if run_dir == ROOT or ROOT in run_dir.parents:
@@ -450,9 +475,16 @@ def prepare(
         "max_wall_minutes": 180,
         "max_task_lease_min": 120,
     }
+    goal = render_goal(slug, repository, issue, work_text)
     (run_dir / "alice.prompt.md").write_text(
-        render_alice_prompt(slug, repository, issue, account, policy), encoding="utf-8"
+        render_alice_prompt(goal, account, policy), encoding="utf-8"
     )
+    # The goal text is what Alice initializes with; path and hash tie it to the file.
+    work = {
+        "goal": goal,
+        "path": statement["path"] if statement is not None else None,
+        "sha256": statement["sha256"] if statement is not None else None,
+    }
 
     manifest = {
         "schema_version": 1,
@@ -467,6 +499,7 @@ def prepare(
         "models": models,
         "versions": versions,
         "policy": policy,
+        "work": work,
         "issue": issue,
         "account": account,
         "merge_method": merge_method,
@@ -520,7 +553,7 @@ def prepare(
     ):
         print(line if line else "")
     print(f"\nAlice kickoff prompt: {run_dir / 'alice.prompt.md'}")
-    if issue is None or account is None:
+    if (issue is None and work_text is None) or account is None:
         print("Fill any remaining <issue>/<account> placeholders before launching Alice.")
     return manifest
 
@@ -530,6 +563,12 @@ def main() -> None:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--issue", type=int, default=None)
+    parser.add_argument(
+        "--work-file",
+        type=Path,
+        default=None,
+        help="text or Markdown statement of work used as Alice's goal (not with --issue)",
+    )
     parser.add_argument("--account", default=None)
     parser.add_argument("--bob", default=DEFAULT_BOB_HARNESS)
     parser.add_argument("--charlie", default=DEFAULT_CHARLIE_HARNESS)
@@ -568,6 +607,7 @@ def main() -> None:
             args.allow_no_ci,
             args.skip_github_checks,
             args.public_url,
+            args.work_file,
         )
     except ValueError as exc:
         sys.exit(f"prepare-run: error: {exc}")
