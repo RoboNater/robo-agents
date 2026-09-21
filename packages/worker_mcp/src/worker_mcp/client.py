@@ -451,22 +451,27 @@ class WorkerHubClient:
         """Combine the launcher's profile with what the agent declares.
 
         Declared capabilities add to the configured ones. A declared model is
-        used only when the launcher names none: the launcher is the operator's
-        statement of what runs, the agent's is its own belief (§3).
+        used as `model` only when the launcher names none: the launcher is the
+        operator's statement of what runs, the agent's is its own belief (§3).
+        It is reported as `declared_model` either way, so a stale `HUB_MODEL`
+        leaves a trace instead of silently winning (#77).
         """
 
         configured = self.settings.profile
         declared_caps = (item.strip() for item in capabilities or [])
         merged = dict.fromkeys([*configured.capabilities, *(c for c in declared_caps if c)])
         declared_model = (model or "").strip()
-        if configured.model_source is ModelSource.UNKNOWN and declared_model not in ("", UNKNOWN):
+        if declared_model == "":
+            declared_model = UNKNOWN
+        if configured.model_source is ModelSource.UNKNOWN and declared_model != UNKNOWN:
             return replace(
                 configured,
                 capabilities=tuple(merged),
                 model=declared_model,
                 model_source=ModelSource.DECLARED,
+                declared_model=declared_model,
             )
-        return replace(configured, capabilities=tuple(merged))
+        return replace(configured, capabilities=tuple(merged), declared_model=declared_model)
 
     async def check_in(
         self,
@@ -493,6 +498,7 @@ class WorkerHubClient:
             MetaKeys.PROVIDER: profile.provider,
             MetaKeys.MODEL: profile.model,
             MetaKeys.MODEL_SOURCE: profile.model_source.value,
+            MetaKeys.DECLARED_MODEL: profile.declared_model,
             MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
             MetaKeys.OPERATION_ID: op_id,
             MetaKeys.WORKER_INSTANCE_ID: self.worker_instance_id,

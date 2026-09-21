@@ -398,6 +398,8 @@ Create `/path/to/my-run/configs/bob.mcp.json`:
 }
 ```
 
+*`HUB_MODEL` is a claim by you, the operator, not something the hub can check: it is what Alice pairs workers on, and it wins over anything the runtime says. Harness defaults drift, so a pinned value can go stale. Leave `HUB_MODEL` unset and the worker declares the model it is actually using at check-in (`model_source: declared`). If you do set it, the hub still records what the runtime reported as `declared_model`; when the two differ, `get_state` and the `agent_checked_in` event show both with `model_mismatch: true`, so Alice can name the disagreement in her close-out summary. The mismatch is only recorded; it never blocks a run.*
+
 *Note: Set `HUB_HARNESS_VERSION` to match your `claude --version`, and adjust `HUB_CAPABILITIES` to match your project needs. `HUB_TELEMETRY_LOG` is optional for manual interactive runs, but required when using the unattended supervisor so `worker-mcp` emits JSON Lines records and release events to the file the supervisor monitors. On Windows, write `HUB_WORKSPACE` and `HUB_TELEMETRY_LOG` with forward slashes or escaped backslashes — see "Windows paths in JSON configs" above.*
 
 ### 3. Start Bob in His Clone Directory

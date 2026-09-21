@@ -19,6 +19,7 @@ class MetaKeys(StrEnum):
     PROVIDER = "hub.provider"
     MODEL = "hub.model"
     MODEL_SOURCE = "hub.model_source"
+    DECLARED_MODEL = "hub.declared_model"
     WORKSPACE_ID = "hub.workspace_id"
     STATUS = "hub.status"
     TIMEOUT = "hub.timeout"

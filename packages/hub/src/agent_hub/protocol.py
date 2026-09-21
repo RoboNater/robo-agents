@@ -270,6 +270,8 @@ def _profile(metadata: Mapping[str, Any]) -> AgentProfile:
     Whatever the worker does not report is recorded as `unknown`. A model with
     no stated source is refused rather than assigned one, and a source with no
     model is dropped, so `model_source` always describes the recorded model.
+    `hub.declared_model` is recorded beside it as reported and never feeds
+    `model` (#77): a check-in from a worker that predates it reads `unknown`.
     """
 
     model = _profile_text(metadata, MetaKeys.MODEL)
@@ -295,6 +297,7 @@ def _profile(metadata: Mapping[str, Any]) -> AgentProfile:
         model_source=source,
         capabilities=tuple(dict.fromkeys(item.strip() for item in capabilities if item.strip())),
         workspace_id=_profile_text(metadata, MetaKeys.WORKSPACE_ID),
+        declared_model=_profile_text(metadata, MetaKeys.DECLARED_MODEL) or UNKNOWN,
     )
 
 
@@ -530,6 +533,7 @@ class A2AProtocol:
             "provider": profile.provider,
             "model": profile.model,
             "model_source": profile.model_source.value,
+            "declared_model": profile.declared_model,
             "workspace_id": profile.workspace_id,
         })
 

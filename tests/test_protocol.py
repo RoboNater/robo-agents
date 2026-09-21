@@ -189,6 +189,56 @@ async def test_check_in_records_the_reported_profile(
     assert agent.workspace_id == "ws-charlie"
 
 
+async def test_check_in_records_a_declared_model_beside_a_configured_one(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    body = await post(
+        client,
+        "message/send",
+        message(
+            "READY",
+            metadata={
+                MetaKeys.AGENT: "bob",
+                MetaKeys.MODEL: "claude-opus-5",
+                MetaKeys.MODEL_SOURCE: "env",
+                MetaKeys.DECLARED_MODEL: " claude-sonnet-5 ",
+                MetaKeys.SCHEMA_VERSION: 1,
+                MetaKeys.OPERATION_ID: "op-proto-declared-1",
+            },
+        ),
+    )
+
+    assert "error" not in body
+    agent = hub_store.agent_by_name("bob")
+    assert agent is not None
+    # The configured model still resolves `model`; the claim is only recorded.
+    assert (agent.model, agent.model_source) == ("claude-opus-5", ModelSource.ENV)
+    assert agent.declared_model == "claude-sonnet-5"
+    event = hub_store.next_event()
+    assert event is not None and event.kind is EventKind.AGENT_CHECKED_IN
+    assert event.payload["declared_model"] == "claude-sonnet-5"
+    assert event.payload["model_mismatch"] is True
+
+
+async def test_a_check_in_from_a_worker_that_predates_declared_model_records_unknown(
+    client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    metadata: dict[str, Any] = {
+        MetaKeys.AGENT: "bob",
+        MetaKeys.MODEL: "claude-opus-5",
+        MetaKeys.MODEL_SOURCE: "env",
+        MetaKeys.SCHEMA_VERSION: 1,
+        MetaKeys.OPERATION_ID: "op-proto-declared-absent",
+    }
+    body = await post(client, "message/send", message("READY", metadata=metadata))
+
+    assert "error" not in body
+    agent = hub_store.agent_by_name("bob")
+    assert agent is not None and agent.declared_model == UNKNOWN
+    event = hub_store.next_event()
+    assert event is not None and event.payload["model_mismatch"] is False
+
+
 async def test_a_check_in_without_a_profile_records_unknown(
     client: httpx.AsyncClient, hub_store: HubStore
 ) -> None:
@@ -220,6 +270,7 @@ async def test_a_check_in_without_a_profile_records_unknown(
     ("profile", "complaint"),
     [
         ({MetaKeys.HARNESS: ["codex"]}, MetaKeys.HARNESS),
+        ({MetaKeys.DECLARED_MODEL: 7}, MetaKeys.DECLARED_MODEL),
         ({MetaKeys.MODEL: "m"}, MetaKeys.MODEL_SOURCE),
         ({MetaKeys.MODEL: "m", MetaKeys.MODEL_SOURCE: "unknown"}, MetaKeys.MODEL_SOURCE),
         ({MetaKeys.MODEL: "m", MetaKeys.MODEL_SOURCE: "guessed"}, MetaKeys.MODEL_SOURCE),

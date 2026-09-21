@@ -212,6 +212,8 @@ class AgentProfile:
 
     Observational only: the hub records what the worker says and verifies none
     of it. `workspace_id` stays None until the worker reports one (#28).
+    `declared_model` is what the runtime itself reported, kept beside `model`
+    because a configured `HUB_MODEL` wins there and would otherwise hide it (#77).
     """
 
     harness: str = UNKNOWN
@@ -221,3 +223,4 @@ class AgentProfile:
     model_source: ModelSource = ModelSource.UNKNOWN
     capabilities: tuple[str, ...] = field(default_factory=tuple)
     workspace_id: str | None = None
+    declared_model: str = UNKNOWN
