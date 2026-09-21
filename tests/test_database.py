@@ -718,6 +718,55 @@ def test_migration_from_v9_adds_an_empty_call_log_and_keeps_existing_rows(
     assert "idx_call_log_actor" in indexes
 
 
+def test_migration_from_v10_adds_declared_model_and_keeps_existing_agents_readable(
+    tmp_path: Path,
+) -> None:
+    """#77's v11: an agent that checked in before the column has nothing recorded."""
+
+    path = tmp_path / "v10_hub.db"
+    _legacy_database(path, 10)
+    assert "declared_model" not in _agent_columns(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO agent (name, status, context_id, last_seen, harness, model,"
+            " model_source) VALUES ('bob', 'idle', 'ctx-bob', '2026-09-20T00:00:00Z',"
+            " 'claude-code', 'claude-opus-5', 'env')"
+        )
+
+    initialize_database(path)
+    initialize_database(path)
+
+    # Nullable, defaulting to `unknown`: no NOT NULL on a column old rows lack.
+    assert _agent_columns(path)["declared_model"] == ("TEXT", 0, "'unknown'")
+    with database(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    store = HubStore(path)
+    bob = store.agent_by_name("bob")
+    assert bob is not None
+    assert (bob.model, bob.model_source, bob.declared_model) == (
+        "claude-opus-5",
+        ModelSource.ENV,
+        UNKNOWN,
+    )
+    [state] = store.get_state()["agents"]
+    assert state["declared_model"] == UNKNOWN
+    assert state["model_mismatch"] is False
+
+
+def test_a_null_declared_model_reads_as_unknown(tmp_path: Path) -> None:
+    path = tmp_path / "hub.db"
+    initialize_database(path)
+    with database(path) as connection:
+        connection.execute(
+            "INSERT INTO agent (name, status, context_id, last_seen, declared_model)"
+            " VALUES ('bob', 'idle', 'ctx-bob', '2026-09-20T00:00:00Z', NULL)"
+        )
+
+    bob = HubStore(path).agent_by_name("bob")
+
+    assert bob is not None and bob.declared_model == UNKNOWN
+
+
 def test_call_log_accepts_only_known_boundaries(tmp_path: Path) -> None:
     path = tmp_path / "hub.db"
     initialize_database(path)

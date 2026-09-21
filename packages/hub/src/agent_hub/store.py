@@ -109,6 +109,8 @@ class AgentRecord:
     model: str = UNKNOWN
     model_source: ModelSource = ModelSource.UNKNOWN
     workspace_id: str | None = None
+    # What the runtime reported, kept even when a configured `model` won (#77).
+    declared_model: str = UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +202,20 @@ def _agent(row: Row) -> AgentRecord:
         model=row["model"],
         model_source=ModelSource(row["model_source"]),
         workspace_id=row["workspace_id"],
+        declared_model=row["declared_model"] or UNKNOWN,
     )
+
+
+def _model_mismatch(model_source: ModelSource, model: str, declared_model: str) -> bool:
+    """True when the operator's configured model and the runtime's own claim differ.
+
+    Only a configured model can disagree with a declaration: a declared one is
+    the same string by construction, and a runtime that reported nothing is not
+    contradicting anyone. Recorded, never enforced (§3), and pairing still reads
+    `model`.
+    """
+
+    return model_source is ModelSource.ENV and declared_model not in (UNKNOWN, model)
 
 
 def _profile_fields(profile: AgentProfile) -> dict[str, Any]:
@@ -212,6 +227,10 @@ def _profile_fields(profile: AgentProfile) -> dict[str, Any]:
         "provider": profile.provider,
         "model": profile.model,
         "model_source": profile.model_source.value,
+        "declared_model": profile.declared_model,
+        "model_mismatch": _model_mismatch(
+            profile.model_source, profile.model, profile.declared_model
+        ),
         "capabilities": list(profile.capabilities),
         "workspace_id": profile.workspace_id,
     }
@@ -441,7 +460,11 @@ class HubStore:
                 tasks.append(summary)
             agents = []
             for row in connection.execute("SELECT * FROM agent ORDER BY name").fetchall():
-                summary = asdict(_agent(row))
+                agent = _agent(row)
+                summary = asdict(agent)
+                summary["model_mismatch"] = _model_mismatch(
+                    agent.model_source, agent.model, agent.declared_model
+                )
                 summary["heartbeat_age_s"] = _age_seconds(summary["last_heartbeat"], now)
                 summary["progress_age_s"] = _age_seconds(summary["last_progress_at"], now)
                 agents.append(summary)
@@ -545,6 +568,7 @@ class HubStore:
             profile.model,
             profile.model_source.value,
             profile.workspace_id,
+            profile.declared_model,
         )
         with database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -584,8 +608,9 @@ class HubStore:
                 connection.execute(
                     "INSERT INTO agent (name, status, context_id, last_seen, worker_instance_id,"
                     " last_heartbeat, capabilities_json,"
-                    " harness, harness_version, provider, model, model_source, workspace_id)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " harness, harness_version, provider, model, model_source, workspace_id,"
+                    " declared_model)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         name,
                         AgentStatus.IDLE.value,
@@ -614,7 +639,8 @@ class HubStore:
                     "UPDATE agent SET status = ?, last_seen = ?, worker_instance_id = ?,"
                     " last_heartbeat = ?, last_progress_at = ?, current_task_id = ?,"
                     " capabilities_json = ?, harness = ?, harness_version = ?, provider = ?,"
-                    " model = ?, model_source = ?, workspace_id = ? WHERE name = ?",
+                    " model = ?, model_source = ?, workspace_id = ?, declared_model = ?"
+                    " WHERE name = ?",
                     (
                         _readmitted(previous, current).value,
                         now,

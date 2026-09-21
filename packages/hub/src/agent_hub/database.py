@@ -19,13 +19,14 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-# v10 is #78's `call_log` byte accounting, after #51's v9 durable binding from
-# an assignment to its triggering event.
+# v11 is #77's `agent.declared_model`, after #78's v10 `call_log` byte
+# accounting and #51's v9 durable binding from an assignment to its triggering
+# event.
 # Bumping this means first dumping the version it replaces:
 # `uv run python scripts/dump-schema.py` writes tests/fixtures/schema_v<N>.sql,
 # which is what the migration tests replay instead of a fixture written from
 # memory (#54).
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class DatabaseVersionError(RuntimeError):
@@ -43,7 +44,7 @@ def _sql_values(enum_type: type[StrEnum]) -> str:
 
 # The worker identity profile (spec §3). Declared once so a fresh schema and a
 # migrated one get identical columns.
-PROFILE_COLUMNS = {
+_BASE_PROFILE_COLUMNS = {
     "harness": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'",
     "harness_version": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'",
     "provider": f"TEXT NOT NULL DEFAULT '{UNKNOWN}'",
@@ -52,6 +53,12 @@ PROFILE_COLUMNS = {
     f" CHECK (model_source IN ({_sql_values(ModelSource)}))",
     "workspace_id": "TEXT",
 }
+# What the runtime itself reported (#77). Nullable so a row written before the
+# column existed is not forced to claim anything; readers treat NULL as unknown.
+DECLARED_MODEL_COLUMNS = {
+    "declared_model": f"TEXT DEFAULT '{UNKNOWN}'",
+}
+PROFILE_COLUMNS = _BASE_PROFILE_COLUMNS | DECLARED_MODEL_COLUMNS
 _PROFILE_SQL = "".join(f"\n    {name} {spec}," for name, spec in PROFILE_COLUMNS.items())
 
 
@@ -240,7 +247,7 @@ def initialize_database(path: Path) -> None:
             )
         # Each step inspects the table rather than trusting the version number,
         # so it is safe to re-run and migrations compose across schema versions
-        # (any of v1-v9 -> v10).
+        # (any of v1-v10 -> v11).
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
         _migrate_worker_heartbeat(connection)
@@ -249,6 +256,7 @@ def initialize_database(path: Path) -> None:
         _migrate_task_pr_head_sha(connection)
         _migrate_task_source_event_id(connection)
         _migrate_call_log(connection)
+        _migrate_declared_model(connection)
 
     # v8 (#59). Outside the transaction above: the rebuild needs its own
     # connection, because `PRAGMA foreign_keys` is a no-op inside one. The
@@ -272,7 +280,7 @@ def _migrate_agent_profile(connection: sqlite3.Connection) -> None:
     """
 
     columns = _columns(connection, "agent")
-    for name, spec in PROFILE_COLUMNS.items():
+    for name, spec in _BASE_PROFILE_COLUMNS.items():
         if name not in columns:
             connection.execute(f"ALTER TABLE agent ADD COLUMN {name} {spec}")
     if "runtime" in columns:
@@ -410,6 +418,19 @@ def _migrate_call_log(connection: sqlite3.Connection) -> None:
 
     connection.execute(_canonical_tables()["call_log"])
     connection.execute("CREATE INDEX IF NOT EXISTS idx_call_log_actor ON call_log(actor, tool)")
+
+
+def _migrate_declared_model(connection: sqlite3.Connection) -> None:
+    """Add the model a runtime reported, beside the one that was resolved (#77).
+
+    Agents that checked in before v11 never had it recorded, and it cannot be
+    recovered afterwards, so their rows read `unknown` until they next check in.
+    """
+
+    columns = _columns(connection, "agent")
+    for name, spec in DECLARED_MODEL_COLUMNS.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE agent ADD COLUMN {name} {spec}")
 
 
 def _rebuild_drifted_tables(path: Path) -> None:

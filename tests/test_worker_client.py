@@ -100,7 +100,8 @@ async def test_check_in_reports_the_launcher_profile_to_get_state(
     )
     worker = WorkerHubClient(replace(worker_settings, profile=configured), http_client=client)
 
-    # The launcher's model wins over the agent's own belief about itself.
+    # The launcher's model wins over the agent's own belief about itself, but
+    # that belief is recorded beside it rather than discarded (#77).
     res = await worker.check_in(["gh", "python"], model="something-else")
 
     expected = {
@@ -111,19 +112,26 @@ async def test_check_in_reports_the_launcher_profile_to_get_state(
         "model_source": "env",
         "capabilities": ["python", "gh"],
         "workspace_id": None,
+        "declared_model": "something-else",
     }
     [agent] = hub_store.get_state()["agents"]
     assert {key: agent[key] for key in expected} == expected
+    assert agent["model_mismatch"] is True
     assert res["profile"] == expected
+    event = hub_store.next_event()
+    assert event is not None and event.kind is EventKind.AGENT_CHECKED_IN
+    assert event.payload["model"] == "example-codex-model"
+    assert event.payload["declared_model"] == "something-else"
+    assert event.payload["model_mismatch"] is True
 
 
 @pytest.mark.parametrize(
-    ("declared", "model", "source"),
+    ("declared", "model", "source", "recorded"),
     [
-        ("claude-opus-5", "claude-opus-5", "declared"),
-        (" ", "unknown", "unknown"),
-        ("unknown", "unknown", "unknown"),
-        (None, "unknown", "unknown"),
+        ("claude-opus-5", "claude-opus-5", "declared", "claude-opus-5"),
+        (" ", "unknown", "unknown", "unknown"),
+        ("unknown", "unknown", "unknown", "unknown"),
+        (None, "unknown", "unknown", "unknown"),
     ],
 )
 async def test_a_declared_model_is_used_only_when_the_launcher_names_none(
@@ -133,6 +141,7 @@ async def test_a_declared_model_is_used_only_when_the_launcher_names_none(
     declared: str | None,
     model: str,
     source: str,
+    recorded: str,
 ) -> None:
     worker = WorkerHubClient(worker_settings, http_client=client)
 
@@ -145,6 +154,10 @@ async def test_a_declared_model_is_used_only_when_the_launcher_names_none(
         source,
     )
     assert agent["provider"] == agent["harness_version"] == "unknown"
+    # Unset HUB_MODEL: the declared model agrees with `model`; a runtime that
+    # reported nothing stays `unknown`, never guessed.
+    assert agent["declared_model"] == recorded
+    assert agent["model_mismatch"] is False
 
 
 async def test_get_role_guide_no_cache(

@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from sqlite3 import Connection
@@ -104,11 +105,76 @@ def test_check_in_registers_an_agent_and_queues_the_event(store: HubStore) -> No
         "provider": "anthropic",
         "model": "claude-opus-5",
         "model_source": "env",
+        "declared_model": "unknown",
+        "model_mismatch": False,
         "capabilities": ["python"],
         "workspace_id": None,
         "context_id": agent.context_id,
         "worker_instance_id": "bob-1",
     }
+
+
+def test_check_in_records_a_declared_model_that_disagrees_with_the_configured_one(
+    store: HubStore,
+) -> None:
+    profile = replace(CLAUDE, declared_model="claude-sonnet-5")
+
+    agent = store.check_in("bob", profile)
+    event = store.next_event()
+
+    # Resolution is untouched: the configured value stays authoritative (§3).
+    assert (agent.model, agent.model_source) == ("claude-opus-5", ModelSource.ENV)
+    assert agent.declared_model == "claude-sonnet-5"
+    assert event is not None
+    assert event.payload["model"] == "claude-opus-5"
+    assert event.payload["declared_model"] == "claude-sonnet-5"
+    assert event.payload["model_mismatch"] is True
+    [state] = store.get_state()["agents"]
+    assert (state["model"], state["declared_model"]) == ("claude-opus-5", "claude-sonnet-5")
+    assert state["model_mismatch"] is True
+
+
+@pytest.mark.parametrize(
+    ("profile", "declared_model"),
+    [
+        # The runtime agrees with the operator.
+        (replace(CLAUDE, declared_model="claude-opus-5"), "claude-opus-5"),
+        # The runtime reported nothing, which contradicts no one.
+        (CLAUDE, "unknown"),
+        # No configured model: the declared one is `model`, so it cannot differ.
+        (
+            replace(
+                CLAUDE,
+                model_source=ModelSource.DECLARED,
+                declared_model="claude-opus-5",
+            ),
+            "claude-opus-5",
+        ),
+    ],
+)
+def test_only_a_configured_model_the_runtime_contradicts_is_a_mismatch(
+    store: HubStore, profile: AgentProfile, declared_model: str
+) -> None:
+    store.check_in("bob", profile)
+
+    event = store.next_event()
+    [state] = store.get_state()["agents"]
+
+    assert event is not None
+    assert event.payload["declared_model"] == state["declared_model"] == declared_model
+    assert event.payload["model_mismatch"] is state["model_mismatch"] is False
+
+
+def test_a_returning_worker_replaces_the_declared_model_with_its_new_one(
+    store: HubStore,
+) -> None:
+    store.check_in("bob", replace(CLAUDE, declared_model="claude-sonnet-5"))
+    store.release_agent("bob")
+
+    store.check_in("bob", CLAUDE)
+
+    agent = store.agent_by_name("bob")
+    assert agent is not None and agent.declared_model == "unknown"
 
 
 def test_get_state_shows_each_workers_profile(store: HubStore) -> None:
@@ -140,12 +206,14 @@ def test_get_state_shows_each_workers_profile(store: HubStore) -> None:
         "model_source": "env",
         "capabilities": ["python"],
         "workspace_id": None,
+        "declared_model": "unknown",
+        "model_mismatch": False,
     }
     # Whatever charlie's launcher left unset reads `unknown`, not a guess.
     charlie = agents["charlie"]
     assert charlie["harness"] == "codex"
     assert charlie["harness_version"] == charlie["provider"] == charlie["model"] == "unknown"
-    assert charlie["model_source"] == "unknown"
+    assert charlie["model_source"] == charlie["declared_model"] == "unknown"
     assert charlie["capabilities"] == []
 
 
