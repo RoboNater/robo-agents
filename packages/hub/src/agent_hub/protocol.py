@@ -64,6 +64,7 @@ from fastapi import Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
+from .accounting import note_a2a
 from .store import (
     AgentRecord,
     ConflictError,
@@ -551,6 +552,7 @@ class A2AProtocol:
                 ).model_dump(mode="json", exclude_none=True)
             ),
         )
+        note_a2a(actor=agent_name)
         return A2AMessage.model_validate(json.loads(resp_json))
 
     def _heartbeat(
@@ -575,6 +577,8 @@ class A2AProtocol:
             None if current_task_id is None else current_task_id.strip(),
         )
         agent = self.store.agent_by_name(agent_name)
+        if agent is not None:
+            note_a2a(actor=agent.name)
         return _agent_message(
             "HEARTBEAT",
             context_id=None if agent is None else agent.context_id,
@@ -686,6 +690,7 @@ class A2AProtocol:
     ) -> AsyncIterator[bytes]:
         outcome = await self.store.await_assignment(agent.context_id, timeout_s)
         if isinstance(outcome, Released):
+            note_a2a(outcome="release")
             yield _sse(
                 _success_body(
                     request_id,
@@ -698,8 +703,10 @@ class A2AProtocol:
             )
             return
         if outcome is None:
+            note_a2a(outcome="timeout")
             yield _sse(_success_body(request_id, self._timeout_message(agent.context_id)))
             return
+        note_a2a(outcome="assignment", task_id=outcome.id)
         yield _sse(_success_body(request_id, _task_object(outcome, agent.context_id)))
 
     async def _reply_stream(
@@ -718,6 +725,7 @@ class A2AProtocol:
             TaskState.FAILED,
             TaskState.COMPLETED,
         ):
+            note_a2a(outcome="task_ended")
             note = str((current.result or {}).get("summary", current.state.value))
             status_message = _agent_message(
                 note,
@@ -733,6 +741,7 @@ class A2AProtocol:
             )
             return
         if reply is None:
+            note_a2a(outcome="timeout")
             yield _sse(
                 _success_body(
                     request_id,
@@ -740,6 +749,7 @@ class A2AProtocol:
                 )
             )
             return
+        note_a2a(outcome="reply")
         yield _sse(_success_body(request_id, _stored_message(reply)))
 
     def _timeout_message(
@@ -802,12 +812,14 @@ class A2AProtocol:
             agent = self.store.agent_by_context(message.context_id)
             if agent is None:
                 raise _invalid(f"unknown contextId {message.context_id!r}; check in first")
+            note_a2a(actor=agent.name)
             return self._require_current_instance(agent, metadata)
         name = metadata.get(MetaKeys.AGENT)
         if isinstance(name, str) and name.strip():
             agent = self.store.agent_by_name(name.strip())
             if agent is None:
                 raise _invalid(f"unknown agent {name!r}; check in first")
+            note_a2a(actor=agent.name)
             return self._require_current_instance(agent, metadata)
         raise _invalid(f"the message needs a contextId or metadata.{MetaKeys.AGENT}")
 
@@ -827,6 +839,7 @@ class A2AProtocol:
             raise ProtocolError(TaskNotFoundError())
         if task.assignee != agent.name:
             raise _invalid(f"task {task_id} is not assigned to {agent.name}")
+        note_a2a(task_id=task.id)
         return task
 
 

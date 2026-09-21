@@ -109,7 +109,7 @@ def config(*args, **kwargs):
     return original_config(*args, **kwargs)
 main.uvicorn.Config = config
 
-async def fake_mcp(store, stdout):
+async def fake_mcp(store, stdout, accounting):
     print("stray startup print")
     logger = logging.getLogger("third-party")
     logger.addHandler(logging.StreamHandler(sys.stdout))
@@ -209,7 +209,7 @@ main.uvicorn.Server.main_loop = broken_loop
 """
     if shutdown == "mcp_stuck":
         script += """
-async def stuck_mcp(store, stdout):
+async def stuck_mcp(store, stdout, accounting):
     while True:
         try:
             await asyncio.sleep(3600)

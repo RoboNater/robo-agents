@@ -266,3 +266,37 @@ def test_custom_event_lease_seconds(tmp_path: Path) -> None:
         "HUB_EVENT_LEASE_S": "300",
     })
     assert settings.event_lease_s == 300.0
+
+
+def test_call_accounting_is_off_unless_enabled(tmp_path: Path) -> None:
+    base = {"HUB_STATE_DIR": str(tmp_path)}
+    assert HubSettings.from_env(base).call_accounting is False
+    assert HubSettings.from_env(base).call_log_jsonl is None
+    for value in ("1", "true", "ON", " yes "):
+        assert HubSettings.from_env({**base, "HUB_CALL_ACCOUNTING": value}).call_accounting
+    for value in ("0", "false", "off", "no", ""):
+        assert not HubSettings.from_env({**base, "HUB_CALL_ACCOUNTING": value}).call_accounting
+
+    jsonl = tmp_path / "calls.jsonl"
+    enabled = HubSettings.from_env(
+        {**base, "HUB_CALL_ACCOUNTING": "1", "HUB_CALL_LOG_JSONL": str(jsonl)}
+    )
+    assert enabled.call_log_jsonl == jsonl
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({"HUB_CALL_ACCOUNTING": "maybe"}, "HUB_CALL_ACCOUNTING must be"),
+        (
+            {"HUB_CALL_ACCOUNTING": "1", "HUB_CALL_LOG_JSONL": "calls.jsonl"},
+            "HUB_CALL_LOG_JSONL must be an absolute path",
+        ),
+        ({"HUB_CALL_LOG_JSONL": "/abs/calls.jsonl"}, "requires HUB_CALL_ACCOUNTING=1"),
+    ],
+)
+def test_call_accounting_settings_are_validated(
+    tmp_path: Path, env: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=message):
+        HubSettings.from_env({"HUB_STATE_DIR": str(tmp_path), **env})

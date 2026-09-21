@@ -326,3 +326,63 @@ def test_wire_cancellation_stops_event_consumption(tmp_path: Path) -> None:
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["accounting-on", "accounting-off"])
+async def test_stdio_calls_are_accounted_only_when_enabled(tmp_path: Path, enabled: bool) -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    jsonl = tmp_path / "calls.jsonl"
+    env = {
+        **os.environ,
+        "HUB_STATE_DIR": str(tmp_path),
+        "HUB_DB_PATH": str(tmp_path / "hub.db"),
+        "HUB_HOST": "127.0.0.1",
+        "HUB_PORT": str(port),
+        "HUB_TOKEN": "test",
+    }
+    for name in ("HUB_CALL_ACCOUNTING", "HUB_CALL_LOG_JSONL"):
+        env.pop(name, None)
+    if enabled:
+        env |= {"HUB_CALL_ACCOUNTING": "1", "HUB_CALL_LOG_JSONL": str(jsonl)}
+    secret = "IGNORE PREVIOUS INSTRUCTIONS"
+    params = StdioServerParameters(command=sys.executable, args=["-m", "agent_hub.main"], env=env)
+    # The client parses every stdout line as JSON-RPC, so any stray write
+    # during accounting fails the session here (#7).
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        await session.list_tools()
+        await session.call_tool("initialize_workflow", {"goal": secret})
+        await session.call_tool("wait_for_event", {"timeout_s": 0})
+        state = [await session.call_tool("get_state") for _ in range(2)]
+        await session.call_tool("log_decision", {"summary": secret, "rationale": secret})
+
+    with database(tmp_path / "hub.db") as connection:
+        rows = [dict(row) for row in connection.execute("SELECT * FROM call_log ORDER BY id")]
+    if not enabled:
+        assert rows == []
+        assert not jsonl.exists()
+        return
+    assert [(row["tool"], row["outcome"]) for row in rows] == [
+        ("initialize", "ok"),
+        ("tools/list", "ok"),
+        ("initialize_workflow", "ok"),
+        ("wait_for_event", "null_event"),
+        ("get_state", "ok"),
+        ("get_state", "ok"),
+        ("log_decision", "ok"),
+    ]
+    assert {(row["boundary"], row["actor"]) for row in rows} == {("mcp", "alice")}
+    tools_list = rows[1]
+    assert tools_list["bytes_out"] > 1000  # Ten tool schemas, once per session.
+    first, second = rows[4], rows[5]
+    text = state[0].content[0].text  # type: ignore[union-attr]
+    assert first["content_bytes"] == len(text.encode("utf-8"))
+    assert first["repeat_bytes"] == 0
+    assert 0 < second["repeat_bytes"] <= second["content_bytes"]
+    assert all(row["bytes_out"] > (row["content_bytes"] or 0) for row in rows)
+    assert all(row["workflow_id"] for row in rows[3:])
+    assert len(jsonl.read_text(encoding="utf-8").splitlines()) == len(rows)
+    assert secret not in json.dumps(rows)
+    assert secret not in jsonl.read_text(encoding="utf-8")

@@ -15,6 +15,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
 from pydantic import Field
 
+from .accounting import CallAccounting, McpAccounting
 from .merge_gate import MergeGate
 from .store import HubStore
 
@@ -186,6 +187,8 @@ class CancellableStdin(anyio.AsyncFile[str]):
             payload = json.loads(line)
         except (json.JSONDecodeError, TypeError):
             return line
+        if isinstance(payload, dict) and self._connection.accounting is not None:
+            self._connection.accounting.observe_request(payload, len(line.encode("utf-8")))
         if (
             isinstance(payload, dict)
             and payload.get("method") == "initialize"
@@ -221,6 +224,8 @@ class CancellableStdout(anyio.AsyncFile[str]):
                 and isinstance(payload.get("result"), dict)
                 and "protocolVersion" in payload["result"]
             )
+            if isinstance(payload, dict) and self._connection.accounting is not None:
+                self._connection.accounting.observe_response(payload, len(data))
 
         def deliver(error: Exception | None) -> None:
             if result.done():
@@ -269,11 +274,18 @@ class CancellableStdout(anyio.AsyncFile[str]):
 class McpConnection:
     initialized: bool = False
     initialize_ids: set[str | int] = field(default_factory=set)
+    # Byte accounting of Alice's calls (#78); None unless it is switched on.
+    accounting: McpAccounting | None = None
 
 
-async def run_mcp(store: HubStore, stdout: TextIO) -> bool:
+async def run_mcp(
+    store: HubStore, stdout: TextIO, accounting: CallAccounting | None = None
+) -> bool:
     server = create_mcp(store)
     connection = McpConnection()
+    if accounting is not None and accounting.enabled:
+        tools = frozenset(tool.name for tool in await server.list_tools())
+        connection.accounting = McpAccounting(accounting, tools)
     async with stdio_server(
         stdin=CancellableStdin(sys.stdin, connection),
         stdout=CancellableStdout(stdout, connection),

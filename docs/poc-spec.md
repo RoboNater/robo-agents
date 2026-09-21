@@ -79,6 +79,7 @@ Working name: **hub** (rename later). Python, uv workspace, A2A-shaped data mode
 | `event` | id, kind, payload_json, state (`queued`/`delivered`/`acked`), delivery_id, delivery_attempts, delivered_at, delivery_expires, acked_at, ts | Alice's inbox queue; acked events retained for audit |
 | `decision` | id, ts, summary, rationale, key? | Alice's audit log; optional unique key for deduplication |
 | `operation` | actor, operation_id, payload_hash, response_json, created | idempotency ledger for mutations (§4.1) |
+| `call_log` | id, boundary (`a2a`/`mcp`), actor, tool, outcome, status?, bytes_in, bytes_out, content_bytes?, repeat_bytes?, task_id?, workflow_id?, started, finished | per-call byte accounting (#78), written only when `HUB_CALL_ACCOUNTING=1`; sizes and closed-set labels, never payload text. A per-agent tally is `GROUP BY actor` |
 
 **Event kinds:** `agent_checked_in` (payload carries the profile), `task_progress`, `task_completed`, `task_failed`, `worker_question`, `lease_expired`, `agent_lost`
 
