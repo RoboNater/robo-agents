@@ -792,6 +792,74 @@ def test_gate_response_cannot_come_from_another_pr(proof: tuple[Any, ...], label
     )
 
 
+def test_extract_single_json_object() -> None:
+    extract = STEP6.extract_single_json_object
+    assert extract('{"a": 1}') == {"a": 1}
+    assert extract('Prefix: {"a": 1}') == {"a": 1}
+    assert extract('{"a": 1}. Done.') == {"a": 1}
+    assert extract('Prefix: {"a": 1}. Done.') == {"a": 1}
+    assert extract('Nested: {"a": {"b": 2}}.') == {"a": {"b": 2}}
+    assert extract('Brace in string: {"a": "hello {world}"}.') == {"a": "hello {world}"}
+    # Fail closed on multiple JSON objects, malformed JSON, or wrong shapes
+    assert extract('{"a": 1} {"b": 2}') is None
+    assert extract('First {"a": 1} second {"b": 2}') is None
+    assert extract('{"a": 1') is None
+    assert extract('{"a": }') is None
+    assert extract('{"a": 1}}') is None
+    assert extract('{{ "a": 1 }') is None
+    assert extract('} {"a": 1 }') is None
+    assert extract('{malformed} {"a": 1}') is None
+    assert extract('{"a": 1} {malformed') is None
+    assert extract("not json") is None
+    assert extract("null") is None
+    assert extract("[]") is None
+    assert extract('"text"') is None
+    assert extract(123) is None
+    assert extract(None) is None
+
+
+@pytest.mark.parametrize("label", ["head", "base", "final"])
+def test_prose_prefixed_gate_decision_passes(proof: tuple[Any, ...], label: str) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    row = next(row for row in snapshot["decision"] if row["key"] == "step6:gate:" + label)
+    row["rationale"] = f"Actual check_merge_gate JSON: {row['rationale']}. Verified."
+    evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
+    assert f"{label}_gate" not in evidence["failed_checks"]
+    assert f"{label}_gate_response_correlated" not in evidence["failed_checks"]
+    assert evidence["passed"]
+
+
+@pytest.mark.parametrize("label", ["head", "base", "final"])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "two_json",
+        "malformed_syntax",
+        "malformed_unclosed",
+        "differing_result",
+    ],
+)
+def test_gate_decision_invalid_or_differing_rationale_fails(
+    proof: tuple[Any, ...], label: str, variant: str
+) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    row = next(row for row in snapshot["decision"] if row["key"] == "step6:gate:" + label)
+    original = row["rationale"]
+    if variant == "two_json":
+        row["rationale"] = f"{original} {original}"
+    elif variant == "malformed_syntax":
+        row["rationale"] = "Actual gate JSON: {malformed"
+    elif variant == "malformed_unclosed":
+        row["rationale"] = original[:-1]
+    elif variant == "differing_result":
+        payload = json.loads(original)
+        payload["head_matches"] = not payload.get("head_matches", False)
+        row["rationale"] = f"Actual check_merge_gate JSON: {json.dumps(payload)}"
+    evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
+    assert not evidence["passed"]
+    assert f"{label}_gate_response_correlated" in evidence["failed_checks"]
+
+
 @pytest.mark.parametrize(
     "command,failed_check",
     [
@@ -1538,7 +1606,20 @@ def test_own_workspace_paths_are_not_cross_access() -> None:
         assert "other_workspace" not in STEP6.recorded_shell_actions(command, workspace, other)
 
 
-@pytest.mark.parametrize("rationale", ["null", "[]", '"text"', '{"urls": 3}', "not json"])
+@pytest.mark.parametrize(
+    "rationale",
+    [
+        "null",
+        "[]",
+        '"text"',
+        '{"urls": 3}',
+        "not json",
+        '{"urls": []} {"urls": []}',
+        'Prefix {"urls": []} suffix {"urls": []}',
+        '{"urls": []}}',
+        '{"urls": [}',
+    ],
+)
 def test_wrong_shaped_follow_ups_fail_closed(proof: tuple[Any, ...], rationale: str) -> None:
     manifest, snapshot, facts, traces = copy.deepcopy(proof)
     row = next(row for row in snapshot["decision"] if row["key"] == "step6:follow-ups")
@@ -1546,6 +1627,15 @@ def test_wrong_shaped_follow_ups_fail_closed(proof: tuple[Any, ...], rationale: 
     assert (
         "follow_ups_verified" in STEP6.evaluate(manifest, snapshot, facts, traces)["failed_checks"]
     )
+
+
+def test_prose_prefixed_follow_ups_pass(proof: tuple[Any, ...]) -> None:
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    row = next(row for row in snapshot["decision"] if row["key"] == "step6:follow-ups")
+    row["rationale"] = 'Verified close-out. Follow-up URLs JSON: {"urls": []}. No action.'
+    evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
+    assert "follow_ups_verified" not in evidence["failed_checks"]
+    assert evidence["passed"]
 
 
 def test_codex_exec_windows_command_is_unwrapped() -> None:
