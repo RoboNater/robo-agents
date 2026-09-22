@@ -7,11 +7,13 @@ This document assesses the feasibility and architectural impact of expanding **r
 ### Verdict: **High Feasibility; Equivalent Safety is Achievable**
 - **Feasibility is High**: The foundational coordination mechanics of robo-agents—the **hub-centric pull model**, A2A JSON-RPC transport, SQLite durable event ledger, worker heartbeats, task leasing, and prompt-injection defense—are **completely forge-agnostic**.
 - **Equivalent Safety is Achievable**: GitLab provides the technical primitives necessary to satisfy every core safety rail in [`docs/poc-spec.md`](poc-spec.md) §5 (including head-SHA-bound merges, stale-base detection, and CI verification). However, achieving true invariant parity requires explicit accommodation of GitLab-specific behaviors rather than assuming a 1:1 mapping:
-  1. Managing `glab` CLI's positional syntax, policy flag mappings, unsafe default auto-merge behavior, and known version bugs.
-  2. Supporting GitLab's primary pipeline architectures (default branch pipelines, detached MR pipelines, and merged-results pipelines), while explicitly declaring merge trains and server-side automatic rebase unsupported in initial phases.
-  3. Formulating a queryable, fail-closed operational definition of `NO_CHECKS` versus `NO_WORKFLOWS` given GitLab's remote and compliance CI capabilities.
-  4. Handling the full 24-state `detailed_merge_status` machine (including approval rules, unresolved discussions, external checks, and transient polling states) rather than simple conflict checks.
-  5. Binding forge credentials securely to allowlisted base URLs (`HUB_GITLAB_BASE_URLS`) with least-privilege token scoping (`read_api` for the gate).
+  1. Managing `glab` CLI's positional `<iid>` and `-R <repo>` syntax, non-interactive `--yes` flags, and dynamic mapping of `WorkflowPolicy.merge_method`.
+  2. Declaring GitLab server-side auto-rebase (`automatic_rebase_enabled`) and merge trains unsupported in initial phases to preserve the client-verified, head-SHA-bound merge invariant.
+  3. Supporting GitLab's primary pipeline architectures (default branch pipelines, detached MR pipelines, and merged-results pipelines).
+  4. Formulating a queryable, fail-closed operational definition of `NO_CHECKS` versus `NO_WORKFLOWS` given GitLab's remote and compliance CI capabilities.
+  5. Handling the full 24-state `detailed_merge_status` machine (including approval rules, unresolved discussions, external checks, and transient polling states) rather than simple conflict checks.
+  6. Binding forge credentials securely to allowlisted, normalized base URLs (`HUB_GITLAB_BASE_URLS`) with least-privilege token scoping (`read_api` for the gate).
+  7. Failing closed (HTTP 404) when `{role}.gitlab.md` guides are missing, avoiding silent fallbacks to GitHub instructions.
 
 ---
 
@@ -95,21 +97,24 @@ In the current PoC, GitHub integration is embedded across code, configuration, s
 | **Namespace & Hierarchy** | 2-level: `owner/repo` | Multi-level: `group/subgroup1/.../project` or `user/project` | GitLab projects can have arbitrary nesting. Slugs cannot assume `len(parts) == 2`. Project paths must be URL-encoded (`group%2Fsubgroup%2Fproject`) as `:id` for API calls. |
 | **Change Request** | Pull Request (PR) | Merge Request (MR) | Conceptually equivalent. URLs use `/-/merge_requests/<iid>` instead of `/pull/<number>`. |
 | **Issue Tracking** | Issue `#123` | Issue `#123` (identified by project-scoped `iid`) | Identical semantics. Closing keywords (`Closes #N`, `Fixes #N`) supported natively by both. |
-| **Review & Comments** | PR Comments & Formal Reviews (`gh pr comment`, `gh pr review`) | Notes & Discussions (`glab mr note`, `POST /notes`) | Both support markdown comments and threads. Under a shared PoC account, both use comment-based approval. |
+| **Review & Comments** | PR Comments & Formal Reviews (`gh pr comment`, `gh pr review`) | Notes & Discussions (`glab mr note`, `POST /notes`) | Both support markdown comments and threads. Reviewers must pass `--resolvable=false` to prevent opening unresolved threads. |
 | **Merge Head Binding** | `gh pr merge --match-head-commit <sha>` | REST API `sha` param or `glab mr merge <iid> -R <repo> --sha <sha>` | Equivalent safety primitive: GitLab API `PUT /merge` rejects merges with HTTP 409 if `sha` does not match the MR HEAD. |
 | **CI / Checks** | GitHub Actions Workflows & Check Runs | GitLab CI/CD Pipelines & External Status Checks | Diverse pipeline types (default branch pipelines, detached MR pipelines, merged-results). Requires conservative mapping of pipeline states. |
 | **Stale Base Detection** | GitHub Compare API (`behind_by > 0`) | MR `diverged_commits_count > 0` or Compare API | MR API requires `?include_diverged_commits_count=true`. Compare fallback requires `from=<source>&to=<target_tip>` to count target-ahead commits. |
 | **Mergeability** | `mergeable` (`MERGEABLE` / `CONFLICTING`) | `has_conflicts` & `detailed_merge_status` | GitLab mergeability covers approvals, unresolved threads, external checks, and security policies (24 statuses). |
-| **Discussion Gating** | Branch protection setting | Native MR status (`discussions_not_resolved`) | GitLab natively reports whether unresolved discussions block the merge. |
+| **Discussion Gating** | Branch protection setting | Native MR status (`discussions_not_resolved`) | GitLab natively reports whether unresolved discussions block the merge. Reviewer must not open resolvable threads. |
 | **Deployment Model** | Primarily SaaS (`github.com`) | Common SaaS (`gitlab.com`) + Ubiquitous Self-Hosted (CE/EE) | Requires configurable base URLs, custom ports, corporate TLS/CA bundles, and host-bound token allowlisting. |
 
-### Forge Selection: Per-Run Dynamic Resolution
-In robo-agents, a single hub instance and `HUB_STATE_DIR` coordinate exactly **one workflow per run** (spec §4.2). Therefore, per-workflow forge resolution operates on a **per-run basis**:
-- During `initialize_workflow(goal, policy)`, the hub detects the forge from the goal URL (matching `github.com` vs normalized entries in `HUB_GITLAB_BASE_URLS`).
-- Because `WorkflowPolicy` enforces strict schema validation (`extra="forbid"`), supporting a durable forge type requires adding a typed field to `WorkflowPolicy`:
-  `forge: Literal["github", "gitlab"] = "github"` (see §6.1).
-- Guide serving (`GET /guides/{role}.md`) reads the active workflow's forge directly from SQLite. In `agent_hub/guides.py`, if `workflow.policy.forge == "gitlab"`, the route resolves `{role}.gitlab.md` from `HUB_GUIDES_DIR`, cleanly falling back to `{role}.md`. Workers make no query-parameter changes.
-- The `--forge` flag in `scripts/prepare-run.py` acts as an explicit override or provides the forge type for bare local directories.
+### Forge Selection: Per-Run Lifecycle & Storage
+In robo-agents, a single hub instance and `HUB_STATE_DIR` coordinate exactly **one workflow per run** (spec §4.2). Attempting to re-initialize an existing state dir with a different goal or policy is refused with `ConflictError`. Therefore, forge resolution operates on a **per-run basis**:
+- `scripts/prepare-run.py` resolves the forge from the target repository argument (or an explicit `--forge [github|gitlab]` flag) and writes `forge` into Alice's rendered `alice.prompt.md` policy.
+- Because `WorkflowPolicy` enforces strict schema validation (`ConfigDict(extra="forbid", strict=True)`), supporting a durable forge type requires adding an explicit typed field to `WorkflowPolicy`:
+  ```python
+  forge: Literal["github", "gitlab"] = "github"
+  ```
+  (see §6.1). When Alice initializes the workflow, `forge` is already part of the requested policy, preventing restart conflicts.
+- Because `_validated_workflow_policy()` uses `model_dump(exclude_unset=True)`, the default value (`"github"`) is omitted from raw `policy_json`. Code reading stored policy must deserialize it via `WorkflowPolicy.model_validate(json.loads(row["policy_json"])).forge`, rather than indexing the raw dictionary.
+- Guide serving (`GET /guides/{role}.md`) in `agent_hub/app.py` checks this typed `forge` field. When `forge == "gitlab"`, it attempts to serve `{role}.gitlab.md` from `HUB_GUIDES_DIR`. If that file is missing, it **fails closed with HTTP 404** (see §6.2), preventing silent fallback to GitHub instructions.
 
 ---
 
@@ -119,16 +124,15 @@ In robo-agents, a single hub instance and `HUB_STATE_DIR` coordinate exactly **o
 - **Requirement**: Merging must be bound to the exact commit SHA approved by the reviewer. If a commit lands after approval, the merge must fail and route to re-review.
 - **GitLab Support**:
   - GitLab REST API: `PUT /projects/:id/merge_requests/:mr_iid/merge` accepts parameter `sha=<sha>`. If the current MR HEAD does not equal `sha`, GitLab rejects the request with HTTP `409 Conflict` (`"SHA does not match HEAD of source branch"`).
-- **The Critical `glab` CLI Hazard & Syntax Rules**:
-  - **Positional Syntax**: `glab mr merge` takes the MR IID or branch as its positional argument, **not** a full MR URL. The repository must be specified with `-R` / `--repo` (e.g. `-R [HOST/]GROUP/.../PROJECT` or full repository URL).
-  - **Merge Method Mapping**: `WorkflowPolicy.merge_method` permits `squash`, `merge`, and `rebase`. The CLI invocation must dynamically map this policy:
-    - `squash` → `--squash`
-    - `rebase` → `--rebase`
-    - `merge` → omit strategy flag (GitLab defaults to standard merge commit)
-  - **Auto-Merge Hazard**: In `glab mr merge`, **auto-merge defaults to `true` when a pipeline is running**. Running `glab mr merge` on an active pipeline will silently schedule auto-merge rather than performing an immediate merge or failing! Furthermore, `glab` v1.66.0 suffers from an upstream issue ([glab#8485](https://gitlab.com/gitlab-org/cli/-/issues/8485)) where it can report "Merged!" while the MR is merely queued for auto-merge.
-  - **Executable Phase 1 CLI Syntax**:
+- **`glab` CLI Syntax & Strategy Mapping**:
+  - **Positional Arguments**: `glab mr merge` takes the MR IID or branch as its positional argument, **not** a full MR URL. The repository must be targeted with `-R <project_repo>` (accepting `[HOST/]GROUP/.../PROJECT` or full repository URL).
+  - **Dynamic Policy Mapping**: `WorkflowPolicy.merge_method` permits `squash`, `merge`, and `rebase`. In GitLab, merge topologies are controlled by project settings (`merge`, `rebase_merge`/semi-linear, or `ff`), while CLI flags modify behavior:
+    - **Policy `rebase` is UNSUPPORTED on GitLab**: GitLab's `glab mr merge --rebase` commands the server to rebase the MR commits on top of the target branch *before* merging. This creates a newly rewritten commit on the server with a new SHA at merge time. If combined with `--sha <approved_head>`, it either fails with HTTP 409 or merges code that was never reviewed or tested by CI. (Client-side rebase is already handled by robo-agents' §5 REBASE worker task).
+    - **Policy `squash`**: Pass `--squash`. Project settings (`squash_option`) must permit squashing.
+    - **Policy `merge`**: Omit strategy flags. Project settings must allow merge commits.
+  - **Auto-Merge Hazard & `--yes`**: `glab mr merge` defaults auto-merge to `true` when a pipeline is running, and v1.66.0 has an upstream bug ([glab#8485](https://gitlab.com/gitlab-org/cli/-/issues/8485)) reporting "Merged!" prematurely. Additionally, omitting a strategy flag can trigger an interactive prompt in `glab`. The command must pass `--auto-merge=false` and `--yes` (skip confirmation):
     ```sh
-    glab mr merge <iid> -R <project_repo> --sha <approved_head> --auto-merge=false [--squash | --rebase] --remove-source-branch
+    glab mr merge <iid> -R <project_repo> --sha <approved_head> --auto-merge=false [--squash] --remove-source-branch --yes
     ```
     Alice or the hub must immediately read back the MR state to verify `state == "merged"`.
   - **REST API Call**: If performing merges via REST, send `sha=<approved_head>`, omit `auto_merge` (or pass `auto_merge=false`), and verify `state == "merged"`. (Note: the older parameter `merge_when_pipeline_succeeds` was deprecated in GitLab 17.11).
@@ -214,7 +218,11 @@ In GitLab, `detailed_merge_status` evaluates 24 authoritative states:
 | `security_policy_violations`, `commits_status` | Policy Blocker | No | Compliance violation or commit rule failure; escalate. |
 | *Unknown Future Status* | Fail Closed | No | Unknown blocker; log and escalate to operator. |
 
-*Legacy Fallback*: For older self-hosted instances (prior to GitLab 15.6 when `detailed_merge_status` was introduced), the adapter falls back to `merge_status` (`can_be_merged` → Clean, `cannot_be_merged` → Conflicting, `checking` / `unchecked` → Polled in `_POLLED_CI`) combined with `has_conflicts`.
+*Legacy Fallback (GitLab < 15.6)*:
+- If `detailed_merge_status` is not present, fall back to `merge_status` combined with `has_conflicts`:
+  - `can_be_merged` → `Mergeable.CLEAN`.
+  - `checking`, `unchecked`, `cannot_be_merged_recheck` → `Mergeable.UNKNOWN` (polled in `_POLLED_CI`).
+  - `cannot_be_merged`: **Must not be treated as an automatic conflict**. Route to `rebase` only if `has_conflicts == true`. If `has_conflicts == false`, classify as unmergeable / policy blocker and escalate to the operator.
 
 ---
 
@@ -253,7 +261,7 @@ In GitLab, `detailed_merge_status` evaluates 24 authoritative states:
 3. **Alice Merge Execution**:
    - *Phase 1 Baseline (Honoring Spec §8)*: Alice merges via shell using:
      ```sh
-     glab mr merge <iid> -R <project_repo> --sha <approved_head> --auto-merge=false [--squash | --rebase] --remove-source-branch
+     glab mr merge <iid> -R <project_repo> --sha <approved_head> --auto-merge=false [--squash] --remove-source-branch --yes
      ```
    - *Proposed Product Evolution (Amending Spec §8)*: Propose amending the locked decision to introduce a hub MCP tool `merge_change_request(url, approved_head, method)`. Mediating merges through the hub eliminates CLI dependency hazards and unsafe auto-merge defaults.
 
@@ -284,8 +292,8 @@ In GitLab, `detailed_merge_status` evaluates 24 authoritative states:
     class ForgeMergeGate(Protocol):
         async def check(self, change_url: str, expected_head_sha: str) -> GateReport: ...
     ```
-  - Implement `GitHubMergeGate` (preserving existing `gh` logic) and `GitLabMergeGate` (using `httpx` against GitLab API v4).
-  - Implement a unified URL parser combining allowlisted base URLs and non-backtracking segment validation:
+  - Implement `GitHubMergeGate` (preserving existing `gh` logic) and `GitLabMergeGate` (using `httpx` against GitLab API v4 with `read_api` token scope).
+  - Implement a structural, normalized URL parser using `urlsplit` and longest matching allowlisted base URL (`HUB_GITLAB_BASE_URLS`):
     ```python
     SEG = r"(?!\.\.?/)[A-Za-z0-9_.][A-Za-z0-9_.-]*"
     PATH_RE = re.compile(rf"^/(?P<project>{SEG}(?:/{SEG})*)/-/merge_requests/(?P<number>[1-9][0-9]*)/?$")
@@ -295,29 +303,49 @@ In GitLab, `detailed_merge_status` evaluates 24 authoritative states:
         Parses an MR URL against trusted base URLs (supporting host, port, and subpaths).
         Returns (matched_base_url, project_path, mr_number, api_url).
         """
-        clean_url = url.strip()
-        matched_base = None
-        for base in trusted_base_urls:
-            norm_base = base.rstrip("/")
-            if clean_url.startswith(norm_base + "/"):
-                matched_base = norm_base
-                break
+        cand = urlsplit(url.strip())
+        if cand.scheme.lower() != "https" or not cand.hostname:
+            raise MergeGateError(f"Candidate URL must be https: {url}")
+        if cand.username or cand.password or cand.query or cand.fragment:
+            raise MergeGateError(f"URL contains forbidden userinfo/query/fragment: {url}")
 
-        if not matched_base:
+        cand_netloc = f"{cand.hostname.lower()}:{cand.port}" if cand.port and cand.port != 443 else cand.hostname.lower()
+        cand_origin = f"https://{cand_netloc}"
+        cand_path = cand.path
+
+        matching_bases = []
+        for b in trusted_base_urls:
+            b_parts = urlsplit(b.strip())
+            b_netloc = f"{b_parts.hostname.lower()}:{b_parts.port}" if b_parts.port and b_parts.port != 443 else b_parts.hostname.lower()
+            b_origin = f"https://{b_netloc}"
+            b_path = b_parts.path.rstrip("/")
+            if cand_origin == b_origin:
+                if not b_path or cand_path == b_path or cand_path.startswith(b_path + "/"):
+                    matching_bases.append((f"{b_origin}{b_path}", b_path))
+
+        if not matching_bases:
             raise MergeGateError(f"URL base is not in trusted allowlist: {url}")
 
-        remainder = clean_url[len(matched_base):]
+        # Longest matching base path prevents prefix ambiguity
+        matching_bases.sort(key=lambda x: len(x[1]), reverse=True)
+        best_base, best_b_path = matching_bases[0]
+
+        remainder = cand_path[len(best_b_path):]
         match = PATH_RE.fullmatch(remainder)
         if not match:
             raise MergeGateError(f"Invalid GitLab MR path or segment traversal: {remainder}")
 
         project = match.group("project")
         number = int(match.group("number"))
-        api_url = f"{matched_base}/api/v4/projects/{quote(project, safe='')}/merge_requests/{number}"
-        return matched_base, project, number, api_url
+        api_url = f"{best_base}/api/v4/projects/{quote(project, safe='')}/merge_requests/{number}"
+        return best_base, project, number, api_url
     ```
-- **Guide Serving (`agent_hub/guides.py`)**:
-  - Update `serve_guide(role: str)` to inspect the active workflow's `policy.forge`. If `forge == "gitlab"`, it resolves `{role}.gitlab.md` from `HUB_GUIDES_DIR`, cleanly falling back to `{role}.md`.
+- **Guide Serving (`agent_hub/app.py` & `agent_hub/guides.py`)**:
+  - In `app.py:147`, the route queries `hub_store.get_workflow()` and deserializes its policy:
+    ```python
+    forge = WorkflowPolicy.model_validate(json.loads(workflow.policy_json)).forge
+    ```
+  - If `forge == "gitlab"`, it passes `{role}.gitlab.md` to `guide_response()`. If that file does not exist, it **fails closed with HTTP 404** (never falling back to `{role}.md`).
 - **Strings (`store.py`, `protocol.py`)**:
   - Generalize `DEFAULT_GOAL` and payload-cap error messages from "Store work product in GitHub" to "Store work product in the forge (GitHub/GitLab)".
 
@@ -326,21 +354,32 @@ In GitLab, `detailed_merge_status` evaluates 24 authoritative states:
 - If Strategy C is adopted, `worker_mcp` will expose new helper tools (`create_change_request`, `view_change_head`).
 
 ### 6.4 Role Guides (`guides/*.md`)
-- Dynamically serve `{role}.gitlab.md` files containing explicit `glab` invocation flags:
-  - Implementer: `glab mr create --title ... --description ...`
-  - Reviewer: `glab mr note -R <repo> -m "Reviewer agent <name> on behalf of <account>..."`
-  - Rebase: `glab mr view <iid> -R <repo> --output json`
+- Dynamically serve `{role}.gitlab.md` files containing executable `glab` syntax:
+  - Implementer:
+    ```sh
+    glab mr create -R <project_repo> --source-branch <branch> --target-branch <base> --title "..." --description "..." --yes
+    ```
+  - Reviewer:
+    ```sh
+    glab mr note create <iid> -R <project_repo> --resolvable=false -m "Reviewer agent <name> on behalf of <account>..."
+    ```
+    (Note: passing `<iid>` is required so the comment targets the specific MR rather than the clone's checked-out branch, and `--resolvable=false` is mandatory to avoid creating unresolved thread blockers).
+  - Rebase:
+    ```sh
+    glab mr view <iid> -R <project_repo> --output json
+    ```
+- Provide `guides/worker.gitlab.md` (or forge-neutralize `guides/worker.md`) replacing "GitHub is the work-product store".
 
 ### 6.5 Alice Orchestrator Skill & Prompts
-- Update `skills/alice-orchestrator/SKILL.md` to specify GitLab merge commands:
+- Update `skills/alice-orchestrator/SKILL.md` to specify the executable GitLab merge command with dynamic method mapping:
   ```sh
-  glab mr merge <iid> -R <project_repo> --sha <approved_head> --auto-merge=false [--squash | --rebase] --remove-source-branch
+  glab mr merge <iid> -R <project_repo> --sha <approved_head> --auto-merge=false [--squash] --remove-source-branch --yes
   ```
 - Update `prompts/alice.md` comment identity account placeholders to support GitLab usernames.
 
 ### 6.6 Run Scripts & Automation
 - `scripts/run_common.py`: Update `parse_github_slug` to a generalized `parse_forge_slug` supporting nested paths.
-- `scripts/prepare-run.py`: Add `--forge [github|gitlab]` flag and implement GitLab preflight checks (token validity, project permissions, CI config discovery, and rejecting merge trains / automatic rebase).
+- `scripts/prepare-run.py`: Add `--forge [github|gitlab]` flag, inject `forge` into Alice's rendered policy, and implement GitLab preflight checks (token validity, project permissions, CI config discovery, and rejecting merge trains / automatic rebase).
 - `scripts/step6.py`, `scripts/hub-report.py`, `mock-alice.py`, `mock-worker.py`: Parameterize repository URLs and workflow paths for multi-forge testing.
 
 ---
@@ -359,8 +398,9 @@ GitLab distinguishes API access from Git repository access:
 
 ### 7.2 Base-URL Allowlisting & SSRF Prevention
 When the hub receives a merge request URL, it must **never send its bearer token to an arbitrary host parsed from untrusted text**:
-- Configure `HUB_GITLAB_BASE_URLS` as an allowlist of trusted base URLs (defaulting to `["https://gitlab.com"]`), which also accommodates custom ports and subfolder installations (e.g. `https://corp.internal:8443/gitlab`).
-- The hub's HTTP client must verify that the MR URL begins with an allowlisted base URL before attaching the `PRIVATE-TOKEN` header.
+- Configure `HUB_GITLAB_BASE_URLS` as a normalized allowlist of trusted base URLs (defaulting to `["https://gitlab.com"]`), which also accommodates custom ports and subfolder installations (e.g. `https://corp.internal:8443/gitlab`).
+- Base URLs are validated at startup: HTTPS scheme required, userinfo/query/fragment forbidden, lowercase host normalized, and default port `:443` stripped.
+- The hub's HTTP client verifies that the candidate MR URL matches an allowlisted base URL before attaching the `PRIVATE-TOKEN` header.
 - Disallow unvalidated HTTP redirects to external hosts.
 
 ### 7.3 Corporate TLS & Custom CA Bundles
@@ -377,7 +417,7 @@ Enterprise GitLab instances frequently use internal enterprise PKI. Environment 
 Phase 1: Spec Revision, Model Update & String Generalization
   ├── Add typed forge: Literal["github", "gitlab"] = "github" to WorkflowPolicy
   ├── Propose amendments to docs/poc-spec.md §4.2, §8 (forge-neutral gate rules,
-  │   merge tool consideration, and declaring merge trains / auto-rebase unsupported)
+  │   merge tool consideration, declaring policy "rebase" and merge trains unsupported)
   ├── Generalize URL parsing in scripts/run_common.py for nested paths (group/subgroup/project)
   ├── Generalize user-facing remediation strings in store.py and protocol.py
   └── Add unit tests for parse_gitlab_mr_url, base-URL allowlist matching, and ReDoS resistance
@@ -387,19 +427,22 @@ Phase 2: GitLab Merge Gate Adapter in Hub
   ├── Define ForgeMergeGate protocol in agent_hub.merge_gate
   ├── Implement GitLabMergeGate using httpx against GitLab API v4 with read_api token scope
   ├── Implement default branch pipelines, detached MR pipelines, and merged-results parent check
-  ├── Implement ?include_diverged_commits_count=true and compare fallback
+  ├── Implement ?include_diverged_commits_count=true and compare fallback (from=source&to=target)
   ├── Implement 24-status detailed_merge_status mapping with legacy merge_status fallback
+  │   (requiring has_conflicts == true before routing to rebase)
   ├── Enforce base-URL allowlisting (HUB_GITLAB_BASE_URLS) and SSRF protection
   └── Write comprehensive unit tests in tests/test_gitlab_merge_gate.py with mock HTTP fixtures
 
 Phase 3: Guide Serving & Orchestrator Skill
-  ├── Update agent_hub/guides.py to serve {role}.gitlab.md when workflow.policy.forge == "gitlab"
-  ├── Create guides/implementer.gitlab.md, reviewer.gitlab.md, rebase.gitlab.md with glab syntax
+  ├── Update agent_hub/app.py to resolve {role}.gitlab.md based on active workflow policy forge,
+  │   failing closed with 404 if missing
+  ├── Create guides/implementer.gitlab.md, reviewer.gitlab.md, rebase.gitlab.md, worker.gitlab.md
+  │   with glab syntax (--resolvable=false for reviewer notes, --yes for mr create)
   ├── Update skills/alice-orchestrator/SKILL.md with safe glab mr merge syntax and policy mapping
   └── Test mock-alice and mock-worker workflows against simulated GitLab responses
 
 Phase 4: Run Preparation & Tooling Updates
-  ├── Add --forge flag to scripts/prepare-run.py
+  ├── Add --forge flag to scripts/prepare-run.py and inject forge into rendered policy
   ├── Implement GitLab preflight checks (token validity, project permissions, rejecting merge trains
   │   and automatic rebase)
   └── Update scripts/hub-report.py to handle GitLab MR references cleanly
@@ -414,4 +457,4 @@ Phase 5: Validation & End-to-End Testing
 
 ## 9. Conclusion & Recommendation
 
-Supporting GitLab workflows in `robo-agents` is **highly feasible and architecturally clean**. The core pull-coordination architecture, task state machine, and durable leasing engine require zero modifications. By updating `WorkflowPolicy` with a typed forge field, implementing a dedicated `GitLabMergeGate` adapter over HTTPX with `read_api` token scope, accommodating default branch and merged-results pipelines, rejecting incompatible merge train configurations in preflight, and providing a hardened base-URL parser, robo-agents can achieve equivalent safety on GitLab without sacrificing the rigor of its workflow invariants.
+Supporting GitLab workflows in `robo-agents` is **highly feasible and architecturally clean**. The core pull-coordination architecture, task state machine, and durable leasing engine require zero modifications. By updating `WorkflowPolicy` with a typed forge field, implementing a dedicated `GitLabMergeGate` adapter over HTTPX with `read_api` token scope, accommodating default branch and merged-results pipelines, rejecting incompatible merge train and server-side auto-rebase configurations in preflight, enforcing `--resolvable=false` on reviewer notes, and providing a hardened structural base-URL parser, robo-agents can achieve equivalent safety on GitLab without sacrificing the rigor of its workflow invariants.
