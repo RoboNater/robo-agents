@@ -747,3 +747,29 @@ When the workflow completes:
      # Stop-Process -Id <PID> -Force
      ```
 5. Your target repository will have a merged pull request, closing the issue (when referenced with `Closes #<issue>`).
+
+---
+
+## After the Run
+
+`scripts/hub-report.py` summarizes one run from its hub state: per agent, the
+hub calls made while active and while waiting, turn/waiting/idle time, timeouts,
+transport retries and bytes on each boundary; per task, the role, assignee,
+lease, wall time, outcome, head SHA, questions and progress notes; and for the
+workflow, elapsed time against `max_wall_minutes`, review rounds against
+`max_review_rounds`, logged merge-gate readings, the merged SHA and every
+`log_decision` entry.
+
+```bash
+uv run --locked python scripts/hub-report.py --state-dir /path/to/my-run/hub-state
+uv run --locked python scripts/hub-report.py --state-dir /path/to/my-run/hub-state --format json
+uv run --locked python scripts/hub-report.py --state-dir /path/to/my-run/hub-state --format md
+```
+
+It opens `hub.db` read-only, so it can run while the workflow is still going,
+and reads the worker telemetry (`*-telemetry.jsonl`) beside the state directory
+unless `--telemetry` names the files. The figures are message-body bytes, not
+tokens or cost. Alice's bytes and the hub-side wire bytes are measured only
+when the hub ran with `HUB_CALL_ACCOUNTING=1` (see `.env.example`). The report
+prints sizes and counts, never payload text; `--no-labels` also leaves out the
+goal, task titles, decision keys and summaries.
