@@ -11,6 +11,7 @@ import httpx
 import pytest
 from agent_hub.database import initialize_database
 from agent_hub.store import HubStore
+from agent_hub_common import TaskState
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("hub_report", ROOT / "scripts/hub-report.py")
@@ -352,6 +353,45 @@ def test_a_workflow_in_progress_reports_partial_figures(tmp_path: Path) -> None:
     assert report["workflow"]["merged"] is None
     assert "(open)" in REPORT.render_text(report)
     assert "(in progress)" in REPORT.render_text(report, markdown=True)
+
+
+def test_limits_left_out_of_the_stored_policy_report_their_defaults(tmp_path: Path) -> None:
+    state = tmp_path / "hub-state"
+    state.mkdir()
+    initialize_database(state / "hub.db")
+    store = HubStore(path=state / "hub.db")
+    # Only what Alice supplies is stored; the hub enforces the §5 defaults.
+    store.initialize_workflow()
+
+    workflow = REPORT.build_report(state, telemetry_paths=[])["workflow"]
+
+    assert workflow["max_wall_minutes"] == 120 and workflow["max_review_rounds"] == 3
+    assert workflow["wall_used_fraction"] is not None
+    assert {"max_wall_minutes", "max_review_rounds"} <= set(workflow["policy_defaults"])
+    text = REPORT.render_text(REPORT.build_report(state, telemetry_paths=[]))
+    assert "of max_wall_minutes 120" in text and "of max_review_rounds 3" in text
+
+
+def test_tasks_ended_by_alice_report_their_terminal_outcome(tmp_path: Path) -> None:
+    state = tmp_path / "hub-state"
+    state.mkdir()
+    initialize_database(state / "hub.db")
+    store = HubStore(path=state / "hub.db")
+    store.initialize_workflow()
+    store.check_in("bob")
+    outcomes = {}
+    for override in (TaskState.FAILED, TaskState.CANCELED, None):
+        task = store.assign_task("bob", "implementer", f"IMPLEMENT {override}", MARKER)
+        if override is None:
+            store.cancel_task(task.id)
+        else:
+            store.set_task_state(task.id, override, MARKER)
+        outcomes[task.id] = "canceled" if override is None else override.value
+
+    report = REPORT.build_report(state, telemetry_paths=[])
+
+    assert {task["id"]: task["outcome"] for task in report["tasks"]} == outcomes
+    assert MARKER not in REPORT.render_text(report)
 
 
 async def test_a_live_hub_database_is_read_without_being_modified(

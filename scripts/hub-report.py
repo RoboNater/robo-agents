@@ -44,6 +44,9 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePath
 from typing import Any
 
+from agent_hub_common import WorkflowPolicy
+from pydantic import ValidationError
+
 UNITS = (
     "Figures are serialized message-body bytes (hub call_log and worker telemetry, #78), "
     "not tokens and not billed cost: HTTP headers, TLS/TCP overhead and harness framing "
@@ -387,9 +390,14 @@ def task_figures(
         created = parse_ts(row["created"])
         assigned = telemetry.assigned.get(row["id"])
         finished = parse_ts(row["updated"]) if terminal else None
-        outcome = closed(result.get("outcome")) or closed(result.get("verdict"))
-        if outcome is None and row["state"] == "canceled":
-            outcome = "canceled"
+        # A typed result names its outcome or verdict; Alice's manual cancel or
+        # fail stores only `status`, and a plain cancel stores no result at all.
+        outcome = (
+            closed(result.get("outcome"))
+            or closed(result.get("verdict"))
+            or closed(result.get("status"))
+            or (closed(row["state"]) if terminal else None)
+        )
         tasks.append(
             {
                 "id": row["id"],
@@ -623,7 +631,8 @@ def workflow_figures(
     if not snapshot["workflow"]:
         return None
     row = snapshot["workflow"][0]
-    policy = json_object(row["policy_json"]) or {}
+    stored = json_object(row["policy_json"]) or {}
+    policy, defaulted = effective_policy(stored)
     decisions = sorted(snapshot["decision"], key=lambda item: item["id"])
     created = parse_ts(row["created"])
     end = now
@@ -648,6 +657,7 @@ def workflow_figures(
         "status": closed(row["status"]),
         "created": row["created"],
         "policy": policy,
+        "policy_defaults": defaulted,
         "elapsed_s": elapsed,
         "max_wall_minutes": max_wall,
         "wall_used_fraction": (
@@ -674,6 +684,21 @@ def workflow_figures(
         "events": dict(sorted(_count(e["kind"] for e in snapshot["event"]).items())),
         "messages": len(snapshot["message"]),
     }
+
+
+def effective_policy(stored: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The policy the hub enforces, and which keys came from §5 defaults.
+
+    The hub stores only the keys Alice supplied, so a limit she left out is the
+    `WorkflowPolicy` default, not absent. A stored policy that no longer
+    validates is reported as stored.
+    """
+
+    try:
+        policy = WorkflowPolicy.model_validate(stored).model_dump(mode="json")
+    except ValidationError:
+        return stored, []
+    return policy, sorted(set(policy) - set(stored))
 
 
 def _count(values: Iterable[Any]) -> dict[str, int]:
@@ -894,7 +919,13 @@ def workflow_lines(workflow: Mapping[str, Any] | None) -> list[str]:
         f"id: {workflow['id']}   status: {show(workflow['status'])}   "
         f"created: {workflow['created']}",
         f"goal: {show(workflow['goal'])} ({workflow['goal_bytes']} bytes)",
-        "policy: " + json.dumps(workflow["policy"], sort_keys=True),
+        "policy: "
+        + json.dumps(workflow["policy"], sort_keys=True)
+        + (
+            f" (defaults: {', '.join(workflow['policy_defaults'])})"
+            if workflow["policy_defaults"]
+            else ""
+        ),
         f"elapsed: {duration(workflow['elapsed_s'])} of max_wall_minutes "
         f"{show(workflow['max_wall_minutes'])}"
         + (f" ({fraction:.0%})" if fraction is not None else ""),
