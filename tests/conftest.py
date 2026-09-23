@@ -2,7 +2,9 @@
 
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any, cast
 from uuid import uuid4
 
@@ -22,6 +24,24 @@ BASE_URL = "http://hub.test"
 # production deadline.
 TEST_WAIT_S = 0.2
 TEST_MAX_WAIT_S = 1.0
+
+
+class MonotonicClock:
+    """Wall-clock time that advances only as `time.monotonic()` does.
+
+    A test that sleeps past a lease, or waits for a heartbeat stamp to move,
+    measures the sleep on the monotonic clock, while the store stamps on the
+    wall clock. A host that steps its wall clock back — WSL2 resyncs by seconds
+    (#120, #95) — leaves the lease live or the stamp unmoved after the sleep;
+    one clock for both keeps the sleep meaning what it says.
+    """
+
+    def __init__(self) -> None:
+        self.start = datetime.now(UTC)
+        self.started = monotonic()
+
+    def __call__(self) -> datetime:
+        return self.start + timedelta(seconds=monotonic() - self.started)
 
 
 @pytest.fixture

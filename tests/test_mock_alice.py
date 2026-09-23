@@ -15,7 +15,7 @@ from agent_hub.database import database, initialize_database
 from agent_hub.mcp import create_mcp
 from agent_hub.store import HubStore, TaskRecord
 from agent_hub_common import AgentProfile, HubSettings, TaskState, WorkflowStatus
-from conftest import BASE_URL, TOKEN
+from conftest import BASE_URL, TOKEN, MonotonicClock
 from mcp import ClientSession
 from worker_mcp.client import WorkerHubClient
 from worker_mcp.config import WorkerSettings
@@ -373,7 +373,19 @@ async def test_mock_alice_drives_worker_through_full_task(
             assert any("Assigned task" in d["summary"] for d in decisions)
 
 
+# The scaled endurance scenario keeps the production shape — one work interval
+# outlives lost-after while heartbeats keep the worker live — in seconds, not
+# minutes. Hub sweeper, worker heartbeat and mock Alice share one event loop, so
+# a stall of the loop under full-suite load delays the heartbeat until the
+# sweep that follows it; lost-after must dwarf both the heartbeat interval and
+# any plausible stall, or the sweep declares the worker lost (#95).
+ENDURANCE_HEARTBEAT_S = 0.05
+ENDURANCE_LOST_AFTER_S = 2.0
+ENDURANCE_LONG_WORK_S = 2.5
+
+
 async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> None:
+    assert ENDURANCE_LONG_WORK_S > ENDURANCE_LOST_AFTER_S >= 40 * ENDURANCE_HEARTBEAT_S
     db_path = tmp_path / "endurance.db"
     initialize_database(db_path)
     settings = HubSettings(
@@ -387,17 +399,20 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
         guides_dir=tmp_path / "guides",
         default_wait_s=0.1,
         max_wait_s=1.0,
-        lost_after_s=0.5,
+        lost_after_s=ENDURANCE_LOST_AFTER_S,
         sweep_interval_s=0.02,
     )
     app = create_app(settings)
+    # Mock Alice checks the heartbeat stamp moved across a monotonic sleep; a
+    # wall clock stepped back by more than that sleep would hold it still.
+    app.state.store.clock = MonotonicClock()
     worker_settings = WorkerSettings(
         hub_url=BASE_URL,
         token=TOKEN,
         agent_name="bob",
         profile=AgentProfile(harness="codex"),
         default_wait_s=0.1,
-        heartbeat_s=0.05,
+        heartbeat_s=ENDURANCE_HEARTBEAT_S,
         max_retries=2,
         backoff_factor_s=0.01,
     )
@@ -436,7 +451,7 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
                             )
                         assert "Approved" in reply.get("reply", "")
                     elif observed["cycles"] == 2:
-                        await asyncio.sleep(0.7)
+                        await asyncio.sleep(ENDURANCE_LONG_WORK_S)
 
                     await worker.submit_result(
                         task_id,
@@ -460,8 +475,8 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
                 worker_hold_s=0.1,
                 question_hold_s=0.1,
                 question_reply_delay_s=0.2,
-                long_work_s=0.7,
-                lost_after_s=0.5,
+                long_work_s=ENDURANCE_LONG_WORK_S,
+                lost_after_s=ENDURANCE_LOST_AFTER_S,
                 checkin_timeout_s=2.0,
             )
         )
@@ -469,7 +484,7 @@ async def test_mock_alice_drives_scaled_endurance_scenario(tmp_path: Path) -> No
 
     assert result["cycles"] == 3
     assert result["elapsed_s"] >= 1.5
-    assert result["long_work_interval_s"] >= 0.7
+    assert result["long_work_interval_s"] >= ENDURANCE_LONG_WORK_S
     assert result["heartbeat_advanced"] is True
     assert result["row_counts"] == {
         "assignments": 3,
