@@ -5,6 +5,7 @@ from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -72,6 +73,23 @@ class FakeClock:
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()
+
+
+class MonotonicClock:
+    """Wall-clock time that advances only as `time.monotonic()` does.
+
+    A test that sleeps past a lease measures the sleep on the monotonic clock,
+    while the store stamps the lease on the wall clock. A host that steps its
+    wall clock back — WSL2 resyncs by seconds (#120) — leaves the lease live
+    after the sleep; one clock for both keeps the sleep meaning what it says.
+    """
+
+    def __init__(self) -> None:
+        self.start = datetime.now(UTC)
+        self.started = monotonic()
+
+    def __call__(self) -> datetime:
+        return self.start + timedelta(seconds=monotonic() - self.started)
 
 
 @pytest.fixture
@@ -489,6 +507,7 @@ async def test_alice_crashes_and_a_second_session_finishes_the_task(
     twice — one task, one assignment decision, one reply.
     """
 
+    hub_store.clock = MonotonicClock()
     worker_client = WorkerHubClient(worker, http_client=client)
     worker_task = asyncio.create_task(run_worker_lifecycle(worker_client, ask=asks))
 

@@ -709,6 +709,31 @@ def test_superseded_heartbeat_does_not_renew_or_revive(store: HubStore) -> None:
     assert unchanged_task is not None and unchanged_task.lease_expires == original_expiry
 
 
+def test_a_wall_clock_stepped_back_never_moves_liveness_or_the_lease_back(
+    store: HubStore,
+) -> None:
+    # WSL2 steps its wall clock back by seconds when it resyncs (#120).
+    clock = FakeClock()
+    store.clock = clock
+    store.check_in("bob", worker_instance_id="bob-1")
+    task = store.assign_task("bob", "implementer", "Task", "Work", lease_min=5)
+    clock.advance(minutes=1)
+    assert store.heartbeat("bob", "bob-1", task.id, max_task_lease_min=30)
+    before = store.agent_by_name("bob")
+    renewed = store.get_task(task.id)
+
+    clock.advance(seconds=-2)
+    assert store.heartbeat("bob", "bob-1", task.id, max_task_lease_min=30)
+
+    after = store.agent_by_name("bob")
+    unchanged = store.get_task(task.id)
+    assert before is not None and after is not None
+    assert after.last_heartbeat == before.last_heartbeat
+    assert after.last_seen == before.last_seen
+    assert renewed is not None and unchanged is not None
+    assert unchanged.lease_expires == renewed.lease_expires
+
+
 def test_heartbeat_lease_renewal_stops_at_cap_and_expires_once(tmp_path: Path) -> None:
     clock = FakeClock()
     path = tmp_path / "lease-cap.db"

@@ -735,12 +735,16 @@ class HubStore:
 
         A stale process is deliberately given a successful no-op path: it must
         not revive an agent or lease after a newer instance supersedes it.
+
+        The wall clock can step backwards (WSL2 resyncs by seconds, #120), so
+        the stamp is taken once the write lock is held and never moves either
+        liveness stamp, or the lease, back behind a value already stored.
         """
 
-        now = self._now()
-        now_iso = to_iso(now)
         with database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            now = self._now()
+            now_iso = to_iso(now)
             agent = self._require_agent(connection, name)
             if (
                 agent.worker_instance_id != worker_instance_id
@@ -748,7 +752,8 @@ class HubStore:
             ):
                 return False
             connection.execute(
-                "UPDATE agent SET last_heartbeat = ?, last_seen = ? WHERE name = ?",
+                "UPDATE agent SET last_heartbeat = MAX(last_heartbeat, ?),"
+                " last_seen = MAX(last_seen, ?) WHERE name = ?",
                 (now_iso, now_iso, name),
             )
             if not current_task_id or agent.current_task_id != current_task_id:
@@ -771,7 +776,9 @@ class HubStore:
                     (to_iso(cap), now_iso, task.id),
                 )
                 return True
-            renewed = min(now + timedelta(seconds=task.lease_duration_s), cap)
+            renewed = min(
+                max(now + timedelta(seconds=task.lease_duration_s), current_expiry), cap
+            )
             if renewed != current_expiry:
                 connection.execute(
                     "UPDATE task SET lease_expires = ?, updated = ? WHERE id = ?",
