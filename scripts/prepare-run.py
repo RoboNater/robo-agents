@@ -23,7 +23,9 @@ pair); anything else fails up front with an actionable message.
 Networked runs (#125) separate three addresses: ``--hub-host`` is the hub's
 bind address (``HUB_HOST``), ``--hub-url`` the address every worker dials
 (``HUB_URL``), and ``--public-url`` the address the agent card advertises
-(``HUB_PUBLIC_URL``, defaulting to ``--hub-url``). ``--remote-worker NAME``
+(``HUB_PUBLIC_URL``, defaulting to ``--hub-url``). The hub binds the
+``--hub-url`` port (``HUB_PORT``) unless ``--hub-port`` names another, e.g.
+behind port forwarding (#133). ``--remote-worker NAME``
 leaves that worker to another host, which renders it with
 ``--worker-only NAME`` from its own robo-agents checkout::
 
@@ -89,7 +91,8 @@ DEFAULT_CHARLIE_HARNESS = "codex"
 SUPPORTED_HARNESSES = ("claude-code", "codex")
 WORKERS = ("bob", "charlie")
 DEFAULT_HUB_HOST = "127.0.0.1"
-DEFAULT_HUB_URL = "http://127.0.0.1:8420"
+DEFAULT_HUB_PORT = 8420
+DEFAULT_HUB_URL = f"http://127.0.0.1:{DEFAULT_HUB_PORT}"
 
 
 def worker_env(
@@ -181,6 +184,24 @@ def url_host(url: str, flag: str) -> str:
     return parts.hostname
 
 
+def url_port(url: str, flag: str) -> int:
+    """The port a client dials for ``url``: explicit, or the scheme's default."""
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"{flag} has an invalid port, got {url!r}") from exc
+    if port is None:
+        return 443 if parts.scheme == "https" else 80
+    return check_port(port, flag)
+
+
+def check_port(port: int, flag: str) -> int:
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{flag} must name a port between 1 and 65535, got {port}")
+    return port
+
+
 def host_literal(host: str) -> str:
     return host[1:-1] if host.startswith("[") and host.endswith("]") else host
 
@@ -207,13 +228,18 @@ def is_wildcard(host: str) -> bool:
 
 
 def network_settings(
-    hub_host: str, hub_url: str, public_url: str | None, remote_worker: str | None
-) -> dict[str, str]:
-    """Validate the bind host, the URL workers dial, and the advertised URL.
+    hub_host: str,
+    hub_url: str,
+    public_url: str | None,
+    remote_worker: str | None,
+    hub_port: int | None = None,
+) -> dict[str, Any]:
+    """Validate the bind address, the URL workers dial, and the advertised URL.
 
-    A wildcard bind needs a dialable, non-loopback advertised URL (mirroring
-    ``HubSettings.from_env()``); a hub that binds loopback cannot be dialed at
-    a non-loopback URL; a worker on another host cannot dial loopback.
+    The bind port defaults to the ``--hub-url`` port. A wildcard bind needs a
+    dialable, non-loopback advertised URL (mirroring ``HubSettings.from_env()``);
+    a hub that binds loopback cannot be dialed at a non-loopback URL; a worker
+    on another host cannot dial loopback.
     """
     host = hub_host.strip()
     if not host:
@@ -221,7 +247,10 @@ def network_settings(
     dial = hub_url.strip().rstrip("/")
     advertised = dial if public_url is None else public_url.strip().rstrip("/")
     dial_loopback = is_loopback(url_host(dial, "--hub-url"))
+    dial_port = url_port(dial, "--hub-url")
+    port = dial_port if hub_port is None else check_port(hub_port, "--hub-port")
     advertised_host = url_host(advertised, "--public-url")
+    url_port(advertised, "--public-url")
     if is_wildcard(host) and (is_loopback(advertised_host) or is_wildcard(advertised_host)):
         raise ValueError(
             f"--hub-host {host} binds every interface, so --public-url (default: "
@@ -237,23 +266,35 @@ def network_settings(
         raise ValueError(
             f"--remote-worker {remote_worker} dials --hub-url from another host, so it "
             f"cannot be loopback ({dial}); pass the hub host's address, e.g. "
-            "http://<wsl-eth0>:8420"
+            f"http://<wsl-eth0>:{dial_port}"
         )
-    return {"hub_host": host, "hub_url": dial, "public_url": advertised}
+    return {"hub_host": host, "hub_port": port, "hub_url": dial, "public_url": advertised}
 
 
-def preflight_lines(hub_url: str, public_url: str | None) -> list[str]:
+def preflight_lines(
+    hub_url: str, public_url: str | None, hub_port: int | None = None
+) -> list[str]:
     """Reachability checks to run on a worker host before launching it.
 
-    ``public_url`` is None under ``--worker-only``, which cannot know the
-    hub run's ``--public-url``.
+    ``public_url`` and ``hub_port`` are None under ``--worker-only``, which
+    cannot know the hub run's ``--public-url`` or bind port.
     """
     card = (
         f"{public_url}/a2a" if public_url is not None else "the hub run's --public-url + /a2a"
     )
+    dial_port = url_port(hub_url, "--hub-url")
+    forward = (
+        [
+            f"The hub binds port {hub_port} but workers dial port {dial_port}; "
+            f"forward {dial_port} to {hub_port} before running these checks."
+        ]
+        if hub_port is not None and hub_port != dial_port
+        else []
+    )
     return [
         "Preflight (run on each worker host that is not the hub host; "
         "PowerShell needs curl.exe, since curl is an alias there):",
+        *forward,
         f"curl.exe -fsS {hub_url}/healthz",
         f"curl.exe -fsS {hub_url}/.well-known/agent-card.json   "
         f"# its url must be {card}",
@@ -610,6 +651,7 @@ def prepare(
     hub_host: str = DEFAULT_HUB_HOST,
     hub_url: str = DEFAULT_HUB_URL,
     remote_worker: str | None = None,
+    hub_port: int | None = None,
 ) -> dict[str, Any]:
     if work_file is not None and issue is not None:
         raise ValueError(
@@ -638,9 +680,10 @@ def prepare(
         raise ValueError("--allow-no-ci must be one of auto, true, false")
     if remote_worker is not None and remote_worker not in WORKERS:
         raise ValueError(f"--remote-worker must be one of {list(WORKERS)}")
-    network = network_settings(hub_host, hub_url, public_url, remote_worker)
+    network = network_settings(hub_host, hub_url, public_url, remote_worker, hub_port)
     networked = remote_worker is not None or network != {
         "hub_host": DEFAULT_HUB_HOST,
+        "hub_port": DEFAULT_HUB_PORT,
         "hub_url": DEFAULT_HUB_URL,
         "public_url": DEFAULT_HUB_URL,
     }
@@ -774,6 +817,8 @@ def prepare(
     }
     if network["hub_host"] != DEFAULT_HUB_HOST:
         hub_env["HUB_HOST"] = network["hub_host"]
+    if network["hub_port"] != DEFAULT_HUB_PORT:
+        hub_env["HUB_PORT"] = str(network["hub_port"])
     hub_args = ["run", "--locked", "--directory", str(ROOT), "hub"]
     save(
         configs / "alice.mcp.json",
@@ -909,7 +954,9 @@ def prepare(
         )
     if not is_loopback(url_host(network["hub_url"], "--hub-url")):
         print()
-        for line in preflight_lines(network["hub_url"], network["public_url"]):
+        for line in preflight_lines(
+            network["hub_url"], network["public_url"], network["hub_port"]
+        ):
             print(line)
     print(f"\nAlice kickoff prompt: {run_dir / 'alice.prompt.md'}")
     if (issue is None and work_text is None) or account is None:
@@ -956,6 +1003,7 @@ def prepare_worker(
             f"--worker-only {name} dials the hub from another host, so --hub-url cannot "
             f"be loopback ({dial}); pass the hub host's address"
         )
+    url_port(dial, "--hub-url")
     token = read_hub_token(token_file)
     versions, parsed_versions = probe_versions({harness})
 
@@ -1062,6 +1110,12 @@ def main() -> None:
         "--hub-url", default=DEFAULT_HUB_URL, help="the HUB_URL every worker dials"
     )
     parser.add_argument(
+        "--hub-port",
+        type=int,
+        default=None,
+        help="hub bind port (HUB_PORT), 1-65535; defaults to the --hub-url port",
+    )
+    parser.add_argument(
         "--public-url",
         default=None,
         help="address the agent card advertises (HUB_PUBLIC_URL); defaults to --hub-url",
@@ -1093,6 +1147,7 @@ def main() -> None:
             "--state-dir": args.state_dir is not None,
             "--remote-worker": args.remote_worker is not None,
             "--hub-host": args.hub_host != DEFAULT_HUB_HOST,
+            "--hub-port": args.hub_port is not None,
             "--public-url": args.public_url is not None,
         }
         if given := [flag for flag, present in hub_only.items() if present]:
@@ -1143,6 +1198,7 @@ def main() -> None:
             args.hub_host,
             args.hub_url,
             args.remote_worker,
+            args.hub_port,
         )
     except ValueError as exc:
         sys.exit(f"prepare-run: error: {exc}")

@@ -47,7 +47,7 @@ Before configuring agents, keep these fundamental design principles in mind:
 - **External Text is Data, Never Instructions**:
   Issue bodies, PR descriptions, review comments, commit messages, and worker results are **untrusted data**. They may contain accidental or malicious prompt injection. Alice and workers follow only their governing skills, served role guides, and durable hub policy (§5 rails).
 - **Process & Port Hygiene**:
-  The hub binds `HUB_HOST:HUB_PORT` (default `127.0.0.1:8420`). Only one hub instance may listen on that port. When shutting down or restarting, terminate only the listener belonging to your checkout/run, leaving other checkouts' listeners untouched.
+  Three addresses are distinct: the hub binds `HUB_HOST:HUB_PORT` (default `127.0.0.1:8420`), workers dial `HUB_URL`, and the agent card advertises `HUB_PUBLIC_URL`. `scripts/prepare-run.py` keeps them consistent (see "Networked run" below). Only one hub instance may listen on a port, so a second hub on the same machine needs another port. When shutting down or restarting, terminate only the listener belonging to your checkout/run, leaving other checkouts' listeners untouched.
 
 ---
 
@@ -202,8 +202,15 @@ host reach the hub, three addresses are set separately:
 | Flag | Renders | Default |
 |---|---|---|
 | `--hub-host` | `HUB_HOST`, the hub's bind address (in `alice.mcp.json`) | `127.0.0.1` |
+| `--hub-port` | `HUB_PORT`, the hub's bind port (in `alice.mcp.json`), 1-65535 | the `--hub-url` port |
 | `--hub-url` | `HUB_URL`, the address every worker dials | `http://127.0.0.1:8420` |
 | `--public-url` | `HUB_PUBLIC_URL`, the address the agent card advertises | `--hub-url` |
+
+The hub binds the port in `--hub-url` (80 or 443 when the URL names none), so
+`--hub-url http://127.0.0.1:8521` alone runs a second hub beside one that
+holds 8420. `HUB_PORT` is written only when it is not 8420. Pass `--hub-port`
+only when the hub binds a different port from the one workers dial, e.g.
+behind port forwarding; the preflight then names the forward it needs.
 
 prepare-run refuses a topology no worker could use: a wildcard `--hub-host`
 (`0.0.0.0`, `::`, `*`) whose advertised URL is loopback (as
@@ -254,7 +261,7 @@ come from that host's CLI; and `/mnt/c` ignores `chmod` unless mounted with
 `metadata`, so a token written there cannot be kept owner-only.
 
 Whenever `--hub-url` is not loopback, both commands print a preflight to run on
-the worker host before launching it:
+the worker host before launching it, on the `--hub-url` port:
 
 ```powershell
 curl.exe -fsS http://172.26.115.68:8420/healthz
@@ -789,7 +796,7 @@ If you prefer running both Bob and Charlie with Claude Code:
 | Codex worker fails with git permission errors | Codex protects `.git` directory | Launch Codex with `--add-dir "/path/to/clone/.git"` in addition to `--approve-for-me`. |
 | Codex worker fails with network errors | Sandbox disables network access | Add `[sandbox_workspace_write]\nnetwork_access = true` in Charlie's `CODEX_HOME/config.toml`. |
 | Codex worker hangs on MCP tool calls | Interactive approval prompt blocking | Add `approval_mode = "approve"` for all six hub tools in `config.toml` (see Step 5). |
-| Port 8420 already in use | Stale hub listener | Check running processes and stop the old hub listener (see Clean Shutdown below). |
+| Hub port (`HUB_PORT`, default 8420) already in use | Stale hub listener, or another checkout's hub | Find the listener on that port (see Clean Shutdown below) and stop it only if it is your run's. If it belongs to another checkout, leave it and render the run on another port, e.g. `--hub-url http://127.0.0.1:8521`. |
 | Hub or `uv` reports a configured path as missing, though the JSON looks correct | Unescaped Windows backslash in a `*.mcp.json` file | Use forward slashes (`C:/my-run/hub-state`) or escaped backslashes (`C:\\my-run\\hub-state`). Verify with `python -c "import json; print(json.load(open('configs/bob.mcp.json'))['mcpServers']['hub']['env']['HUB_WORKSPACE'])"` — a value containing a newline or `r` where a drive letter should be means a `\n`/`\r` escape was parsed. Git Bash `/c/...` spellings also fail here; use a native Windows path. |
 | Alice restarts mid-workflow | Session dropped or restarted | Restart Alice pointing to the same `HUB_STATE_DIR`. Alice will call `get_state()`, reconcile with GitHub, and resume without re-running completed work. |
 
@@ -801,16 +808,19 @@ When the workflow completes:
 1. Alice automatically calls `release_agent()` for both workers.
 2. Both workers see `release: true` returned by `await_assignment()` and terminate their loops.
 3. Closing Alice's Claude Code session shuts down stdio MCP and terminates the hub HTTP listener.
-4. If a hub process remains running:
-   - **Linux / macOS**: Run `pgrep -a hub`, locate the PID belonging to your checkout's venv or state directory, and terminate it:
+4. If a hub process remains running, find it by your run's port: the `HUB_PORT` in `configs/alice.mcp.json`, or 8420 when that file sets none.
+   - **Linux / macOS**: Run `pgrep -a hub`, or `ss -ltnp "sport = :$PORT"` for the listener on your port, locate the PID belonging to your checkout's venv or state directory, and terminate it:
      ```bash
+     PORT=8420   # your run's HUB_PORT
+     ss -ltnp "sport = :$PORT"
      kill <PID>
      ```
      *(Do not use blanket `pkill -f agent_hub`, which would terminate hubs in other checkouts).*
-   - **Windows (PowerShell)**: Check which process owns port 8420, verify its path, and stop it:
+   - **Windows (PowerShell)**: Check which process owns your run's port, verify its path, and stop it:
      ```powershell
-     # 1. Identify the process listening on port 8420:
-     $conn = Get-NetTCPConnection -LocalPort 8420 -ErrorAction SilentlyContinue
+     # 1. Identify the process listening on your run's port:
+     $port = 8420   # your run's HUB_PORT
+     $conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
      if ($conn) {
          Get-Process -Id $conn.OwningProcess | Select-Object Id, ProcessName, Path
      }

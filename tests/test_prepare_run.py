@@ -666,6 +666,7 @@ def test_networked_run_renders_addresses_consistently(
     ]["hub"]["env"]
     assert hub_env["HUB_HOST"] == "0.0.0.0"
     assert hub_env["HUB_PUBLIC_URL"] == WSL_URL
+    assert "HUB_PORT" not in hub_env  # 8420 is the hub's own default
     bob_env = json.loads((configs / "bob.mcp.json").read_text(encoding="utf-8"))[
         "mcpServers"
     ]["hub"]["env"]
@@ -675,6 +676,7 @@ def test_networked_run_renders_addresses_consistently(
     assert bob_env["HUB_URL"] == charlie_env["HUB_URL"] == WSL_URL
     assert manifest["network"] == {
         "hub_host": "0.0.0.0",
+        "hub_port": 8420,
         "hub_url": WSL_URL,
         "public_url": WSL_URL,
         "remote_worker": None,
@@ -708,6 +710,125 @@ def test_public_url_overrides_the_advertised_address_only(
         "mcpServers"
     ]["hub"]["env"]
     assert bob_env["HUB_URL"] == WSL_URL
+
+
+PORT_URL = "http://172.26.115.68:8521"
+
+
+def rendered_envs(run_dir: Path) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Alice's hub env and the bob and charlie worker envs of a default-topology run."""
+    configs = run_dir / "configs"
+    hub_env = json.loads((configs / "alice.mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["hub"]["env"]
+    bob_env = json.loads((configs / "bob.mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["hub"]["env"]
+    charlie_env = tomllib.loads((configs / "codex" / "config.toml").read_text(encoding="utf-8"))[
+        "mcp_servers"
+    ]["hub"]["env"]
+    return hub_env, bob_env, charlie_env
+
+
+def test_hub_url_port_becomes_the_bind_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(str(origin), run_dir, hub_host="0.0.0.0", hub_url=PORT_URL)
+    hub_env, bob_env, charlie_env = rendered_envs(run_dir)
+    assert hub_env["HUB_PORT"] == "8521"
+    assert hub_env["HUB_PUBLIC_URL"] == bob_env["HUB_URL"] == charlie_env["HUB_URL"] == PORT_URL
+    assert manifest["network"]["hub_port"] == 8521
+    out = capsys.readouterr().out
+    assert f"curl.exe -fsS {PORT_URL}/healthz" in out
+    assert f"curl.exe -fsS {PORT_URL}/.well-known/agent-card.json" in out
+    assert f"its url must be {PORT_URL}/a2a" in out
+    assert ":8420" not in out
+    assert "forward" not in out
+
+
+def test_loopback_run_on_another_port_binds_that_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A second hub on the same machine, beside one that holds 8420.
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(str(origin), run_dir, hub_url="http://127.0.0.1:8521")
+    hub_env, bob_env, charlie_env = rendered_envs(run_dir)
+    assert "HUB_HOST" not in hub_env
+    assert hub_env["HUB_PORT"] == "8521"
+    assert hub_env["HUB_PUBLIC_URL"] == bob_env["HUB_URL"] == charlie_env["HUB_URL"]
+    assert bob_env["HUB_URL"] == "http://127.0.0.1:8521"
+    assert manifest["network"]["hub_port"] == 8521
+
+
+@pytest.mark.parametrize("hub_port,rendered", [(8600, "8600"), (8420, None)])
+def test_explicit_hub_port_is_rendered_as_given(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    hub_port: int,
+    rendered: str | None,
+) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(
+        str(origin), run_dir, hub_host="0.0.0.0", hub_url=PORT_URL, hub_port=hub_port
+    )
+    hub_env, bob_env, charlie_env = rendered_envs(run_dir)
+    assert hub_env.get("HUB_PORT") == rendered
+    # Workers still dial, and the card still advertises, the --hub-url port.
+    assert hub_env["HUB_PUBLIC_URL"] == bob_env["HUB_URL"] == charlie_env["HUB_URL"] == PORT_URL
+    assert manifest["network"]["hub_port"] == hub_port
+    out = capsys.readouterr().out
+    assert (
+        f"The hub binds port {hub_port} but workers dial port 8521; "
+        f"forward 8521 to {hub_port}"
+    ) in out
+    assert f"curl.exe -fsS {PORT_URL}/healthz" in out
+
+
+def test_url_port_falls_back_to_the_scheme_default() -> None:
+    assert PREPARE_RUN.url_port("http://hub.example", "--hub-url") == 80
+    assert PREPARE_RUN.url_port("https://hub.example/", "--hub-url") == 443
+    assert PREPARE_RUN.url_port("http://[::1]:8521", "--hub-url") == 8521
+
+
+@pytest.mark.parametrize(
+    "extra,expected",
+    [
+        (["--hub-port", "0"], "--hub-port must name a port between 1 and 65535"),
+        (["--hub-port", "65536"], "--hub-port must name a port between 1 and 65535"),
+        (["--hub-url", "http://127.0.0.1:0"], "--hub-url must name a port between 1 and 65535"),
+        (["--hub-url", "http://127.0.0.1:70000"], "--hub-url has an invalid port"),
+        (
+            ["--hub-host", "0.0.0.0", "--hub-url", PORT_URL,
+             "--public-url", "http://hub.example:99999"],
+            "--public-url has an invalid port",
+        ),
+    ],
+)
+def test_out_of_range_ports_are_rejected_before_any_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str], expected: str
+) -> None:
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    message = run_main(monkeypatch, run_dir, "--skip-github-checks", *extra)
+    assert message.startswith("prepare-run: error:")
+    assert expected in message
+    assert not run_dir.exists()
+
+
+def test_non_integer_hub_port_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = (tmp_path / "run").resolve()
+    assert run_main(monkeypatch, run_dir, "--hub-port", "http") == "2"
+    assert not run_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -784,6 +905,7 @@ def test_remote_worker_is_left_to_its_host(
     assert "# bob runs on the worker host" in out
     command = next(line for line in out.splitlines() if "--worker-only bob" in line)
     assert f"--hub-url '{WSL_URL}'" in command
+    assert "--hub-port" not in command
     assert f"--token-file '{run_dir / 'hub-state' / 'token'}'" in command
     assert "--bob claude-code" in command and "--bob-model 'claude-opus-5-5'" in command
     token = (run_dir / "hub-state" / "token").read_text(encoding="utf-8").strip()
@@ -937,6 +1059,24 @@ def test_worker_only_renders_one_worker_from_the_hub_token(
     assert again["workspaces"] == manifest["workspaces"]
 
 
+def test_worker_only_carries_a_non_default_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    token_file, _ = hub_token_file(tmp_path)
+    run_dir = (tmp_path / "worker-run").resolve()
+    manifest = PREPARE_RUN.prepare_worker(
+        "bob", str(origin), run_dir, PORT_URL, token_file, "claude-code"
+    )
+    hub = json.loads((run_dir / "configs" / "bob.mcp.json").read_text(encoding="utf-8"))
+    assert hub["mcpServers"]["hub"]["env"]["HUB_URL"] == manifest["hub_url"] == PORT_URL
+    out = capsys.readouterr().out
+    assert f"curl.exe -fsS {PORT_URL}/healthz" in out
+    assert f"curl.exe -fsS {PORT_URL}/.well-known/agent-card.json" in out
+    assert ":8420" not in out
+
+
 @pytest.mark.parametrize(
     "mode,url,expected",
     [
@@ -966,6 +1106,7 @@ def test_worker_only_refuses_hub_flags(tmp_path: Path, monkeypatch: pytest.Monke
     run_dir = (tmp_path / "run").resolve()
     for extra in (
         ["--worker-only", "bob", "--token-file", str(token_file), "--issue", "42"],
+        ["--worker-only", "bob", "--token-file", str(token_file), "--hub-port", "8521"],
         ["--worker-only", "bob"],
         ["--token-file", str(token_file)],
     ):
