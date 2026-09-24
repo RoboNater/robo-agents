@@ -721,6 +721,11 @@ def test_public_url_overrides_the_advertised_address_only(
             {"hub_host": "0.0.0.0", "hub_url": WSL_URL, "public_url": "http://localhost:8420"},
             "binds every interface",
         ),
+        (
+            {"hub_host": "0.0.0.0", "hub_url": WSL_URL, "public_url": "http://0.0.0.0:8420"},
+            "binds every interface",
+        ),
+        ({"hub_host": "[::1]", "hub_url": WSL_URL}, "only binds loopback"),
         ({"remote_worker": "bob"}, "cannot be loopback"),
         ({"hub_host": "0.0.0.0", "public_url": WSL_URL, "remote_worker": "bob"}, "cannot be"),
         ({"hub_url": WSL_URL}, "only binds loopback"),

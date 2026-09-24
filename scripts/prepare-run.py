@@ -181,18 +181,23 @@ def url_host(url: str, flag: str) -> str:
     return parts.hostname
 
 
+def host_literal(host: str) -> str:
+    return host[1:-1] if host.startswith("[") and host.endswith("]") else host
+
+
 def is_loopback(host: str) -> bool:
-    if host.lower() == "localhost":
+    literal = host_literal(host)
+    if literal.lower() == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return ipaddress.ip_address(literal).is_loopback
     except ValueError:
         return False
 
 
 def is_wildcard(host: str) -> bool:
     """The unspecified address in any spelling, as ``HubSettings.from_env()`` sees it."""
-    literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    literal = host_literal(host)
     if literal == WILDCARD_HOST_ALIAS:
         return True
     try:
@@ -216,7 +221,8 @@ def network_settings(
     dial = hub_url.strip().rstrip("/")
     advertised = dial if public_url is None else public_url.strip().rstrip("/")
     dial_loopback = is_loopback(url_host(dial, "--hub-url"))
-    if is_wildcard(host) and is_loopback(url_host(advertised, "--public-url")):
+    advertised_host = url_host(advertised, "--public-url")
+    if is_wildcard(host) and (is_loopback(advertised_host) or is_wildcard(advertised_host)):
         raise ValueError(
             f"--hub-host {host} binds every interface, so --public-url (default: "
             f"--hub-url) must be a dialable non-loopback URL, got {advertised!r}; "
@@ -243,7 +249,7 @@ def preflight_lines(hub_url: str, public_url: str) -> list[str]:
         "PowerShell needs curl.exe, since curl is an alias there):",
         f"curl.exe -fsS {hub_url}/healthz",
         f"curl.exe -fsS {hub_url}/.well-known/agent-card.json   "
-        f"# its url must be {public_url}",
+        f"# its url must be {public_url}/a2a",
         f"Warning: if {url_host(hub_url, '--hub-url')} is a WSL2 NAT address (eth0), it "
         "changes whenever WSL restarts and the LAN cannot reach it; re-read it with "
         "`ip -4 -o addr show eth0` and render the run again after a restart.",
@@ -1068,7 +1074,7 @@ def main() -> None:
             "--public-url": args.public_url is not None,
         }
         if given := [flag for flag, present in hub_only.items() if present]:
-            parser.error(f"{', '.join(given)} belong to the hub host's run, not --worker-only")
+            parser.error(f"hub-host flags do not apply to --worker-only: {', '.join(given)}")
         if args.token_file is None:
             parser.error("--worker-only needs --token-file, the hub's token file")
         name = args.worker_only
