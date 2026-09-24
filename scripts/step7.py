@@ -238,13 +238,21 @@ def launch_lines(directory):
 
 
 def windows_command(windows, args, exports=None):
-    """argv and cwd that run ``args`` natively on Windows, in Git Bash, from the checkout."""
+    """argv and cwd that run ``args`` natively on Windows, in Git Bash, from the checkout.
+
+    The script crosses WSL's Windows command line, which collapses doubled
+    backslashes (``\\\\wsl.localhost`` arrives as ``\\wsl.localhost``), so
+    a backslash is refused: Windows reads forward-slash paths, UNC included.
+    """
     checkout = prepare_run().git_bash_path(PureWindowsPath(windows["checkout"]))
     script = f"cd {shlex.quote(checkout)} || exit 97; "
     script += "".join(
         f"export {key}={shlex.quote(value)}; " for key, value in (exports or {}).items()
     )
-    return [windows["bash"], "-lc", script + "exec " + shlex.join(args)], mount(windows["checkout"])
+    script += "exec " + shlex.join(args)
+    if "\\" in script:
+        raise ValueError("pass forward-slash paths to Windows; a backslash does not survive")
+    return [windows["bash"], "-lc", script], mount(windows["checkout"])
 
 
 def windows_call(windows, args, exports=None):
@@ -420,7 +428,7 @@ def prepare_bob(directory, manifest, repository):
         "--hub-url",
         network["hub_url"],
         "--token-file",
-        prepare_run().remote_token_path(directory / "token"),
+        prepare_run().remote_token_path(directory / "token").replace("\\", "/"),
         "--bob",
         "claude-code",
         "--bob-provider",

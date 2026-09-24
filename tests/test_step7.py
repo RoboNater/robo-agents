@@ -269,6 +269,9 @@ def test_windows_commands_run_in_git_bash_from_the_windows_checkout() -> None:
         "cd /c/work/robo-agents || exit 97; export GIT_CONFIG_COUNT=1; exec uv run python 'x y.py'"
     )
     assert cwd == "/mnt/c/work/robo-agents"
+    # WSL's Windows command line collapses doubled backslashes; refuse them all.
+    with pytest.raises(ValueError, match="forward-slash"):
+        STEP7.windows_command(windows(), ["cat", "\\\\wsl.localhost\\x\\token"])
     url = "git@github.com:RoboNater/robo-agents-sandbox.git"
     assert STEP7.windows_clone_source(url, "Ubuntu-24.04") == (url, {})
     source, exports = STEP7.windows_clone_source("/home/me/sandbox", "Ubuntu-24.04")
@@ -641,9 +644,9 @@ def test_networked_prepare_renders_hub_charlie_and_windows_bob(
     assert args[args.index("--worker-only") + 1] == "bob"
     assert args[args.index("--run-dir") + 1] == WINDOWS_RUN
     assert args[args.index("--hub-url") + 1] == f"http://{ETH0}:{PORT}"
-    assert args[args.index("--token-file") + 1] == "\\\\wsl.localhost\\Ubuntu-24.04" + str(
+    assert args[args.index("--token-file") + 1] == "//wsl.localhost/Ubuntu-24.04" + str(
         directory / "token"
-    ).replace("/", "\\")
+    )
     assert args[args.index("--repository") + 1] == f"//wsl.localhost/Ubuntu-24.04{origin}"
     assert args[args.index("--bob-model") + 1] == manifest["models"]["bob"]
     assert exports["GIT_CONFIG_KEY_0"] == "safe.directory"
