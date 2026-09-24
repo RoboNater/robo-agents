@@ -242,14 +242,21 @@ def network_settings(
     return {"hub_host": host, "hub_url": dial, "public_url": advertised}
 
 
-def preflight_lines(hub_url: str, public_url: str) -> list[str]:
-    """Reachability checks to run on a worker host before launching it."""
+def preflight_lines(hub_url: str, public_url: str | None) -> list[str]:
+    """Reachability checks to run on a worker host before launching it.
+
+    ``public_url`` is None under ``--worker-only``, which cannot know the
+    hub run's ``--public-url``.
+    """
+    card = (
+        f"{public_url}/a2a" if public_url is not None else "the hub run's --public-url + /a2a"
+    )
     return [
         "Preflight (run on each worker host that is not the hub host; "
         "PowerShell needs curl.exe, since curl is an alias there):",
         f"curl.exe -fsS {hub_url}/healthz",
         f"curl.exe -fsS {hub_url}/.well-known/agent-card.json   "
-        f"# its url must be {public_url}/a2a",
+        f"# its url must be {card}",
         f"Warning: if {url_host(hub_url, '--hub-url')} is a WSL2 NAT address (eth0), it "
         "changes whenever WSL restarts and the LAN cannot reach it; re-read it with "
         "`ip -4 -o addr show eth0` and render the run again after a restart.",
@@ -438,17 +445,33 @@ def worker_launch(name: str, harness: str, run_dir: PurePath, workspace: PurePat
 
 
 def require_owner_only(path: Path) -> None:
-    """Refuse a token-bearing file its filesystem left group/world-readable.
+    """Refuse a file its filesystem left group/world-readable, removing it.
 
     ``save`` and ``write_private_text`` chmod 0600, which a DrvFs mount without
     ``metadata`` (``/mnt/c`` from WSL) silently ignores. On Windows the mode
     bits say nothing; the file inherits the run directory's ACL.
     """
     if os.name != "nt" and path.stat().st_mode & 0o077:
+        path.unlink()
         raise ValueError(
-            f"{path} stays readable by other users after chmod 0600, so its filesystem "
-            "ignores POSIX permissions; put the run directory on one that honours them"
+            f"{path.parent} ignores POSIX permissions (chmod 0600 left a file readable by "
+            "other users); put the run directory on a filesystem that honours them"
         )
+
+
+def write_secret(path: Path, write: Any) -> None:
+    """Write a token-bearing file only where chmod 0600 is known to hold.
+
+    An empty probe file is checked first, so no token reaches a filesystem
+    that ignores the mode; the written file is checked again and removed if
+    it still came out loose.
+    """
+    probe = path.with_name(f".{path.name}.permission-probe")
+    write_private_text(probe, "")
+    require_owner_only(probe)
+    probe.unlink()
+    write(path)
+    require_owner_only(path)
 
 
 def render_worker_bundle(
@@ -488,14 +511,13 @@ def render_worker_bundle(
     if harness == "codex":
         home = codex_home(configs, codex_home_name(name))
         worker_args = ["run", "--locked", "--directory", root.as_posix(), "worker-mcp"]
-        written = home / "config.toml"
-        write_private_text(written, render_codex_config(env, worker_args))
+        text = render_codex_config(env, worker_args)
+        write_secret(home / "config.toml", lambda path: write_private_text(path, text))
         config = run_dir / "configs" / codex_home_name(name) / "config.toml"
     else:
-        written = configs / f"{name}.mcp.json"
-        save(written, render_claude_mcp(env, root.as_posix()))
+        mcp = render_claude_mcp(env, root.as_posix())
+        write_secret(configs / f"{name}.mcp.json", lambda path: save(path, mcp))
         config = run_dir / "configs" / f"{name}.mcp.json"
-    require_owner_only(written)
     (out_dir / f"{name}.prompt.md").write_text(render_worker_prompt(name), encoding="utf-8")
     return {
         "config": config.as_posix(),
@@ -997,7 +1019,7 @@ def prepare_worker(
         )
     )
     print()
-    for line in preflight_lines(dial, dial):
+    for line in preflight_lines(dial, None):
         print(line)
     print(f"\nLaunch command for {name} (paste after the preflight passes):")
     for line in bundle["launch"]:

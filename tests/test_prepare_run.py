@@ -854,20 +854,37 @@ def test_remote_codex_launch_uses_git_bash_only_where_the_shell_reads_it() -> No
     ]
 
 
-def test_bundle_refuses_a_filesystem_that_ignores_chmod(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("harness", ["claude-code", "codex"])
+@pytest.mark.parametrize("probe_holds", [False, True])
+def test_bundle_refuses_a_filesystem_that_ignores_chmod_leaving_no_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, probe_holds: bool
 ) -> None:
-    # A DrvFs mount without metadata (/mnt/c from WSL) accepts chmod and ignores it.
-    monkeypatch.setattr(RUN_COMMON.os, "chmod", lambda *args, **kwargs: None)
+    # A DrvFs mount without metadata (/mnt/c from WSL) accepts chmod and ignores
+    # it. probe_holds=True lets only the permission probe keep its mode, so the
+    # check after the real write is exercised too.
+    real_chmod = os.chmod
+
+    def chmod(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+        if probe_holds and "permission-probe" in str(path):
+            real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(RUN_COMMON.os, "chmod", chmod)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-login"))
+    out_dir = tmp_path / "bundle"
+    token = "f" * 64
     previous = os.umask(0o022)
     try:
         with pytest.raises(ValueError, match="ignores POSIX permissions"):
             PREPARE_RUN.render_worker_bundle(
-                "bob", "claude-code", "2.1.277", "anthropic", "", "", "f" * 64, WSL_URL,
-                WINDOWS_ROOT, WINDOWS_RUN, WINDOWS_RUN / "bob", tmp_path / "bundle",
+                "bob", harness, "2.1.277", "anthropic", "", "", token, WSL_URL,
+                WINDOWS_ROOT, WINDOWS_RUN, WINDOWS_RUN / "bob", out_dir,
             )
     finally:
         os.umask(previous)
+    files = [path for path in out_dir.rglob("*") if path.is_file()]
+    assert all(token not in path.read_text(encoding="utf-8") for path in files), files
+    assert not (out_dir / "configs" / "bob.mcp.json").exists()
+    assert not (out_dir / "configs" / "bob-codex" / "config.toml").exists()
 
 
 def hub_token_file(tmp_path: Path, mode: int = 0o600) -> tuple[Path, str]:
@@ -908,6 +925,9 @@ def test_worker_only_renders_one_worker_from_the_hub_token(
             assert token not in path.read_text(encoding="utf-8", errors="replace")
     out = capsys.readouterr().out
     assert f"curl.exe -fsS {WSL_URL}/healthz" in out
+    # The hub run may advertise a --public-url this host was never told.
+    assert "its url must be the hub run's --public-url + /a2a" in out
+    assert f"{WSL_URL}/a2a" not in out
     assert f'claude --strict-mcp-config --mcp-config "{written}"' in out
     assert token not in out
     # A rerun reuses the clone and identity.
