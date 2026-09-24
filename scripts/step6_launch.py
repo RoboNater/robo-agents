@@ -493,7 +493,8 @@ def launch_manifest(directory, agent):
     """The Step 6 manifest, or on Bob's Windows host prepare-run's worker-only one.
 
     A worker-only run directory is reached only through ``bob_on_windows``,
-    which has already checked the WSL run's seeded issue.
+    which has already checked the WSL run's seeded issue. Its clone targets the
+    sandbox, or (no slug) the local clone of a ``--local-repository`` run.
     """
     value = json.loads((directory / "run.json").read_text(encoding="utf-8"))
     if value.get("worker_only") is None:
@@ -504,7 +505,7 @@ def launch_manifest(directory, agent):
     if (
         agent != "bob"
         or value["worker_only"] != "bob"
-        or value.get("slug") != SANDBOX
+        or value.get("slug") not in (SANDBOX, None)
         or not directory.is_absolute()
         or value.get("run_dir") != str(directory)
     ):

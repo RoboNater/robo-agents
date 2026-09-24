@@ -382,6 +382,9 @@ def test_worker_only_run_directory_launches_only_its_bob(
     STEP6.save(directory / "run.json", worker | {"slug": "someone/else"})
     with pytest.raises(SystemExit, match="only its own sandbox bob"):
         LAUNCH.launch_manifest(directory, "bob")
+    # A --local-repository dry run's clone has no GitHub slug.
+    STEP6.save(directory / "run.json", worker | {"slug": None})
+    assert LAUNCH.launch_manifest(directory, "bob")["slug"] is None
     # The fake claude echoes its argv and exits, so the supervisor stops before release.
     with pytest.raises(SystemExit, match="exited before release"):
         LAUNCH.bob(directory, worker, 0, 0)
