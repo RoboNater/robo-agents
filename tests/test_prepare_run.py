@@ -801,9 +801,9 @@ def test_url_port_falls_back_to_the_scheme_default() -> None:
 @pytest.mark.parametrize(
     "extra,expected",
     [
-        (["--hub-port", "0"], "--hub-port port must be between 1 and 65535"),
-        (["--hub-port", "65536"], "--hub-port port must be between 1 and 65535"),
-        (["--hub-url", "http://127.0.0.1:0"], "--hub-url port must be between 1 and 65535"),
+        (["--hub-port", "0"], "--hub-port must name a port between 1 and 65535"),
+        (["--hub-port", "65536"], "--hub-port must name a port between 1 and 65535"),
+        (["--hub-url", "http://127.0.0.1:0"], "--hub-url must name a port between 1 and 65535"),
         (["--hub-url", "http://127.0.0.1:70000"], "--hub-url has an invalid port"),
         (
             ["--hub-host", "0.0.0.0", "--hub-url", PORT_URL,

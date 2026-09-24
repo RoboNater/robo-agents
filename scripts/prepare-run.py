@@ -198,7 +198,7 @@ def url_port(url: str, flag: str) -> int:
 
 def check_port(port: int, flag: str) -> int:
     if not 1 <= port <= 65535:
-        raise ValueError(f"{flag} port must be between 1 and 65535, got {port}")
+        raise ValueError(f"{flag} must name a port between 1 and 65535, got {port}")
     return port
 
 
