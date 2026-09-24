@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import subprocess
 import sys
 from io import StringIO
@@ -150,6 +151,76 @@ main.main()
         "Finished server process",
     ):
         assert marker in result.stderr
+
+
+def test_live_server_records_the_socket_peer_not_a_forwarded_header(tmp_path: Path) -> None:
+    """#126: uvicorn trusts X-Forwarded-For from loopback unless told not to."""
+
+    script = r"""
+import os
+import socket
+
+import httpx
+from agent_hub import main
+from agent_hub_common import SCHEMA_VERSION, MetaKeys
+
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+port = listener.getsockname()[1]
+listener.close()
+os.environ["HUB_PORT"] = str(port)
+
+async def fake_mcp(store, stdout, accounting):
+    metadata = {
+        MetaKeys.AGENT: "bob",
+        MetaKeys.SCHEMA_VERSION: SCHEMA_VERSION,
+        MetaKeys.OPERATION_ID: "op-1",
+        MetaKeys.WORKER_INSTANCE_ID: "bob-1",
+    }
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "messageId": "m-1",
+                "role": "user",
+                "parts": [{"kind": "text", "text": "READY"}],
+                "metadata": metadata,
+            }
+        },
+    }
+    async with httpx.AsyncClient(
+        headers={"Authorization": "Bearer test-token", "X-Forwarded-For": "203.0.113.7"}
+    ) as client:
+        response = await client.post(f"http://127.0.0.1:{port}/a2a", json=body)
+        response.raise_for_status()
+        assert "result" in response.json(), response.text
+    return True
+
+main.run_mcp = fake_mcp
+main.main()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={
+            **os.environ,
+            "HUB_STATE_DIR": str(tmp_path),
+            "HUB_DB_PATH": str(tmp_path / "hub.db"),
+            "HUB_TOKEN": "test-token",
+            "HUB_HOST": "127.0.0.1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+    with sqlite3.connect(tmp_path / "hub.db") as connection:
+        row = connection.execute(
+            "SELECT checkin_remote_addr, last_remote_addr FROM agent WHERE name = 'bob'"
+        ).fetchone()
+    assert row == ("127.0.0.1", "127.0.0.1")
 
 
 @pytest.mark.parametrize(

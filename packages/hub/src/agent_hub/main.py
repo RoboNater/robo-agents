@@ -65,6 +65,10 @@ async def run_hub(settings: HubSettings, stdout: TextIO) -> bool:
             log_config=log_config,
             access_log=False,
             timeout_graceful_shutdown=2,
+            # uvicorn otherwise rewrites the peer from X-Forwarded-For when
+            # the connection is from 127.0.0.1, which would let any loopback
+            # worker choose the address the hub records for it (#126).
+            proxy_headers=False,
         )
     )
     http = asyncio.create_task(server.serve())

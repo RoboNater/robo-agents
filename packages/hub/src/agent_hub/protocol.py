@@ -412,8 +412,13 @@ class A2AProtocol:
     store: HubStore
     settings: HubSettings
 
-    async def dispatch(self, payload: Any) -> Response:
-        """Route one JSON-RPC request, turning refusals into error responses."""
+    async def dispatch(self, payload: Any, remote_addr: str | None = None) -> Response:
+        """Route one JSON-RPC request, turning refusals into error responses.
+
+        remote_addr: the transport peer the request arrived from, recorded on
+        check-in and heartbeat as an observation (#126). The caller takes it
+        from the connection, never from anything the worker sent.
+        """
 
         if not isinstance(payload, dict):
             return _error_response(None, InvalidRequestError())
@@ -426,7 +431,7 @@ class A2AProtocol:
             return _error_response(request_id, MethodNotFoundError())
 
         try:
-            return await self._dispatch(method, payload, request_id)
+            return await self._dispatch(method, payload, request_id, remote_addr)
         except (
             ResultValidationError,
             UnsupportedSchemaVersionError,
@@ -453,11 +458,13 @@ class A2AProtocol:
             logger.exception("Unhandled error serving %s", method)
             return _error_response(request_id, InternalError())
 
-    async def _dispatch(self, method: str, payload: Any, request_id: RequestId) -> Response:
+    async def _dispatch(
+        self, method: str, payload: Any, request_id: RequestId, remote_addr: str | None
+    ) -> Response:
         if method == "message/send":
             params = _validate(SendMessageRequest, payload).params
             _check_message_part_sizes(params.message)
-            return JSONResponse(_success_body(request_id, self._send(params)))
+            return JSONResponse(_success_body(request_id, self._send(params, remote_addr)))
         if method == "message/stream":
             params = _validate(SendStreamingMessageRequest, payload).params
             _check_message_part_sizes(params.message)
@@ -470,13 +477,13 @@ class A2AProtocol:
 
     # -- message/send -------------------------------------------------------
 
-    def _send(self, params: MessageSendParams) -> Task | A2AMessage:
+    def _send(self, params: MessageSendParams, remote_addr: str | None) -> Task | A2AMessage:
         message = params.message
         metadata = _metadata(message)
         if message.task_id is None:
             if metadata.get(MetaKeys.KIND) == "heartbeat":
-                return self._heartbeat(message, metadata)
-            return self._check_in(message, metadata)
+                return self._heartbeat(message, metadata, remote_addr)
+            return self._check_in(message, metadata, remote_addr)
 
         agent = self._resolve_agent(message, metadata)
         task = self._owned_task(message.task_id, agent)
@@ -511,7 +518,9 @@ class A2AProtocol:
             return A2AMessage.model_validate(json.loads(resp_json))
         raise _invalid(f"metadata.{MetaKeys.KIND} {kind!r} is not a message/send intent on a task")
 
-    def _check_in(self, message: A2AMessage, metadata: dict[str, Any]) -> A2AMessage:
+    def _check_in(
+        self, message: A2AMessage, metadata: dict[str, Any], remote_addr: str | None
+    ) -> A2AMessage:
         if _text(message).upper() != CHECK_IN_TEXT:
             raise _invalid(f"a message with no taskId must be the {CHECK_IN_TEXT} check-in")
         _require_schema_version(metadata)
@@ -555,12 +564,13 @@ class A2AProtocol:
                     },
                 ).model_dump(mode="json", exclude_none=True)
             ),
+            remote_addr=remote_addr,
         )
         note_a2a(actor=agent_name)
         return A2AMessage.model_validate(json.loads(resp_json))
 
     def _heartbeat(
-        self, message: A2AMessage, metadata: dict[str, Any]
+        self, message: A2AMessage, metadata: dict[str, Any], remote_addr: str | None
     ) -> A2AMessage:
         _require_schema_version(metadata)
         name = metadata.get(MetaKeys.AGENT)
@@ -579,6 +589,7 @@ class A2AProtocol:
             agent_name,
             instance_id,
             None if current_task_id is None else current_task_id.strip(),
+            remote_addr=remote_addr,
         )
         agent = self.store.agent_by_name(agent_name)
         if agent is not None:

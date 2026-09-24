@@ -207,6 +207,9 @@ def test_get_state_shows_each_workers_profile(store: HubStore) -> None:
         "capabilities": ["python"],
         "workspace_id": None,
         "declared_model": "unknown",
+        # A direct store call has no connection, so nothing was observed.
+        "checkin_remote_addr": None,
+        "last_remote_addr": None,
         "model_mismatch": False,
     }
     # Whatever charlie's launcher left unset reads `unknown`, not a guess.

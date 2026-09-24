@@ -753,6 +753,42 @@ def test_migration_from_v10_adds_declared_model_and_keeps_existing_agents_readab
     assert state["model_mismatch"] is False
 
 
+def test_migration_from_v11_adds_nullable_peer_addresses(tmp_path: Path) -> None:
+    """#126's v12: an agent observed before the columns existed has no address."""
+
+    path = tmp_path / "v11_hub.db"
+    _legacy_database(path, 11)
+    assert "checkin_remote_addr" not in _agent_columns(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO agent (name, status, context_id, last_seen, worker_instance_id,"
+            " declared_model) VALUES ('bob', 'idle', 'ctx-bob', '2026-09-24T00:00:00Z',"
+            " 'bob-1', 'claude-opus-5-5')"
+        )
+
+    initialize_database(path)
+    initialize_database(path)
+
+    columns = _agent_columns(path)
+    assert columns["checkin_remote_addr"] == ("TEXT", 0, None)
+    assert columns["last_remote_addr"] == ("TEXT", 0, None)
+    with database(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 12
+    store = HubStore(path)
+    bob = store.agent_by_name("bob")
+    assert bob is not None
+    assert bob.declared_model == "claude-opus-5-5"
+    assert (bob.checkin_remote_addr, bob.last_remote_addr) == (None, None)
+    [state] = store.get_state()["agents"]
+    assert (state["checkin_remote_addr"], state["last_remote_addr"]) == (None, None)
+
+    # The first heartbeat after the upgrade is what fills a legacy row in.
+    assert store.heartbeat("bob", "bob-1", None, remote_addr="192.0.2.10")
+    bob = store.agent_by_name("bob")
+    assert bob is not None
+    assert (bob.checkin_remote_addr, bob.last_remote_addr) == (None, "192.0.2.10")
+
+
 def test_a_null_declared_model_reads_as_unknown(tmp_path: Path) -> None:
     path = tmp_path / "hub.db"
     initialize_database(path)

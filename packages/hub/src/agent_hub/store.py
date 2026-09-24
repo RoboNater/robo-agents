@@ -111,6 +111,10 @@ class AgentRecord:
     workspace_id: str | None = None
     # What the runtime reported, kept even when a configured `model` won (#77).
     declared_model: str = UNKNOWN
+    # The peer address the hub saw at check-in and most recently (#126). An
+    # observation, never identity: None when the hub did not see one.
+    checkin_remote_addr: str | None = None
+    last_remote_addr: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +207,8 @@ def _agent(row: Row) -> AgentRecord:
         model_source=ModelSource(row["model_source"]),
         workspace_id=row["workspace_id"],
         declared_model=row["declared_model"] or UNKNOWN,
+        checkin_remote_addr=row["checkin_remote_addr"],
+        last_remote_addr=row["last_remote_addr"],
     )
 
 
@@ -550,12 +556,15 @@ class HubStore:
         operation_id: str | None = None,
         payload_hash: str | None = None,
         response_builder: Callable[[AgentRecord], str] | None = None,
+        remote_addr: str | None = None,
     ) -> Any:
         """Register a worker, or re-admit a returning one on its own context.
 
         The profile replaces whatever was recorded before, field by field: a
         returning worker may be a different harness or model under the same
-        name, and a stale value would mislead role selection.
+        name, and a stale value would mislead role selection. `remote_addr`,
+        the peer the request arrived from, likewise replaces both recorded
+        addresses; a replayed check-in records nothing.
         """
 
         now = self._now_iso()
@@ -569,6 +578,8 @@ class HubStore:
             profile.model_source.value,
             profile.workspace_id,
             profile.declared_model,
+            remote_addr,
+            remote_addr,
         )
         with database(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -609,8 +620,8 @@ class HubStore:
                     "INSERT INTO agent (name, status, context_id, last_seen, worker_instance_id,"
                     " last_heartbeat, capabilities_json,"
                     " harness, harness_version, provider, model, model_source, workspace_id,"
-                    " declared_model)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " declared_model, checkin_remote_addr, last_remote_addr)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         name,
                         AgentStatus.IDLE.value,
@@ -639,7 +650,8 @@ class HubStore:
                     "UPDATE agent SET status = ?, last_seen = ?, worker_instance_id = ?,"
                     " last_heartbeat = ?, last_progress_at = ?, current_task_id = ?,"
                     " capabilities_json = ?, harness = ?, harness_version = ?, provider = ?,"
-                    " model = ?, model_source = ?, workspace_id = ?, declared_model = ?"
+                    " model = ?, model_source = ?, workspace_id = ?, declared_model = ?,"
+                    " checkin_remote_addr = ?, last_remote_addr = ?"
                     " WHERE name = ?",
                     (
                         _readmitted(previous, current).value,
@@ -730,11 +742,15 @@ class HubStore:
         worker_instance_id: str,
         current_task_id: str | None,
         max_task_lease_min: float | None = None,
+        *,
+        remote_addr: str | None = None,
     ) -> bool:
         """Record a timer heartbeat and renew the matching task's bounded lease.
 
         A stale process is deliberately given a successful no-op path: it must
-        not revive an agent or lease after a newer instance supersedes it.
+        not revive an agent or lease after a newer instance supersedes it, nor
+        overwrite the live instance's `last_remote_addr`. An accepted heartbeat
+        with no `remote_addr` leaves the recorded one in place.
 
         The wall clock can step backwards (WSL2 resyncs by seconds, #120), so
         the stamp is taken once the write lock is held and never moves either
@@ -753,8 +769,9 @@ class HubStore:
                 return False
             connection.execute(
                 "UPDATE agent SET last_heartbeat = MAX(last_heartbeat, ?),"
-                " last_seen = MAX(last_seen, ?) WHERE name = ?",
-                (now_iso, now_iso, name),
+                " last_seen = MAX(last_seen, ?),"
+                " last_remote_addr = coalesce(?, last_remote_addr) WHERE name = ?",
+                (now_iso, now_iso, remote_addr, name),
             )
             if not current_task_id or agent.current_task_id != current_task_id:
                 return True

@@ -59,6 +59,9 @@ class WorkerHubClient:
             agent=settings.agent_name,
             worker_instance_id=self.worker_instance_id,
             session_fields={
+                # The address this worker dialed, to set beside the peer
+                # address the hub recorded for it (#126).
+                "hub_url": settings.hub_url,
                 "harness": settings.profile.harness,
                 "harness_version": settings.profile.harness_version,
                 "provider": settings.profile.provider,
@@ -127,6 +130,7 @@ class WorkerHubClient:
                     phase="success",
                     accepted=accepted,
                     current_task_id=self.current_task_id,
+                    hub_url=self.settings.hub_url,
                 )
             except Exception as exc:
                 # The normal request retry policy has already been exhausted;
@@ -137,6 +141,7 @@ class WorkerHubClient:
                     error_type=type(exc).__name__,
                     error=str(exc)[:500],
                     current_task_id=self.current_task_id,
+                    hub_url=self.settings.hub_url,
                 )
                 logger.exception("Background heartbeat failed")
 
