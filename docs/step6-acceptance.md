@@ -197,3 +197,70 @@ turns so his `worker-mcp` instance persists. Supervisors send only fixed
 continuation text. OpenCode has no OS sandbox: Charlie's generated config denies
 edits and external directories and allows a narrow shell list. See
 [the Windows attempt](evidence/step6-failed-20260919013155_2a972a49.md).
+
+## Networked topology (Step 7)
+
+The same harness runs the Step 7 topology from
+[`docs/plan-for-step-7-and-issue-70.md`](plan-for-step-7-and-issue-70.md)
+(#140). The hub, Alice and Charlie run in WSL2 (NAT mode). Bob runs natively on
+the Windows host and dials WSL's `eth0` address. The helpers live in
+`scripts/step7.py`, and `scripts/step6.py` stays the entry point. The port comes
+from `--hub-port`; pick one no other checkout's hub holds.
+
+```sh
+# From WSL. The Windows checkout must be clean and at this checkout's commit,
+# with `uv sync --locked --all-packages` run there.
+uv run --locked python scripts/step6.py prepare /abs/run \
+  --scenario scenarios/step7-networked-untrusted.json --hub-port 8431 \
+  --windows-run-dir C:/work/step7-run --windows-checkout C:/work/robo-agents \
+  [--local-repository /abs/sandbox-clone | --seed]
+```
+
+`prepare` reads `eth0` and renders a hub that binds `0.0.0.0:<port>` and
+advertises `http://<eth0>:<port>`. Charlie dials `127.0.0.1:<port>`. The
+preflight then runs through WSL interop and records its result in `run.json`:
+
+- Git Bash and `curl.exe` are present.
+- The Windows checkout is clean and at this checkout's commit.
+- The port is free.
+- From Windows, `curl.exe` against a throwaway hub gets `/healthz` and an agent
+  card whose `url` is `HUB_PUBLIC_URL` + `/a2a`.
+
+Any failure stops `prepare` before Bob is rendered or an issue is created.
+Bob's clone and config then come from `prepare-run.py --worker-only bob`, run
+natively on Windows, which bootstraps the clone with Windows git. It reads the
+hub token in place over `//wsl.localhost` and writes it only into
+`configs/bob.mcp.json`. Each clone gets an uncommitted, git-ignored canary.
+`prepare` prints the launch lines. Run them from WSL in this order:
+
+```sh
+scripts/launch-step6-alice.sh /abs/run
+scripts/launch-step6-charlie.sh /abs/run
+uv run --locked python scripts/step6_launch.py bob /abs/run   # Bob's supervisor runs on Windows
+uv run --locked python scripts/run-step6-disturbances.py /abs/run
+uv run --locked python scripts/step6.py verify /abs/run
+uv run --locked python scripts/step6.py export /abs/run --destination docs/evidence
+```
+
+Besides the disturbances, the driver samples Bob's hub row until he is
+released. While Bob holds a task, it checks in once from a second clone that
+carries a copy of Bob's identity file. `verify` pulls Bob's transcript and
+telemetry from Windows. It runs every Step 6 check plus these:
+
+- **Boundary crossed:** `step7_bob_remote_peer`, `step7_charlie_loopback_peer`
+  and `step7_bob_dialed_public_url`.
+- **Live heartbeats:** `step7_heartbeat_gaps`, measured on Bob's own clock from
+  each assignment to its result; `step7_no_agent_lost`; and
+  `step7_hub_heartbeat_advanced`, during Bob's longest task.
+- **#70 identities:** `step7_distinct_workspace_ids` and
+  `step7_stable_workspace_ids`.
+- **#70 duplicate refused:** `step7_duplicate_refused`, which needs HTTP 409
+  while Bob is live and Bob unaffected.
+- **#70 uncommitted isolation:** `step7_canary_isolation` and
+  `step7_{bob,charlie}_no_cross_host_access`. Each worker's calls are matched
+  against every spelling the other clone has on that worker's host.
+
+`export` writes `step7-<run_id>.*.json`. It masks the WSL and Windows run roots
+as `wsl:/RUN` and `windows:/RUN` in every recorded spelling, and Windows profile
+paths as `C:/Users/<user>/...`. It keeps the private `172.16.0.0/12` NAT
+addresses, which are check 1's evidence, and still refuses any credential.

@@ -3,6 +3,10 @@
 
 Usage: step6_launch.py {alice,bob,charlie} ABSOLUTE_RUN_DIR
 
+In a networked (Step 7) run, ``bob`` launched from WSL starts this same
+supervisor natively on Windows through interop, where RUN_DIR is Bob's
+``prepare-run.py --worker-only`` run directory.
+
 Each supervisor keeps one runtime process (and so one MCP child) alive and may
 send only its fixed continuation text when the model ends a turn early. Alice
 owns every assignment and workflow decision; workers pull work from the hub.
@@ -28,8 +32,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import step7
 from run_common import executable
-from step6 import load_manifest, topology
+from step6 import SANDBOX, load_manifest, topology
 
 HUB = "http://127.0.0.1:8420"
 ALICE_CONTINUE = (
@@ -58,18 +63,18 @@ def log(message):
     print(f"{now()} {message}", file=sys.stderr, flush=True)
 
 
-def environment(directory):
+def environment(manifest):
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     # Setting the implicit default relocates Claude's main configuration file.
-    if not load_manifest(directory).get("claude_config_dir_is_custom"):
+    if not manifest.get("claude_config_dir_is_custom"):
         env.pop("CLAUDE_CONFIG_DIR", None)
     return env
 
 
-def hub_healthy():
+def hub_healthy(url):
     try:
-        with urllib.request.urlopen(HUB + "/healthz", timeout=2) as response:
+        with urllib.request.urlopen(url + "/healthz", timeout=2) as response:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
@@ -218,9 +223,10 @@ class AppServer:
 def alice(directory, manifest, max_turns, delay):
     if topology(manifest)[0]["alice"] != "codex":
         raise SystemExit("use scripts/launch-step6-alice.sh for interactive Claude Code Alice")
-    if hub_healthy():
-        raise SystemExit("port 8420 occupied; leave other checkout listeners alone")
-    env = environment(directory)
+    hub = step7.local_hub(manifest, HUB)
+    if hub_healthy(hub):
+        raise SystemExit(f"{hub} occupied; leave other checkout listeners alone")
+    env = environment(manifest)
     env["CODEX_HOME"] = str(directory / "codex-alice-home")
     runtime = directory / "alice-runtime"
     thread_file = directory / "alice.thread.json"
@@ -260,7 +266,7 @@ def alice(directory, manifest, max_turns, delay):
                 status = workflow_status(directory)
                 log(f"alice turn ended; workflow status {status}")
                 if status == "done":
-                    wait_for_worker_release(directory)
+                    wait_for_worker_release(directory, manifest)
                     return
                 if status in ("escalated", "paused"):
                     raise SystemExit(f"workflow {status}; operator attention required")
@@ -274,13 +280,13 @@ def alice(directory, manifest, max_turns, delay):
             stop_tree(server.process)
 
 
-def wait_for_worker_release(directory, timeout=900):
+def wait_for_worker_release(directory, manifest, timeout=900):
     """Keep the hub up until both workers observed release (or the deadline passes)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         observed = []
         for name in ("bob", "charlie"):
-            path = directory / f"{name}.telemetry.jsonl"
+            path = step7.telemetry_path(directory, manifest, name)
             text = path.read_text(encoding="utf-8") if path.exists() else ""
             observed.append('"outcome": "release"' in text)
         if all(observed):
@@ -290,8 +296,40 @@ def wait_for_worker_release(directory, timeout=900):
     log("worker release not observed before the deadline")
 
 
+def bob_on_windows(manifest, max_turns, delay):
+    """From WSL: run this supervisor natively on Windows, in Bob's worker-only run directory."""
+    windows = manifest["windows"]
+    command, cwd = step7.windows_command(
+        windows,
+        [
+            "uv",
+            "run",
+            "--locked",
+            "python",
+            "scripts/step6_launch.py",
+            "bob",
+            windows["run_dir"],
+            "--max-turns",
+            str(max_turns),
+            "--delay",
+            str(delay),
+        ],
+    )
+    log(f"launching bob on Windows in {windows['run_dir']} through interop")
+    returncode = subprocess.run(command, cwd=cwd).returncode
+    if returncode:
+        raise SystemExit(f"bob's Windows supervisor exited {returncode}")
+
+
 def bob(directory, manifest, max_turns, delay):
-    telemetry = Telemetry(directory / "bob.telemetry.jsonl")
+    if step7.networked(manifest):
+        return bob_on_windows(manifest, max_turns, delay)
+    if manifest.get("worker_only"):
+        config = directory / step7.WORKER_ONLY_CONFIG
+        telemetry = Telemetry(directory / step7.WORKER_ONLY_TELEMETRY)
+    else:
+        config = directory / "bob.mcp.json"
+        telemetry = Telemetry(directory / "bob.telemetry.jsonl")
     command = [
         executable("claude"),
         "-p",
@@ -304,7 +342,7 @@ def bob(directory, manifest, max_turns, delay):
         "--verbose",
         "--strict-mcp-config",
         "--mcp-config",
-        str(directory / "bob.mcp.json"),
+        str(config),
         "--permission-mode",
         "dontAsk",
         "--permission-prompts",
@@ -321,7 +359,7 @@ def bob(directory, manifest, max_turns, delay):
         process = subprocess.Popen(
             command,
             cwd=manifest["workspaces"]["bob"]["path"],
-            env=environment(directory),
+            env=environment(manifest),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
@@ -383,7 +421,7 @@ def charlie(directory, manifest, max_turns, delay):
     telemetry = Telemetry(directory / "charlie.telemetry.jsonl")
     clone = manifest["workspaces"]["charlie"]["path"]
     binary = opencode_binary()
-    env = environment(directory)
+    env = environment(manifest)
     env["OPENCODE_CONFIG"] = str(directory / "charlie.opencode.json")
     env["OPENCODE_SERVER_PASSWORD"] = secrets.token_hex(16)
     port = free_port()
@@ -451,6 +489,30 @@ def charlie(directory, manifest, max_turns, delay):
             stop_tree(server, grace=10)
 
 
+def launch_manifest(directory, agent):
+    """The Step 6 manifest, or on Bob's Windows host prepare-run's worker-only one.
+
+    A worker-only run directory is reached only through ``bob_on_windows``,
+    which has already checked the WSL run's seeded issue. Its clone targets the
+    sandbox, or (no slug) the local clone of a ``--local-repository`` run.
+    """
+    value = json.loads((directory / "run.json").read_text(encoding="utf-8"))
+    if value.get("worker_only") is None:
+        manifest = load_manifest(directory)
+        if not manifest.get("issue"):
+            raise SystemExit("run has no seeded issue")
+        return manifest
+    if (
+        agent != "bob"
+        or value["worker_only"] != "bob"
+        or value.get("slug") not in (SANDBOX, None)
+        or not directory.is_absolute()
+        or value.get("run_dir") != str(directory)
+    ):
+        raise SystemExit("a worker-only run directory launches only its own sandbox bob")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("agent", choices=["alice", "bob", "charlie"])
@@ -458,9 +520,7 @@ def main():
     parser.add_argument("--max-turns", type=int, default=100)
     parser.add_argument("--delay", type=float, default=2)
     args = parser.parse_args()
-    manifest = load_manifest(args.run_dir)
-    if not manifest.get("issue"):
-        raise SystemExit("run has no seeded issue")
+    manifest = launch_manifest(args.run_dir, args.agent)
     {"alice": alice, "bob": bob, "charlie": charlie}[args.agent](
         args.run_dir, manifest, args.max_turns, args.delay
     )
