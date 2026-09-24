@@ -151,9 +151,13 @@ def root_pattern(workspace):
     return re.compile(wsl_root_pattern(workspace["path"]), re.IGNORECASE)
 
 
+# A profile name may contain spaces (``C:/Users/John Doe``), so the whole path
+# component is masked: it ends only at a separator, a quote, a line end, or a
+# character Windows forbids in a name. It never takes a backslash or a quote,
+# so JSON escaping survives.
 PROFILE = re.compile(
     BEFORE + r"((?:[a-z]:|/mnt/[a-z]|/[a-z])" + SEP + r")users(" + SEP + r")"
-    r"(?!<user>)[^\\/\s\"':;<>|*?]+",
+    r"[^\\/\"'\r\n:*?<>|]+",
     re.IGNORECASE,
 )
 
@@ -353,7 +357,7 @@ def windows_curl(windows, url):
 def windows_checkout(windows):
     """Windows git's view of the Windows checkout: its HEAD, and whether it is dirty."""
     head = windows_call(windows, ["git", "rev-parse", "HEAD"])
-    status = windows_call(windows, ["git", "status", "--porcelain", "--untracked-files=no"])
+    status = windows_call(windows, ["git", "status", "--porcelain"])
     if head.returncode or status.returncode:
         raise ValueError(output_tail(head if head.returncode else status))
     return head.stdout.strip(), bool(status.stdout.strip())

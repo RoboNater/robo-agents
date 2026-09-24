@@ -512,6 +512,25 @@ def test_preflight_fails_closed(
     assert check in {row["check"] for row in result["checks"] if not row["passed"]}
 
 
+def test_windows_checkout_counts_untracked_files_as_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clean-checkout preflight sees untracked files; ignored ones stay ignored (r1-2)."""
+    commands: list[list[str]] = []
+    status = {"stdout": ""}
+
+    def windows_call(_: Any, args: list[str]) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        stdout = "1" * 40 + "\n" if args[1] == "rev-parse" else status["stdout"]
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(STEP7, "windows_call", windows_call)
+    assert STEP7.windows_checkout(windows()) == ("1" * 40, False)
+    assert commands[-1] == ["git", "status", "--porcelain"]
+    status["stdout"] = "?? stray.py\n"
+    assert STEP7.windows_checkout(windows()) == ("1" * 40, True)
+
+
 def seed_fakes(monkeypatch: pytest.MonkeyPatch, calls: list[tuple[Any, ...]]) -> None:
     def runner(*args: Any, **kwargs: Any) -> str:
         calls.append(args)
@@ -1088,6 +1107,11 @@ def spellings(directory: Path) -> list[str]:
         "C:/Users/nates/AppData",
         "/c/Users/nates/.local/bin/uv",
         "/mnt/c/Users/nates/.claude",
+        # A profile name with a space is masked whole, in every spelling (r1-1).
+        "C:/Users/John Doe/AppData/Local",
+        "C:\\Users\\John Doe\\.claude\\x.jsonl",
+        "cd '/c/Users/John Doe' && ls",
+        '"/mnt/c/Users/John Doe"',
     ]
 
 
@@ -1139,6 +1163,7 @@ def test_networked_export_masks_both_run_roots_and_windows_profiles(tmp_path: Pa
     assert "work/step7-run" not in flat
     assert str(directory).lower() not in flat
     assert "nates" not in flat
+    assert "john" not in flat and "doe" not in flat
     assert "private-token-" not in text
     assert "windows:/RUN" in text and "wsl:/RUN" in text
     assert "C:/Users/<user>/AppData" in text and "/c/Users/<user>/.local" in text
@@ -1150,6 +1175,12 @@ def test_networked_export_masks_both_run_roots_and_windows_profiles(tmp_path: Pa
     assert commands[5] == "windows:/RUN/bob"
     assert commands[8] == "wsl:/RUN/charlie"
     assert commands[12] == "C:\\Users\\<user>\\.claude\\projects\\x.jsonl"
+    assert commands[16:] == [
+        "C:/Users/<user>/AppData/Local",
+        "C:\\Users\\<user>\\.claude\\x.jsonl",
+        "cd '/c/Users/<user>' && ls",
+        '"/mnt/c/Users/<user>"',
+    ]
     audit = json.loads((destination / "step7-unique.hub-audit.json").read_text())
     assert {row["name"]: row["last_remote_addr"] for row in audit["agent"]} == {
         "bob": VETHERNET,
