@@ -19,14 +19,14 @@ from agent_hub_common import (
     WorkflowStatus,
 )
 
-# v11 is #77's `agent.declared_model`, after #78's v10 `call_log` byte
-# accounting and #51's v9 durable binding from an assignment to its triggering
-# event.
+# v12 is #126's observed peer addresses on `agent`, after #77's v11
+# `agent.declared_model`, #78's v10 `call_log` byte accounting and #51's v9
+# durable binding from an assignment to its triggering event.
 # Bumping this means first dumping the version it replaces:
 # `uv run python scripts/dump-schema.py` writes tests/fixtures/schema_v<N>.sql,
 # which is what the migration tests replay instead of a fixture written from
 # memory (#54).
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class DatabaseVersionError(RuntimeError):
@@ -59,7 +59,16 @@ DECLARED_MODEL_COLUMNS = {
     "declared_model": f"TEXT DEFAULT '{UNKNOWN}'",
 }
 PROFILE_COLUMNS = _BASE_PROFILE_COLUMNS | DECLARED_MODEL_COLUMNS
-_PROFILE_SQL = "".join(f"\n    {name} {spec}," for name, spec in PROFILE_COLUMNS.items())
+# Where a worker's requests were seen coming from (#126): the transport peer
+# the hub observed, not anything the worker claimed. Nullable, since no row
+# written before v12 recorded it and it cannot be recovered afterwards.
+PEER_ADDRESS_COLUMNS = {
+    "checkin_remote_addr": "TEXT",
+    "last_remote_addr": "TEXT",
+}
+_AGENT_SQL = "".join(
+    f"\n    {name} {spec}," for name, spec in (PROFILE_COLUMNS | PEER_ADDRESS_COLUMNS).items()
+)
 
 
 SCHEMA = f"""
@@ -80,7 +89,7 @@ CREATE TABLE IF NOT EXISTS agent (
     worker_instance_id TEXT NOT NULL DEFAULT '',
     last_heartbeat TEXT NOT NULL DEFAULT '',
     last_progress_at TEXT,
-    current_task_id TEXT,{_PROFILE_SQL}
+    current_task_id TEXT,{_AGENT_SQL}
     FOREIGN KEY (current_task_id) REFERENCES task(id) ON DELETE SET NULL
 );
 
@@ -247,7 +256,7 @@ def initialize_database(path: Path) -> None:
             )
         # Each step inspects the table rather than trusting the version number,
         # so it is safe to re-run and migrations compose across schema versions
-        # (any of v1-v10 -> v11).
+        # (any of v1-v11 -> v12).
         _migrate_agent_profile(connection)
         _migrate_operation_table(connection)
         _migrate_worker_heartbeat(connection)
@@ -257,6 +266,7 @@ def initialize_database(path: Path) -> None:
         _migrate_task_source_event_id(connection)
         _migrate_call_log(connection)
         _migrate_declared_model(connection)
+        _migrate_peer_addresses(connection)
 
     # v8 (#59). Outside the transaction above: the rebuild needs its own
     # connection, because `PRAGMA foreign_keys` is a no-op inside one. The
@@ -429,6 +439,19 @@ def _migrate_declared_model(connection: sqlite3.Connection) -> None:
 
     columns = _columns(connection, "agent")
     for name, spec in DECLARED_MODEL_COLUMNS.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE agent ADD COLUMN {name} {spec}")
+
+
+def _migrate_peer_addresses(connection: sqlite3.Connection) -> None:
+    """Add the observed peer addresses for schema v12 (#126).
+
+    Agents that checked in before v12 were never observed, so their rows hold
+    NULL until they next check in or heartbeat.
+    """
+
+    columns = _columns(connection, "agent")
+    for name, spec in PEER_ADDRESS_COLUMNS.items():
         if name not in columns:
             connection.execute(f"ALTER TABLE agent ADD COLUMN {name} {spec}")
 

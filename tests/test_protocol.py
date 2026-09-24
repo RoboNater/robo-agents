@@ -1,4 +1,6 @@
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -13,7 +15,8 @@ from agent_hub_common import (
     ModelSource,
     TaskState,
 )
-from conftest import check_in, message, rpc, sse_results
+from conftest import BASE_URL, TOKEN, check_in, message, rpc, sse_results
+from fastapi import FastAPI
 
 
 async def post(
@@ -116,6 +119,90 @@ async def test_heartbeat_is_an_immediate_message_send_intent(
         MetaKeys.ACCEPTED: True,
     }
     assert after is not None and after.last_heartbeat >= before.last_heartbeat
+
+
+@asynccontextmanager
+async def peer(app: FastAPI, host: str) -> AsyncIterator[httpx.AsyncClient]:
+    """A client whose connection the app sees arriving from `host`.
+
+    Borrows the lifespan the `client` fixture already entered.
+    """
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=(host, 50123)),
+        base_url=BASE_URL,
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    ) as connected:
+        yield connected
+
+
+def heartbeat(context_id: str, instance_id: str) -> dict[str, Any]:
+    return message(
+        "HEARTBEAT",
+        context_id=context_id,
+        metadata={
+            MetaKeys.KIND: "heartbeat",
+            MetaKeys.AGENT: "bob",
+            MetaKeys.SCHEMA_VERSION: 1,
+            MetaKeys.WORKER_INSTANCE_ID: instance_id,
+        },
+    )
+
+
+async def test_check_in_and_heartbeat_record_the_observed_peer_address(
+    app: FastAPI, client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    """#126: check-in sets both addresses; a heartbeat moves only the latest."""
+
+    async with peer(app, "192.0.2.10") as windows:
+        context_id = await check_in(windows, "bob", worker_instance_id="bob-1")
+    bob = hub_store.agent_by_name("bob")
+    assert bob is not None
+    assert (bob.checkin_remote_addr, bob.last_remote_addr) == ("192.0.2.10", "192.0.2.10")
+
+    async with peer(app, "192.0.2.20") as moved:
+        body = await post(moved, "message/send", heartbeat(context_id, "bob-1"))
+    assert body["result"]["metadata"][MetaKeys.ACCEPTED] is True
+
+    bob = hub_store.agent_by_name("bob")
+    assert bob is not None
+    assert (bob.checkin_remote_addr, bob.last_remote_addr) == ("192.0.2.10", "192.0.2.20")
+    [state] = hub_store.get_state()["agents"]
+    assert (state["checkin_remote_addr"], state["last_remote_addr"]) == (
+        "192.0.2.10",
+        "192.0.2.20",
+    )
+
+
+async def test_a_header_claiming_an_address_is_ignored(
+    app: FastAPI, client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    claims = {
+        "X-Forwarded-For": "203.0.113.7",
+        "X-Real-IP": "203.0.113.7",
+        "Forwarded": "for=203.0.113.7",
+    }
+    async with peer(app, "192.0.2.10") as windows:
+        windows.headers.update(claims)
+        context_id = await check_in(windows, "bob", worker_instance_id="bob-1")
+        await post(windows, "message/send", heartbeat(context_id, "bob-1"))
+
+    bob = hub_store.agent_by_name("bob")
+    assert bob is not None
+    assert (bob.checkin_remote_addr, bob.last_remote_addr) == ("192.0.2.10", "192.0.2.10")
+
+
+async def test_a_superseded_heartbeat_leaves_the_live_address_alone(
+    app: FastAPI, client: httpx.AsyncClient, hub_store: HubStore
+) -> None:
+    async with peer(app, "192.0.2.10") as windows:
+        context_id = await check_in(windows, "bob", worker_instance_id="bob-1")
+    async with peer(app, "192.0.2.99") as stale:
+        body = await post(stale, "message/send", heartbeat(context_id, "bob-0"))
+
+    assert body["result"]["metadata"][MetaKeys.ACCEPTED] is False
+    bob = hub_store.agent_by_name("bob")
+    assert bob is not None and bob.last_remote_addr == "192.0.2.10"
 
 
 async def test_worker_calls_require_the_current_instance_id(

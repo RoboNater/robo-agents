@@ -87,6 +87,34 @@ async def test_background_heartbeat_runs_without_llm_tool_calls(
     }
 
 
+async def test_telemetry_records_the_hub_url_at_startup_and_on_each_heartbeat(
+    client: httpx.AsyncClient,
+    worker_settings: WorkerSettings,
+    hub_store: HubStore,
+    tmp_path: Path,
+) -> None:
+    """#126: the URL the worker dialed, to set beside the address the hub saw."""
+
+    telemetry_path = tmp_path / "bob.jsonl"
+    configured = replace(worker_settings, heartbeat_s=0.01, telemetry_log=telemetry_path)
+    async with WorkerHubClient(configured, http_client=client) as worker:
+        await worker.check_in()
+        await asyncio.sleep(0.05)
+
+    records = [
+        json.loads(line) for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+    ]
+    [started] = [record for record in records if record["event"] == "session_started"]
+    heartbeats = [record for record in records if record["event"] == "heartbeat"]
+    assert started["hub_url"] == BASE_URL
+    assert heartbeats
+    assert all(record["hub_url"] == BASE_URL for record in heartbeats)
+    # The in-process transport reports a loopback peer, as a WSL worker would.
+    bob = hub_store.agent_by_name("bob")
+    assert bob is not None
+    assert (bob.checkin_remote_addr, bob.last_remote_addr) == ("127.0.0.1", "127.0.0.1")
+
+
 async def test_check_in_reports_the_launcher_profile_to_get_state(
     client: httpx.AsyncClient, worker_settings: WorkerSettings, hub_store: HubStore
 ) -> None:

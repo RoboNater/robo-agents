@@ -172,6 +172,9 @@ def create_app(settings: HubSettings | None = None) -> FastAPI:
             return measured(call, len(body), parse_error_response())
         if call is not None:
             call.tool = a2a_tool(payload)
-        return measured(call, len(body), await protocol.dispatch(payload))
+        # The connection's peer, not a header such as X-Forwarded-For: a
+        # worker can set any header it likes, but not the socket it dials from.
+        peer = request.client.host if request.client is not None else None
+        return measured(call, len(body), await protocol.dispatch(payload, peer))
 
     return app
