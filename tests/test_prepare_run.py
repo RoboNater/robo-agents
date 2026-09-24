@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -646,3 +646,316 @@ def test_default_rendering_is_byte_for_byte_unchanged(
     rendered = default_rendering(tmp_path, monkeypatch, capsys)
     for name, text in rendered.items():
         assert text == (GOLDEN / name).read_text(encoding="utf-8"), name
+
+
+WSL_URL = "http://172.26.115.68:8420"
+
+
+def test_networked_run_renders_addresses_consistently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(
+        str(origin), run_dir, hub_host="0.0.0.0", hub_url=WSL_URL
+    )
+    configs = run_dir / "configs"
+    hub_env = json.loads((configs / "alice.mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["hub"]["env"]
+    assert hub_env["HUB_HOST"] == "0.0.0.0"
+    assert hub_env["HUB_PUBLIC_URL"] == WSL_URL
+    bob_env = json.loads((configs / "bob.mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["hub"]["env"]
+    charlie_env = tomllib.loads((configs / "codex" / "config.toml").read_text(encoding="utf-8"))[
+        "mcp_servers"
+    ]["hub"]["env"]
+    assert bob_env["HUB_URL"] == charlie_env["HUB_URL"] == WSL_URL
+    assert manifest["network"] == {
+        "hub_host": "0.0.0.0",
+        "hub_url": WSL_URL,
+        "public_url": WSL_URL,
+        "remote_worker": None,
+    }
+    out = capsys.readouterr().out
+    assert f"curl.exe -fsS {WSL_URL}/healthz" in out
+    assert "changes whenever WSL restarts" in out
+    report = json.loads(out.split("\nLaunch commands")[0])
+    assert report["network"] == manifest["network"]
+
+
+def test_public_url_overrides_the_advertised_address_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    PREPARE_RUN.prepare(
+        str(origin),
+        run_dir,
+        hub_host="0.0.0.0",
+        hub_url=WSL_URL + "/",
+        public_url="http://hub.example:8420",
+    )
+    configs = run_dir / "configs"
+    hub_env = json.loads((configs / "alice.mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["hub"]["env"]
+    assert hub_env["HUB_PUBLIC_URL"] == "http://hub.example:8420"
+    bob_env = json.loads((configs / "bob.mcp.json").read_text(encoding="utf-8"))[
+        "mcpServers"
+    ]["hub"]["env"]
+    assert bob_env["HUB_URL"] == WSL_URL
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({"hub_host": "0.0.0.0"}, "binds every interface"),
+        ({"hub_host": "::"}, "binds every interface"),
+        ({"hub_host": "[::]"}, "binds every interface"),
+        ({"hub_host": "*"}, "binds every interface"),
+        (
+            {"hub_host": "0.0.0.0", "hub_url": WSL_URL, "public_url": "http://localhost:8420"},
+            "binds every interface",
+        ),
+        ({"remote_worker": "bob"}, "cannot be loopback"),
+        ({"hub_host": "0.0.0.0", "public_url": WSL_URL, "remote_worker": "bob"}, "cannot be"),
+        ({"hub_url": WSL_URL}, "only binds loopback"),
+        ({"hub_url": "172.26.115.68:8420"}, "http(s) URL"),
+        (
+            {"hub_host": "0.0.0.0", "hub_url": WSL_URL, "remote_worker": "bob",
+             "bob_dir": Path("/elsewhere/bob")},
+            "--worker-only bob",
+        ),
+    ],
+)
+def test_unreachable_network_topologies_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, Any], expected: str
+) -> None:
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    with pytest.raises(ValueError, match=expected.replace("(", r"\(").replace(")", r"\)")):
+        PREPARE_RUN.prepare("test-org/test-repo", run_dir, skip_github_checks=True, **kwargs)
+    assert not run_dir.exists()
+
+
+def test_remote_worker_is_left_to_its_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    origin = make_origin(tmp_path)
+    runner = fake_runner(monkeypatch)
+    probed: list[tuple[Any, ...]] = []
+
+    def recording(*args: Any, **kwargs: Any) -> str:
+        probed.append(args)
+        return str(runner(*args, **kwargs))
+
+    monkeypatch.setattr(PREPARE_RUN, "run", recording)
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(
+        str(origin),
+        run_dir,
+        hub_host="0.0.0.0",
+        hub_url=WSL_URL,
+        remote_worker="bob",
+        bob_model="claude-opus-5-5",
+    )
+    # Bob's clone, config, prompt and harness version all belong to his host.
+    assert not (run_dir / "bob").exists()
+    assert not (run_dir / "configs" / "bob.mcp.json").exists()
+    assert not (run_dir / "bob.prompt.md").exists()
+    assert ("claude", "--version") not in probed
+    assert set(manifest["workspaces"]) == {"charlie"}
+    assert manifest["network"]["remote_worker"] == "bob"
+    charlie_env = tomllib.loads(
+        (run_dir / "configs" / "codex" / "config.toml").read_text(encoding="utf-8")
+    )["mcp_servers"]["hub"]["env"]
+    assert charlie_env["HUB_URL"] == WSL_URL
+    out = capsys.readouterr().out
+    assert "# bob runs on the worker host" in out
+    command = next(line for line in out.splitlines() if "--worker-only bob" in line)
+    assert f"--hub-url '{WSL_URL}'" in command
+    assert f"--token-file '{run_dir / 'hub-state' / 'token'}'" in command
+    assert "--bob claude-code" in command and "--bob-model 'claude-opus-5-5'" in command
+    token = (run_dir / "hub-state" / "token").read_text(encoding="utf-8").strip()
+    assert token not in out
+
+
+def test_remote_token_path_spells_the_wsl_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu-24.04")
+    assert PREPARE_RUN.remote_token_path(Path("/home/me/run/hub-state/token")) == (
+        "\\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\run\\hub-state\\token"
+    )
+    monkeypatch.delenv("WSL_DISTRO_NAME")
+    assert PREPARE_RUN.remote_token_path(Path("/srv/run/token")) == "/srv/run/token"
+
+
+WINDOWS_ROOT = PureWindowsPath("C:/work/robo-agents")
+WINDOWS_RUN = PureWindowsPath("C:/Users/Bob/runs/step7")
+
+
+def test_remote_worker_config_carries_windows_paths_and_a_private_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "bundle"
+    bundle = PREPARE_RUN.render_worker_bundle(
+        "bob",
+        "claude-code",
+        "2.1.277",
+        "anthropic",
+        "",
+        "",
+        "f" * 64,
+        WSL_URL,
+        WINDOWS_ROOT,
+        WINDOWS_RUN,
+        WINDOWS_RUN / "bob",
+        out_dir,
+    )
+    written = out_dir / "configs" / "bob.mcp.json"
+    text = written.read_text(encoding="utf-8")
+    assert "\\\\" not in text  # forward slashes only (#75)
+    hub = json.loads(text)["mcpServers"]["hub"]
+    assert hub["args"] == ["run", "--locked", "--directory", "C:/work/robo-agents", "worker-mcp"]
+    assert hub["env"]["HUB_URL"] == WSL_URL
+    assert hub["env"]["HUB_WORKSPACE"] == "C:/Users/Bob/runs/step7/bob"
+    assert hub["env"]["HUB_TELEMETRY_LOG"] == "C:/Users/Bob/runs/step7/bob-telemetry.jsonl"
+    assert hub["env"]["HUB_TOKEN"] == "f" * 64
+    assert written.stat().st_mode & 0o077 == 0
+    assert bundle["config"] == "C:/Users/Bob/runs/step7/configs/bob.mcp.json"
+    assert "$AGENT_NAME" not in (out_dir / "bob.prompt.md").read_text(encoding="utf-8")
+    assert bundle["launch"] == [
+        'cd "/c/Users/Bob/runs/step7/bob"',
+        'claude --strict-mcp-config --mcp-config "C:/Users/Bob/runs/step7/configs/bob.mcp.json"',
+    ]
+
+
+def test_remote_codex_launch_uses_git_bash_only_where_the_shell_reads_it() -> None:
+    lines = PREPARE_RUN.worker_launch("bob", "codex", WINDOWS_RUN, WINDOWS_RUN / "bob")
+    assert lines == [
+        'cd "/c/Users/Bob/runs/step7/bob"',
+        'CODEX_HOME="C:/Users/Bob/runs/step7/configs/bob-codex" codex exec --ephemeral '
+        '-C . --add-dir "C:/Users/Bob/runs/step7/bob/.git" --approve-for-me - '
+        '< "/c/Users/Bob/runs/step7/bob.prompt.md"',
+    ]
+    posix = PurePosixPath("/srv/run")
+    assert PREPARE_RUN.worker_launch("charlie", "claude-code", posix, posix / "charlie") == [
+        'cd "/srv/run/charlie"',
+        'claude --strict-mcp-config --mcp-config "/srv/run/configs/charlie.mcp.json"',
+    ]
+
+
+def test_bundle_refuses_a_filesystem_that_ignores_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A DrvFs mount without metadata (/mnt/c from WSL) accepts chmod and ignores it.
+    monkeypatch.setattr(RUN_COMMON.os, "chmod", lambda *args, **kwargs: None)
+    previous = os.umask(0o022)
+    try:
+        with pytest.raises(ValueError, match="ignores POSIX permissions"):
+            PREPARE_RUN.render_worker_bundle(
+                "bob", "claude-code", "2.1.277", "anthropic", "", "", "f" * 64, WSL_URL,
+                WINDOWS_ROOT, WINDOWS_RUN, WINDOWS_RUN / "bob", tmp_path / "bundle",
+            )
+    finally:
+        os.umask(previous)
+
+
+def hub_token_file(tmp_path: Path, mode: int = 0o600) -> tuple[Path, str]:
+    state = tmp_path / "hub-state"
+    state.mkdir(mode=0o700)
+    token_file = state / "token"
+    token_file.write_text("a" * 64 + "\n", encoding="utf-8")
+    token_file.chmod(mode)
+    return token_file, "a" * 64
+
+
+def test_worker_only_renders_one_worker_from_the_hub_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    token_file, token = hub_token_file(tmp_path)
+    run_dir = (tmp_path / "worker-run").resolve()
+    manifest = PREPARE_RUN.prepare_worker(
+        "bob", str(origin), run_dir, WSL_URL, token_file, "claude-code"
+    )
+    identity = manifest["workspaces"]["bob"]
+    written = run_dir / "configs" / "bob.mcp.json"
+    hub = json.loads(written.read_text(encoding="utf-8"))["mcpServers"]["hub"]
+    assert hub["env"]["HUB_URL"] == WSL_URL
+    assert hub["env"]["HUB_TOKEN"] == token
+    assert hub["env"]["HUB_WORKSPACE"] == identity["path"] == str(run_dir / "bob")
+    assert hub["env"]["HUB_TELEMETRY_LOG"] == str(run_dir / "bob-telemetry.jsonl")
+    assert hub["env"]["HUB_HARNESS_VERSION"] == "2.1.277"
+    assert hub["args"][3] == ROOT.as_posix()
+    assert written.stat().st_mode & 0o077 == 0
+    assert (run_dir / "bob.prompt.md").exists()
+    assert not (run_dir / "charlie").exists()
+    # The token is only read: no token file is minted or copied on this host.
+    assert [path for path in run_dir.rglob("token*")] == []
+    for path in (run_dir / "bob").rglob("*"):
+        if path.is_file() and ".git" not in path.parts:
+            assert token not in path.read_text(encoding="utf-8", errors="replace")
+    out = capsys.readouterr().out
+    assert f"curl.exe -fsS {WSL_URL}/healthz" in out
+    assert f'claude --strict-mcp-config --mcp-config "{written}"' in out
+    assert token not in out
+    # A rerun reuses the clone and identity.
+    again = PREPARE_RUN.prepare_worker(
+        "bob", str(origin), run_dir, WSL_URL, token_file, "claude-code"
+    )
+    assert again["workspaces"] == manifest["workspaces"]
+
+
+@pytest.mark.parametrize(
+    "mode,url,expected",
+    [
+        (0o644, WSL_URL, "owner-only"),
+        (0o600, "http://127.0.0.1:8420", "cannot be loopback"),
+        (None, WSL_URL, "does not exist"),
+    ],
+)
+def test_worker_only_rejects_loose_missing_token_or_loopback_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int | None, url: str, expected: str
+) -> None:
+    fake_runner(monkeypatch)
+    if mode is None:
+        token_file = tmp_path / "missing-token"
+    else:
+        token_file, _ = hub_token_file(tmp_path, mode)
+    run_dir = (tmp_path / "worker-run").resolve()
+    with pytest.raises(ValueError, match=expected):
+        PREPARE_RUN.prepare_worker(
+            "bob", "test-org/test-repo", run_dir, url, token_file, "claude-code"
+        )
+    assert not run_dir.exists()
+
+
+def test_worker_only_refuses_hub_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    token_file, _ = hub_token_file(tmp_path)
+    run_dir = (tmp_path / "run").resolve()
+    for extra in (
+        ["--worker-only", "bob", "--token-file", str(token_file), "--issue", "42"],
+        ["--worker-only", "bob"],
+        ["--token-file", str(token_file)],
+    ):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["prepare-run.py", "--repository", "test-org/test-repo", "--run-dir", str(run_dir)]
+            + extra,
+        )
+        with pytest.raises(SystemExit) as exc:
+            PREPARE_RUN.main()
+        assert exc.value.code == 2
+    assert not run_dir.exists()
+
+
+def test_git_bash_path_only_rewrites_windows_drives() -> None:
+    assert PREPARE_RUN.git_bash_path(PureWindowsPath("D:/Runs/x")) == "/d/Runs/x"
+    assert PREPARE_RUN.git_bash_path(PurePosixPath("/srv/run")) == "/srv/run"
