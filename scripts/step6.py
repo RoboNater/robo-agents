@@ -482,11 +482,12 @@ def prepare(directory, local_repository=None, seed=False, scenario_path=None, ne
         save(directory / "run.json", manifest)
         render(directory, manifest, scenario)
     if seed and manifest["roadmap_reservation"]:
+        step = "Step 7" if networked else "Step 6"
         comment = directory / "reservation.md"
         comment.write_text(
             "Implementation agent Bob on behalf of RoboNater\n\n"
-            f"Step 6 attempt `{run_id}` reserves {url}. No schema/wire counter needed. "
-            "Step 6 remains open until coordination code and evidence merge.\n"
+            f"{step} attempt `{run_id}` reserves {url}. No schema/wire counter needed. "
+            f"{step} remains open until coordination code and evidence merge.\n"
         )
         run(
             "gh",

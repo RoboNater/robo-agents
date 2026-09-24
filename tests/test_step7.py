@@ -479,7 +479,7 @@ def test_preflight_passes_when_windows_reaches_the_advertised_hub(
         ("head", "windows_checkout"),
         ("dirty", "windows_checkout"),
         ("port", "hub_port_free"),
-        ("hub", "preflight_hub"),
+        ("hub", "preflight_error"),
         ("healthz", "windows_healthz"),
         ("card", "windows_agent_card_url"),
         ("loopback_card", "windows_agent_card_url"),

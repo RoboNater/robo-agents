@@ -394,8 +394,8 @@ def preflight(directory, manifest, hub):
             with preflight_hub(directory, hub, local):
                 health = windows_curl(windows, network["hub_url"] + "/healthz")
                 card = windows_curl(windows, network["hub_url"] + "/.well-known/agent-card.json")
-        except ValueError as exc:
-            record("preflight_hub", False, str(exc))
+        except ValueError as exc:  # the hub did not start, or curl.exe failed
+            record("preflight_error", False, str(exc))
     expected = network["public_url"] + "/a2a"
     record("windows_healthz", health == {"status": "ok"}, json.dumps(health))
     url = card.get("url") if isinstance(card, dict) else None
@@ -408,7 +408,7 @@ def prepare_bob(directory, manifest, repository):
 
     Windows git bootstraps the clone (``scripts/bootstrap-workspace.py``), so
     the identity's path is Windows' own spelling of ``HUB_WORKSPACE``. The
-    hub's token is read in place over ``\\\\wsl.localhost``; no copy is written
+    hub's token is read in place over ``//wsl.localhost``; no copy is written
     on Windows except the config that carries it as ``HUB_TOKEN``.
     """
     windows, network = manifest["windows"], manifest["network"]
