@@ -600,3 +600,49 @@ def test_missing_or_empty_work_file_fails_actionably(
     assert message.startswith("prepare-run: error:")
     assert expected in message
     assert not run_dir.exists()
+
+
+GOLDEN = ROOT / "tests" / "fixtures" / "prepare-run-default"
+#: Rendered outputs of a default (loopback) run, compared byte for byte (#125).
+GOLDEN_FILES = {
+    "alice.mcp.json": Path("configs/alice.mcp.json"),
+    "bob.mcp.json": Path("configs/bob.mcp.json"),
+    "codex.config.toml": Path("configs/codex/config.toml"),
+    "run.json": Path("run.json"),
+}
+
+
+def default_rendering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> dict[str, str]:
+    """A default run's rendered files and stdout, with run-specific values masked."""
+    origin = make_origin(tmp_path)
+    fake_runner(monkeypatch)
+    run_dir = (tmp_path / "run").resolve()
+    manifest = PREPARE_RUN.prepare(str(origin), run_dir, issue=42, account="testuser")
+    token = (run_dir / "hub-state" / "token").read_text(encoding="utf-8").strip()
+    masks = {
+        str(run_dir): "$RUN_DIR",
+        str(origin): "$ORIGIN",
+        str(ROOT): "$ROOT",
+        token: "$TOKEN",
+        manifest["workspaces"]["bob"]["workspace_id"]: "$BOB_ID",
+        manifest["workspaces"]["charlie"]["workspace_id"]: "$CHARLIE_ID",
+    }
+    rendered = {
+        name: (run_dir / path).read_text(encoding="utf-8") for name, path in GOLDEN_FILES.items()
+    }
+    rendered["stdout.txt"] = capsys.readouterr().out
+    for name, text in rendered.items():
+        for value, mask in masks.items():
+            text = text.replace(value, mask)
+        rendered[name] = text
+    return rendered
+
+
+def test_default_rendering_is_byte_for_byte_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rendered = default_rendering(tmp_path, monkeypatch, capsys)
+    for name, text in rendered.items():
+        assert text == (GOLDEN / name).read_text(encoding="utf-8"), name
