@@ -194,6 +194,78 @@ pair); `--bob-provider` / `--charlie-provider` and `--bob-capabilities` /
 identity file. Nothing is ever written inside either clone. The manual
 walkthrough in Steps 1-5 below is kept as an appendix for custom topologies.
 
+### Networked run: a worker on another host
+
+By default everything binds and dials loopback. To let a worker on another
+host reach the hub, three addresses are set separately:
+
+| Flag | Renders | Default |
+|---|---|---|
+| `--hub-host` | `HUB_HOST`, the hub's bind address (in `alice.mcp.json`) | `127.0.0.1` |
+| `--hub-url` | `HUB_URL`, the address every worker dials | `http://127.0.0.1:8420` |
+| `--public-url` | `HUB_PUBLIC_URL`, the address the agent card advertises | `--hub-url` |
+
+prepare-run refuses a topology no worker could use: a wildcard `--hub-host`
+(`0.0.0.0`, `::`, `*`) whose advertised URL is loopback (as
+`HubSettings.from_env()` does), a non-loopback `--hub-url` on a loopback bind,
+and a loopback `--hub-url` with a remote worker.
+
+`--remote-worker NAME` leaves that worker to its own host. For example, hub,
+Alice and Charlie in WSL2 and Bob natively on the Windows host, which dials
+WSL's `eth0` address:
+
+```sh
+# In WSL (the hub host):
+uv run --locked python scripts/prepare-run.py \
+  --repository git@github.com:your-org/your-repo.git \
+  --run-dir /absolute/path/to/my-run --issue 42 --account your-github-username \
+  --hub-host 0.0.0.0 \
+  --hub-url http://$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1):8420 \
+  --remote-worker bob
+```
+
+It renders Alice and Charlie as usual and prints, in place of Bob's launch
+lines, the command to run on Bob's host from a robo-agents checkout at the same
+commit. Fill in the run directory; the token file is the hub's, read in place
+through `\\wsl.localhost\<distro>\...`:
+
+```sh
+# On Windows (Git Bash), in C:/work/robo-agents:
+uv run --locked python scripts/prepare-run.py --worker-only bob \
+  --repository 'git@github.com:your-org/your-repo.git' --run-dir 'C:/runs/my-run' \
+  --hub-url 'http://172.26.115.68:8420' \
+  --token-file '\\wsl.localhost\Ubuntu\home\you\my-run\hub-state\token' --bob claude-code
+```
+
+`--worker-only` bootstraps Bob's clone with that host's git, reads the harness
+version from that host's CLI, and renders `configs/bob.mcp.json`,
+`bob.prompt.md` and the launch lines with that host's paths: forward-slash
+Windows paths in the config (see "Windows paths in JSON configs" below), and
+Git Bash `/c/...` spellings where the shell itself reads a path (`cd`, `<`).
+It never mints or copies a token; the token lives only inside the rendered
+config, written owner-only (mode 0600 on POSIX; on Windows keep the run
+directory under your user profile so it inherits a private ACL).
+
+The worker is rendered on its own host rather than from the hub host into a
+directory both can read (such as `/mnt/c/...` from WSL) for three reasons: the
+clone's identity `path` must match `HUB_WORKSPACE` exactly, so the clone has to
+be bootstrapped by the host that uses it; the reported harness version must
+come from that host's CLI; and `/mnt/c` ignores `chmod` unless mounted with
+`metadata`, so a token written there cannot be kept owner-only.
+
+Whenever `--hub-url` is not loopback, both commands print a preflight to run on
+the worker host before launching it:
+
+```powershell
+curl.exe -fsS http://172.26.115.68:8420/healthz
+curl.exe -fsS http://172.26.115.68:8420/.well-known/agent-card.json   # its url must be <--public-url>/a2a
+```
+
+(`curl.exe`, because `curl` is an alias for `Invoke-WebRequest` in PowerShell.)
+WSL2's default NAT networking gives `eth0` an address the LAN cannot reach and
+that changes whenever WSL restarts: do not restart WSL during a run, and if it
+does restart, render the run again with the new address.
+
 ---
 
 ## Step 1: Bootstrap Worker Workspaces
@@ -254,8 +326,8 @@ The hub and all workers communicate securely using a pre-shared bearer token.
 |---|---|---|---|
 | `HUB_STATE_DIR` | Recommended | Absolute path for `hub.db` and state | `$XDG_STATE_HOME/agent-hub` |
 | `HUB_TOKEN` | Recommended | Pre-shared bearer token | Read from `$HUB_STATE_DIR/token` |
-| `HUB_PUBLIC_URL` | Local: No / Remote: Yes | Dialable address advertised by the hub | `http://HUB_HOST:HUB_PORT` |
-| `HUB_HOST` | No | Bind host (`0.0.0.0` for remote workers) | `127.0.0.1` |
+| `HUB_PUBLIC_URL` | Local: No / Remote: Yes | Dialable address advertised by the hub; prepare-run's `--public-url`, defaulting to `--hub-url` (the `HUB_URL` workers dial) | `http://HUB_HOST:HUB_PORT` |
+| `HUB_HOST` | No | Bind host (`0.0.0.0` for remote workers, which then requires a non-loopback `HUB_PUBLIC_URL`); prepare-run's `--hub-host` | `127.0.0.1` |
 | `HUB_PORT` | No | Bind port | `8420` |
 
 ### Windows paths in JSON configs (Steps 2-4)

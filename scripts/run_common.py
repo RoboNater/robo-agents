@@ -231,11 +231,16 @@ def bootstrap_clone(agent: str, destination: Path, repository: str) -> dict[str,
     return value
 
 
-def render_claude_mcp(env: dict[str, str]) -> dict[str, Any]:
-    """Render a Claude worker ``*.mcp.json`` from the checked-in template."""
+def render_claude_mcp(env: dict[str, str], root: str | None = None) -> dict[str, Any]:
+    """Render a Claude worker ``*.mcp.json`` from the checked-in template.
+
+    ``root`` is the robo-agents checkout ``uv`` runs ``worker-mcp`` from, as
+    the worker's host spells it; it defaults to this checkout.
+    """
     template = json.loads((ROOT / "runtimes/claude-code.mcp.json").read_text(encoding="utf-8"))
+    directory = str(ROOT) if root is None else root
     template["mcpServers"]["hub"].update(
-        {"args": ["run", "--locked", "--directory", str(ROOT), "worker-mcp"], "env": env}
+        {"args": ["run", "--locked", "--directory", directory, "worker-mcp"], "env": env}
     )
     return template
 
