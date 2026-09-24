@@ -17,10 +17,11 @@ transcript = config_root / 'projects' / project / (m['alice_session_id'] + '.jso
 print('resume' if transcript.is_file() else 'new')
 print(config_root)
 print('custom' if m.get('claude_config_dir_is_custom', config_root != Path.home() / '.claude') else 'default')
+print(m.get('network', {}).get('hub_port', 8420))  # a networked (Step 7) run names its port
 PY
 )
-if curl --silent --fail http://127.0.0.1:8420/healthz >/dev/null 2>&1; then
-  echo 'port 8420 occupied; leave other checkout listeners alone' >&2; exit 1
+if curl --silent --fail "http://127.0.0.1:${settings[5]}/healthz" >/dev/null 2>&1; then
+  echo "port ${settings[5]} occupied; leave other checkout listeners alone" >&2; exit 1
 fi
 if [[ ${settings[4]} == custom ]]; then
   export CLAUDE_CONFIG_DIR=${settings[3]}

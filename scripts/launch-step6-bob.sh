@@ -9,6 +9,7 @@ readarray -t settings < <(python3 - "$run_dir/run.json" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1]))
 assert m['repository'] == 'RoboNater/robo-agents-sandbox' and m.get('issue')
+assert not m.get('network'), 'networked run: launch bob with scripts/step6_launch.py bob RUN_DIR'
 print(m['workspaces']['bob']['path'])
 print(m['models']['bob'])
 PY

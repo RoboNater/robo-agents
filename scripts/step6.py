@@ -2,6 +2,9 @@
 """Step 6 preparation, trusted prompts, disturbance driver, and evidence verifier.
 
 The driver reads hub milestones; it never assigns, reviews, or merges the work PR.
+``--scenario scenarios/step7-networked-untrusted.json`` selects the Step 7
+topology (hub, Alice and Charlie in WSL2, Bob on Windows); its extra steps and
+checks live in ``step7.py``.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import step7
 from run_common import (
     TOOLS,
     codex_home,
@@ -35,6 +39,7 @@ from run_common import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SANDBOX = "RoboNater/robo-agents-sandbox"
+DEFAULT_SCENARIO = "scenarios/step6-localhost-untrusted.json"
 
 
 # Default topology: Claude Alice/Bob and Codex Charlie. Launch-time overrides
@@ -57,7 +62,9 @@ def topology(manifest):
 def harness_version(manifest, name):
     """The bare version reported at check-in, from the recorded `--version` output."""
     harness = topology(manifest)[0][name]
-    words = manifest["versions"][VERSION_COMMANDS[harness]].split()
+    # A worker rendered on another host reports that host's CLI version (Step 7).
+    output = manifest.get("remote_versions", {}).get(name)
+    words = (output or manifest["versions"][VERSION_COMMANDS[harness]]).split()
     return words[-1] if harness == "codex" else words[0]
 
 
@@ -210,7 +217,26 @@ def claude_authenticated():
     return json.loads(run("claude", "auth", "status")).get("loggedIn") is True
 
 
-def prepare(directory, local_repository=None, seed=False):
+def load_scenario(path):
+    """The scenario file, its repository-relative spelling, and its digest."""
+    file = (path if path.is_absolute() else ROOT / path).resolve()
+    data = file.read_bytes()
+    name = file.relative_to(ROOT).as_posix() if ROOT in file.parents else str(file)
+    return json.loads(data), name, hashlib.sha256(data).hexdigest()
+
+
+def isolated_clones(first, second, run_id):
+    marker = first / ("isolation-" + run_id)
+    marker.write_text(run_id)
+    isolated = not (second / marker.name).exists()
+    marker.unlink()
+    if not isolated:
+        raise ValueError("cross-clone isolation failed")
+    return {"marker": marker.name, "absent_in_charlie": isolated}
+
+
+def prepare(directory, local_repository=None, seed=False, scenario_path=None, network=None):
+    """Prepare a run. ``network`` holds the Step 7 options, for a networked scenario only."""
     if not directory.is_absolute() or directory != directory.resolve():
         raise ValueError("RUN_DIR must be absolute and canonical")
     if directory == ROOT or ROOT in directory.parents:
@@ -228,9 +254,17 @@ def prepare(directory, local_repository=None, seed=False):
             raise ValueError("refusing to reuse a measured/ready run directory; preserve it")
         if (directory / "run.json").exists() and load_manifest(directory).get("issue"):
             raise ValueError("refusing to reuse a run with a created issue")
-    scenario = json.loads((ROOT / "scenarios/step6-localhost-untrusted.json").read_text())
+    scenario, scenario_name, scenario_sha256 = load_scenario(
+        Path(scenario_path or DEFAULT_SCENARIO)
+    )
     if scenario["repository"] != SANDBOX:
         raise ValueError("scenario must target the sandbox")
+    networked = step7.topology_of(scenario) == step7.NETWORKED
+    if networked != (network is not None):
+        raise ValueError(
+            "a networked scenario needs --hub-port, --windows-run-dir and --windows-checkout; "
+            "a localhost scenario takes none of them"
+        )
     if seed and local_repository:
         raise ValueError("local validation must never create a GitHub issue")
     harnesses = {
@@ -291,20 +325,19 @@ def prepare(directory, local_repository=None, seed=False):
             "phase": "preparing",
             "repository": local_repository,
             "seed": seed,
-            "scenario_sha256": hashlib.sha256(
-                (ROOT / "scenarios/step6-localhost-untrusted.json").read_bytes()
-            ).hexdigest(),
+            "scenario_sha256": scenario_sha256,
             "run_id": datetime.now(UTC).strftime("%Y%m%d%H%M%S") + "_" + secrets.token_hex(4),
         }
+        if network is not None:
+            checkpoint["network"] = network
         save(checkpoint_path, checkpoint)
-    if checkpoint["repository"] != local_repository or checkpoint["seed"] != seed:
-        raise ValueError("setup retry must use the same repository/mode")
     if (
-        checkpoint["scenario_sha256"]
-        != hashlib.sha256(
-            (ROOT / "scenarios/step6-localhost-untrusted.json").read_bytes()
-        ).hexdigest()
+        checkpoint["repository"] != local_repository
+        or checkpoint["seed"] != seed
+        or checkpoint.get("network") != network
     ):
+        raise ValueError("setup retry must use the same repository/mode")
+    if checkpoint["scenario_sha256"] != scenario_sha256:
         raise ValueError("scenario changed during setup; use a fresh run directory")
     (directory / "state").mkdir(mode=0o700, exist_ok=True)
     if os.environ.get("STEP6_PYENV_VERSION"):
@@ -316,7 +349,8 @@ def prepare(directory, local_repository=None, seed=False):
     run_id = checkpoint["run_id"]
     repository = local_repository or f"git@github.com:{SANDBOX}.git"
     workspaces = {}
-    for name in ("bob", "charlie", "driver"):
+    # A networked Bob is bootstrapped on Windows, by Windows git, below.
+    for name in ("charlie", "driver") if networked else ("bob", "charlie", "driver"):
         # Same entry point as bootstrap-workspace.sh, without requiring a POSIX shell.
         identity = json.loads(
             run(
@@ -333,12 +367,11 @@ def prepare(directory, local_repository=None, seed=False):
             )
         )
         workspaces[name] = identity
-    marker = directory / "bob" / ("isolation-" + run_id)
-    marker.write_text(run_id)
-    isolated = not (directory / "charlie" / marker.name).exists()
-    marker.unlink()
-    if not isolated:
-        raise ValueError("cross-clone isolation failed")
+    if networked:
+        workspaces["charlie"].update(
+            host="wsl", qualified_path=step7.qualified("wsl", workspaces["charlie"]["path"])
+        )
+    prefix = scenario.get("evidence_prefix", "step6")
     manifest = {
         "alice_session_id": str(uuid.uuid4()),
         "claude_config_dir": os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")),
@@ -347,16 +380,16 @@ def prepare(directory, local_repository=None, seed=False):
         "run_id": run_id,
         "run_dir": str(directory),
         "repository": SANDBOX,
-        "scenario_sha256": hashlib.sha256(
-            (ROOT / "scenarios/step6-localhost-untrusted.json").read_bytes()
-        ).hexdigest(),
+        "scenario": scenario_name,
+        "scenario_sha256": scenario_sha256,
+        "topology": step7.topology_of(scenario),
+        "evidence_prefix": prefix,
         "coordination_head": run("git", "rev-parse", "HEAD", cwd=ROOT),
         "review_check_script": str(ROOT / "scripts/step6-review-check.py"),
-        "implementation_branch": f"step6-{run_id}/implement",
-        "base_branch": f"step6-{run_id}/base",
+        "implementation_branch": f"{prefix}-{run_id}/implement",
+        "base_branch": f"{prefix}-{run_id}/base",
         "canary": "STEP6-INJECT-" + run_id,
         "workspaces": workspaces,
-        "isolation_check": {"marker": marker.name, "absent_in_charlie": isolated},
         "harnesses": harnesses,
         "providers": providers,
         "models": {
@@ -390,8 +423,32 @@ def prepare(directory, local_repository=None, seed=False):
         }
     else:
         manifest["branch_protection"] = {"available": False, "local_only": True}
+    if networked:
+        manifest["network"] = step7.network_settings(
+            step7.read_eth0(), network["hub_port"], os.environ.get("WSL_DISTRO_NAME", "")
+        )
+        manifest["windows"] = {key: network[key] for key in ("run_dir", "checkout", "bash", "curl")}
+    else:
+        manifest["isolation_check"] = isolated_clones(
+            directory / "bob", directory / "charlie", run_id
+        )
     save(directory / "run.json", manifest)
     render(directory, manifest, scenario)
+    if networked:
+        # Refuses --seed (and a dry run) before Bob is rendered or an issue exists.
+        manifest["preflight"] = step7.preflight(directory, manifest, hub_environment(manifest))
+        save(directory / "run.json", manifest)
+        if not manifest["preflight"]["passed"]:
+            failed = [row for row in manifest["preflight"]["checks"] if not row["passed"]]
+            raise ValueError("Step 7 preflight failed: " + json.dumps(failed))
+        bob, version = step7.prepare_bob(directory, manifest, repository)
+        manifest["workspaces"]["bob"] = bob
+        manifest["remote_versions"] = {"bob": version}
+        manifest["isolation_check"] = isolated_clones(
+            step7.local_path(bob), directory / "charlie", run_id
+        )
+        manifest["canaries"] = step7.place_canaries(manifest)
+        save(directory / "run.json", manifest)
     checkpoint["phase"] = "ready"
     save(checkpoint_path, checkpoint)
     if seed:
@@ -441,15 +498,16 @@ def prepare(directory, local_repository=None, seed=False):
             "--body-file",
             str(comment),
         )
-    print(
-        json.dumps(
-            {
-                "run_id": run_id,
-                "manifest": str(directory / "run.json"),
-                "issue": manifest.get("issue"),
-            }
-        )
-    )
+    summary = {
+        "run_id": run_id,
+        "manifest": str(directory / "run.json"),
+        "issue": manifest.get("issue"),
+    }
+    if networked:
+        summary["network"] = manifest["network"]
+        summary["bob"] = manifest["workspaces"]["bob"]["qualified_path"]
+        summary["launch"] = step7.launch_lines(directory)
+    print(json.dumps(summary))
 
 
 def reject_placeholders(text):
@@ -486,12 +544,29 @@ OPENCODE_BASH = [
 ]
 
 
+def hub_environment(manifest):
+    directory = Path(manifest["run_dir"])
+    env = {
+        "HUB_STATE_DIR": str(directory / "state"),
+        "HUB_TOKEN": (directory / "token").read_text().strip(),
+        "HUB_PUBLIC_URL": "http://127.0.0.1:8420",
+        "HUB_GUIDES_DIR": str(ROOT / "guides"),
+        "PYTHONUTF8": "1",
+    }
+    if step7.networked(manifest):
+        env.update(step7.hub_env(manifest["network"]))
+    return env
+
+
 def render(directory, manifest, scenario):
     token = (directory / "token").read_text().strip()
     harnesses, providers = topology(manifest)
-    for name in ("bob", "charlie"):
+    networked = step7.networked(manifest)
+    # A networked Bob is rendered on Windows by prepare-run --worker-only.
+    local_workers = ("charlie",) if networked else ("bob", "charlie")
+    for name in local_workers:
         env = {
-            "HUB_URL": "http://127.0.0.1:8420",
+            "HUB_URL": step7.local_hub(manifest, "http://127.0.0.1:8420"),
             "HUB_TOKEN": token,
             "AGENT_NAME": name,
             "HUB_WORKSPACE": manifest["workspaces"][name]["path"],
@@ -548,13 +623,7 @@ def render(directory, manifest, scenario):
                     },
                 },
             )
-    hub_env = {
-        "HUB_STATE_DIR": str(directory / "state"),
-        "HUB_TOKEN": token,
-        "HUB_PUBLIC_URL": "http://127.0.0.1:8420",
-        "HUB_GUIDES_DIR": str(ROOT / "guides"),
-        "PYTHONUTF8": "1",
-    }
+    hub_env = hub_environment(manifest)
     hub_args = ["run", "--locked", "--directory", str(ROOT), "hub"]
     alice = {"mcpServers": {"hub": {"command": "uv", "args": hub_args, "env": hub_env}}}
     save(directory / "alice.mcp.json", alice)
@@ -571,14 +640,15 @@ def render(directory, manifest, scenario):
             + codex_mcp("uv", hub_args, hub_env, HUB_TOOLS, 330)
         )
         os.chmod(home / "config.toml", 0o600)
-    bob_skills = directory / "bob/.claude/skills"
-    bob_skills.mkdir(parents=True, exist_ok=True)
-    link_or_copy(ROOT / "skills/worker", bob_skills / "worker")
-    # Local runtime metadata is excluded, never published as sandbox work product.
-    with (directory / "bob/.git/info/exclude").open("a") as stream:
-        stream.write("\n.claude/\n")
+    if not networked:
+        bob_skills = directory / "bob/.claude/skills"
+        bob_skills.mkdir(parents=True, exist_ok=True)
+        link_or_copy(ROOT / "skills/worker", bob_skills / "worker")
+        # Local runtime metadata is excluded, never published as sandbox work product.
+        with (directory / "bob/.git/info/exclude").open("a") as stream:
+            stream.write("\n.claude/\n")
     worker = (ROOT / "prompts/worker.md").read_text()
-    for name in ("bob", "charlie"):
+    for name in local_workers:
         instruction = worker.replace("$AGENT_NAME", name)
         if name == "charlie":
             audit_command = shlex.join(
@@ -1714,6 +1784,15 @@ def evaluate(manifest, snapshot, facts, traces):
         and set(urls) == set(facts.get("follow_ups", {}))
         and (bool(urls) or all(not result.get("nonblocking_findings") for _, result in chain)),
     )
+    if step7.networked(manifest):
+        audit_helpers = {
+            "strings": strings,
+            "shell_actions": recorded_shell_actions,
+            "within": within,
+        }
+        network_checks = step7.evaluate(manifest, snapshot, facts, traces, audit_helpers)
+        for name, passed in network_checks.items():
+            require(name, passed)
     return {
         "run_id": manifest["run_id"],
         "passed": all(validations.values()),
@@ -1785,6 +1864,9 @@ def collect(directory):
     facts["merge_tree_matches_final"] = facts["merge_commit"]["commit"]["tree"]["sha"] == run(
         "git", "rev-parse", final + "^{tree}", cwd=driver
     )
+    if step7.networked(manifest):
+        step7.pull_windows(directory, manifest)
+        facts["canaries"] = step7.canary_facts(manifest)
     traces = {}
     for name in ("alice", "bob", "charlie"):
         path = directory / f"{name}.transcript.jsonl"
@@ -1864,23 +1946,47 @@ def export_evidence(directory, destination):
     }
     encoded = {}
     for label, document in documents.items():
-        content = (
-            json.dumps(document, indent=2, sort_keys=True).replace(str(directory), "/RUN") + "\n"
-        )
+        content = json.dumps(document, indent=2, sort_keys=True)
+        if step7.networked(manifest):
+            content = step7.mask(content, directory, manifest)
+            json.loads(content)  # masking must leave valid JSON
+        else:
+            content = content.replace(str(directory), "/RUN")
+        content += "\n"
         if token in content or re.search(
             r"(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|Bearer [A-Za-z0-9_-]{20,})",
             content,
         ):
             raise ValueError("credential detected in export; nothing was written")
         encoded[label] = content
+    prefix = manifest.get("evidence_prefix", "step6")
     destination.mkdir(parents=True, exist_ok=True)
     for label in encoded:
-        path = destination / f"step6-{manifest['run_id']}.{label}.json"
+        path = destination / f"{prefix}-{manifest['run_id']}.{label}.json"
         if path.exists():
             raise ValueError("refusing to overwrite an existing evidence export")
     for label, content in encoded.items():
-        (destination / f"step6-{manifest['run_id']}.{label}.json").write_text(content)
+        (destination / f"{prefix}-{manifest['run_id']}.{label}.json").write_text(content)
     print(json.dumps({"run_id": manifest["run_id"], "files": list(encoded)}))
+
+
+def drive(directory, timeout, once=False):
+    """Run the disturbances; a networked run also samples Bob until he is released."""
+    deadline = time.monotonic() + timeout
+    disturbed = False
+    while time.monotonic() < deadline:
+        observing = False
+        manifest = load_manifest(directory)
+        if step7.networked(manifest):
+            snapshot = audit(directory)
+            if step7.observe(directory, manifest, snapshot):
+                save(directory / "run.json", manifest)
+            observing = step7.observing(snapshot)
+        disturbed = disturbed or driver_once(directory)
+        if once or disturbed and not observing:
+            return
+        time.sleep(5)
+    raise ValueError("disturbance deadline exhausted; preserve this run")
 
 
 def main():
@@ -1889,12 +1995,41 @@ def main():
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--local-repository")
     parser.add_argument("--seed", action="store_true")
+    parser.add_argument(
+        "--scenario",
+        type=Path,
+        default=None,
+        help=f"scenario file (default {DEFAULT_SCENARIO}); "
+        "scenarios/step7-networked-untrusted.json selects the Step 7 topology",
+    )
+    parser.add_argument("--hub-port", type=int, help="Step 7: the port the hub binds")
+    parser.add_argument(
+        "--windows-run-dir", help="Step 7: Bob's run directory on Windows, e.g. C:/work/run"
+    )
+    parser.add_argument(
+        "--windows-checkout",
+        help="Step 7: a robo-agents checkout on Windows at this checkout's commit",
+    )
+    parser.add_argument("--windows-bash", default=step7.WINDOWS_BASH)
+    parser.add_argument("--windows-curl", default=step7.WINDOWS_CURL)
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--timeout", type=float, default=7200)
     args = parser.parse_args()
     if args.action == "prepare":
-        prepare(args.run_dir, args.local_repository, args.seed)
+        network = None
+        given = [args.hub_port, args.windows_run_dir, args.windows_checkout]
+        if any(value is not None for value in given):
+            if any(value is None for value in given):
+                parser.error("--hub-port, --windows-run-dir and --windows-checkout go together")
+            network = {
+                "hub_port": args.hub_port,
+                "run_dir": step7.windows_path(args.windows_run_dir, "--windows-run-dir"),
+                "checkout": step7.windows_path(args.windows_checkout, "--windows-checkout"),
+                "bash": args.windows_bash,
+                "curl": args.windows_curl,
+            }
+        prepare(args.run_dir, args.local_repository, args.seed, args.scenario, network)
     elif args.action == "verify":
         collect(args.run_dir)
     elif args.action == "export":
@@ -1902,13 +2037,7 @@ def main():
             parser.error("export requires --destination")
         export_evidence(args.run_dir, args.destination)
     else:
-        deadline = time.monotonic() + args.timeout
-        while time.monotonic() < deadline:
-            if driver_once(args.run_dir) or args.once:
-                break
-            time.sleep(5)
-        else:
-            raise ValueError("disturbance deadline exhausted; preserve this run")
+        drive(args.run_dir, args.timeout, args.once)
 
 
 if __name__ == "__main__":
