@@ -9,6 +9,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1110,8 +1111,10 @@ def spellings(directory: Path) -> list[str]:
         # A profile name with a space is masked whole, in every spelling (r1-1).
         "C:/Users/John Doe/AppData/Local",
         "C:\\Users\\John Doe\\.claude\\x.jsonl",
-        "cd '/c/Users/John Doe' && ls",
+        "cd '/c/Users/John Doe/' && ls",
         '"/mnt/c/Users/John Doe"',
+        # No separator after the name: masked through to the end of the string.
+        "cat /c/Users/John Doe",
     ]
 
 
@@ -1178,14 +1181,71 @@ def test_networked_export_masks_both_run_roots_and_windows_profiles(tmp_path: Pa
     assert commands[16:] == [
         "C:/Users/<user>/AppData/Local",
         "C:\\Users\\<user>\\.claude\\x.jsonl",
-        "cd '/c/Users/<user>' && ls",
+        "cd '/c/Users/<user>/' && ls",
         '"/mnt/c/Users/<user>"',
+        "cat /c/Users/<user>",
     ]
     audit = json.loads((destination / "step7-unique.hub-audit.json").read_text())
     assert {row["name"]: row["last_remote_addr"] for row in audit["agent"]} == {
         "bob": VETHERNET,
         "charlie": "127.0.0.1",
     }
+
+
+# Profile names of characters Windows allows in a name (r2-1), each marked Zq.
+PROFILE_NAMES = [
+    "Zq O'Connor",
+    "Zqé Ñúñez",
+    "Zq (x86) & Co;1,=+!@#$%^~`[]{}",
+    "\U0001f600 Zq smile",
+    "ZQJOHN~1",
+]
+
+
+@pytest.mark.parametrize("name", PROFILE_NAMES)
+def test_networked_export_masks_every_valid_profile_name(tmp_path: Path, name: str) -> None:
+    directory = tmp_path / "wsl-run"
+    directory.mkdir()
+    export_run(directory, "step7")
+    paths = [
+        f"{root}{separator.join(['Users', name, 'AppData'])}"
+        for root, separator in (("C:/", "/"), ("C:\\", "\\"), ("/c/", "/"), ("/mnt/c/", "/"))
+    ] + [f"C:\\Documents and Settings\\{name}\\x", f"cd '/c/Users/{name}' && ls"]
+    texts = [
+        *paths,
+        *(json.dumps({"input": path}) for path in paths),  # JSON text inside a string
+        *(json.dumps(path).replace("/", "\\/") for path in paths),  # with \/ escapes
+    ]
+    traces = json.loads((directory / "tool-audit.json").read_text())
+    traces["bob"] = [{"name": "Bash", "input": {"command": text}} for text in texts]
+    STEP6.save(directory / "tool-audit.json", traces)
+    destination = tmp_path / "exports"
+    STEP6.export_evidence(directory, destination)
+    raw = (destination / "step7-unique.tool-audit.json").read_text()
+    commands = [call["input"]["command"] for call in json.loads(raw)["bob"]]
+    for text in (raw, *commands):
+        assert "zq" not in text.lower()
+        assert not any(character in text for character in "éÑúñ\U0001f600")
+        assert not re.search(r"\\+u(00e9|00d1|00fa|00f1|d83d|de00)", text, re.IGNORECASE)
+    assert commands[0] == "C:/Users/<user>/AppData"
+    assert commands[1] == "C:\\Users\\<user>\\AppData"
+    assert commands[4] == "C:\\Users\\<user>\\x"  # Documents and Settings, masked too
+    assert commands[5] == "cd '/c/Users/<user>"
+    for nested in commands[len(paths) :]:
+        json.loads(nested)  # nested JSON text stays parseable after masking
+    assert json.loads(commands[len(paths)]) == {"input": "C:/Users/<user>/AppData"}
+
+
+def test_non_ascii_run_roots_are_masked_inside_nested_json() -> None:
+    manifest = {"windows": {"run_dir": "C:/wörk/step7-rün"}}
+    directory = Path("/home/zoë/run")
+    document = {
+        "windows": json.dumps({"path": "C:\\wörk\\step7-rün\\bob"}),
+        "wsl": json.dumps({"path": "/home/zoë/run/charlie"}),
+    }
+    masked = STEP7.mask_document(document, directory, manifest)
+    assert json.loads(masked["windows"]) == {"path": "windows:/RUN\\bob"}
+    assert json.loads(masked["wsl"]) == {"path": "wsl:/RUN/charlie"}
 
 
 @pytest.mark.parametrize("where", ["bob_transcript", "bob_telemetry", "windows_path"])

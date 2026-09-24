@@ -1947,12 +1947,11 @@ def export_evidence(directory, destination):
     }
     encoded = {}
     for label, document in documents.items():
-        content = json.dumps(document, indent=2, sort_keys=True)
         if step7.networked(manifest):
-            content = step7.mask(content, directory, manifest)
-            json.loads(content)  # masking must leave valid JSON
+            document = step7.mask_document(document, directory, manifest)
+            content = json.dumps(document, indent=2, sort_keys=True)
         else:
-            content = content.replace(str(directory), "/RUN")
+            content = json.dumps(document, indent=2, sort_keys=True).replace(str(directory), "/RUN")
         content += "\n"
         if token in content or re.search(
             r"(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|Bearer [A-Za-z0-9_-]{20,})",

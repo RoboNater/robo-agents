@@ -125,22 +125,42 @@ def telemetry_path(directory, manifest, name):
     return directory / f"{name}.telemetry.jsonl"
 
 
-SEP = r"(?:/|\\+)"  # one slash, or a backslash at any JSON-escaping depth
+# Masking runs on the decoded strings of a document, before it is serialized.
+# A string can still hold JSON text of its own (a tool input or result), so a
+# separator is a slash or backslashes at any escaping depth, including JSON's
+# optional ``\/``, and a non-ASCII character may appear as a ``\uXXXX`` escape.
+SEP = r"(?:\\*/|\\+)"
 BEFORE = r"(?<![\w.-])"
 AFTER = r"(?![\w.-])"
+ESCAPED = r"\\+u[0-9a-f]{4}"
+
+
+def literal(text):
+    """``text`` as a pattern, each non-ASCII character also matched as a JSON escape."""
+    pattern = ""
+    for character in text:
+        if ord(character) < 0x80:
+            pattern += re.escape(character)
+            continue
+        units = character.encode("utf-16-be")
+        escaped = "".join(
+            r"\\+u" + units[index : index + 2].hex() for index in range(0, len(units), 2)
+        )
+        pattern += f"(?:{re.escape(character)}|{escaped})"
+    return pattern
 
 
 def windows_root_pattern(path):
     """Every spelling of a Windows directory: ``C:/``, ``C:\\``, ``/c/``, ``/mnt/c/``."""
     windows = PureWindowsPath(path)
     drive = re.escape(windows.drive[0])
-    parts = "".join(SEP + re.escape(part) for part in windows.parts[1:])
+    parts = "".join(SEP + literal(part) for part in windows.parts[1:])
     return BEFORE + rf"(?:windows:)?(?:{drive}:|/mnt/{drive}|/{drive})" + parts + AFTER
 
 
 def wsl_root_pattern(path):
     """Every spelling of a WSL directory, including ``\\\\wsl.localhost\\<distro>\\...``."""
-    parts = "".join(SEP + re.escape(part) for part in PurePosixPath(path).parts[1:])
+    parts = "".join(SEP + literal(part) for part in PurePosixPath(path).parts[1:])
     unc = r"(?:(?:\\+|//)wsl(?:\.localhost|\$)" + SEP + r"[^\\/\s\"']+)?"
     return BEFORE + r"(?:wsl:)?" + unc + parts + AFTER
 
@@ -151,13 +171,22 @@ def root_pattern(workspace):
     return re.compile(wsl_root_pattern(workspace["path"]), re.IGNORECASE)
 
 
-# A profile name may contain spaces (``C:/Users/John Doe``), so the whole path
-# component is masked: it ends only at a separator, a quote, a line end, or a
-# character Windows forbids in a name. It never takes a backslash or a quote,
-# so JSON escaping survives.
+# A profile name is a whole path component of any character Windows allows in
+# a name: spaces, apostrophes, ``&()[]{};,=+!@#$%^~`` and non-ASCII letters.
+# Only the reserved ``<>:"/\|?*`` and control characters end it, because none
+# can occur inside it. A name followed by no separator (``cd '/c/Users/Ann' &&
+# ls``) is masked through to the end of the string: it fails safe. The
+# separator after ``Users`` is first taken as spelled after the drive, so it
+# never swallows the backslash that opens a ``\uXXXX`` name character.
+NAME = r"(?:[^\\/:*?\"<>|\x00-\x1f]|" + ESCAPED + ")+"
 PROFILE = re.compile(
-    BEFORE + r"((?:[a-z]:|/mnt/[a-z]|/[a-z])" + SEP + r")users(" + SEP + r")"
-    r"[^\\/\"'\r\n:*?<>|]+",
+    BEFORE
+    + r"((?:[a-z]:|/mnt/[a-z]|/[a-z])("
+    + SEP
+    + r"))(?:users|documents and settings)(\2|"
+    + SEP
+    + ")"
+    + NAME,
     re.IGNORECASE,
 )
 
@@ -168,7 +197,21 @@ def mask(text, directory, manifest):
         windows_root_pattern(manifest["windows"]["run_dir"]), "windows:/RUN", text, flags=re.I
     )
     text = re.sub(wsl_root_pattern(str(directory)), "wsl:/RUN", text, flags=re.I)
-    return PROFILE.sub(r"\g<1>Users\g<2><user>", text)
+    return PROFILE.sub(r"\g<1>Users\g<3><user>", text)
+
+
+def mask_document(value, directory, manifest):
+    """``mask`` applied to every string and key, so no JSON escaping hides a name."""
+    if isinstance(value, str):
+        return mask(value, directory, manifest)
+    if isinstance(value, dict):
+        return {
+            mask(key, directory, manifest): mask_document(item, directory, manifest)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [mask_document(item, directory, manifest) for item in value]
+    return value
 
 
 # Addressing.
