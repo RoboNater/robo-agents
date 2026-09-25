@@ -1675,7 +1675,14 @@ def evaluate(manifest, snapshot, facts, traces):
             comment = comments.get(result.get("review_url"), {})
             require(
                 "review_comment_" + task["id"],
-                "Reviewer agent Charlie on behalf of RoboNater" in comment.get("body", "")
+                # Alice fills the skill's `<name>` from the hub agent name
+                # (`charlie`), so only the name's case is free.
+                bool(
+                    re.search(
+                        r"Reviewer agent (?i:charlie) on behalf of RoboNater",
+                        comment.get("body", ""),
+                    )
+                )
                 and result.get("reviewed_head_sha", "MISSING") in comment.get("body", "")
                 and comment_in_task(comment, task)
                 and bool(

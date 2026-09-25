@@ -319,6 +319,15 @@ def test_complete_correlated_proof(proof: tuple[Any, ...]) -> None:
     assert evidence["passed"], evidence["failed_checks"]
 
 
+def test_reviewer_identity_accepts_the_hub_agent_name(proof: tuple[Any, ...]) -> None:
+    """Alice's skill fills `<name>` with the agent name `charlie` (#141 attempt 1)."""
+    manifest, snapshot, facts, traces = copy.deepcopy(proof)
+    for comment in facts["comments"]:
+        comment["body"] = comment["body"].replace("agent Charlie", "agent charlie")
+    evidence = STEP6.evaluate(manifest, snapshot, facts, traces)
+    assert evidence["passed"], evidence["failed_checks"]
+
+
 @pytest.mark.parametrize(
     "defect",
     [
@@ -346,6 +355,8 @@ def test_complete_correlated_proof(proof: tuple[Any, ...]) -> None:
         "old_review_comment",
         "missing_test_evidence",
         "wrong_result_pr",
+        "wrong_reviewer_identity",
+        "unsigned_review",
     ],
 )
 def test_verifier_rejects_missing_or_wrong_evidence(proof: tuple[Any, ...], defect: str) -> None:
@@ -391,6 +402,14 @@ def test_verifier_rejects_missing_or_wrong_evidence(proof: tuple[Any, ...], defe
     elif defect == "missing_test_evidence":
         facts["comments"][0]["body"] = facts["comments"][0]["body"].replace(
             "python3 -m unittest discover -s tests -v", ""
+        )
+    elif defect == "wrong_reviewer_identity":
+        facts["comments"][0]["body"] = facts["comments"][0]["body"].replace(
+            "Reviewer agent Charlie", "Reviewer agent Bob"
+        )
+    elif defect == "unsigned_review":
+        facts["comments"][0]["body"] = facts["comments"][0]["body"].replace(
+            "on behalf of RoboNater", "on behalf of someone"
         )
     elif defect == "wrong_result_pr":
         result = json.loads(snapshot["task"][1]["result_json"])
