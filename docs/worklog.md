@@ -19,6 +19,7 @@ This document archives completed milestones, closed issues, review hardening, op
 - [Step 4B — Worker Endurance](#step-4b--worker-endurance)
 - [Step 5 — Guides, Alice Skill, Prompts](#step-5--guides-alice-skill-prompts)
 - [Step 6 — E2E on Localhost](#step-6--e2e-on-localhost)
+- [Step 7 — E2E networked](#step-7--e2e-networked)
 - [User Documentation (#73)](#user-documentation-73)
 - [User Run Preparation (#75, #76)](#user-run-preparation-75-76)
 - [Settled Architectural Decisions](#settled-architectural-decisions)
@@ -291,6 +292,20 @@ Step 3 reuses `HubStore` for `assign_task`, `reply` and `release_agent`. The wai
   - [x] **Native-Windows, mixed-harness harness** (`4070cd3`, [#72](https://github.com/RoboNater/robo-agents/pull/72))
 
     After completion, the harness gained native Windows support (no WSL) and selectable harnesses: Codex Alice under a `codex app-server` supervisor, Claude Bob, and OpenCode Charlie via `opencode serve`/`run --attach` (`scripts/step6_launch.py`). The verifier now reads those transcript formats and Windows/Git Bash paths. Live run `20260919013155_2a972a49` (Codex `gpt-5.6-luna`, Claude Haiku 4.5, OpenCode Nemotron 3 Ultra free) completed the full choreography on [sandbox #12](https://github.com/RoboNater/robo-agents-sandbox/issues/12) / [PR #13](https://github.com/RoboNater/robo-agents-sandbox/pull/13) with no supervisor reprompts. It **failed strict verification, 54/61**, solely because Alice wrote prose before the JSON in her `step6:*` decision rationales; extracting the embedded JSON passes 61/61 (diagnostic only). It is recorded as a failed attempt in [`docs/evidence/step6-failed-20260919013155_2a972a49.md`](https://github.com/RoboNater/robo-agents/blob/main/docs/evidence/step6-failed-20260919013155_2a972a49.md) and does not change Step 6's completion. Review found and fixed Windows-relative and Git Bash cross-clone path gaps in the isolation audit before merge. ✔
+
+---
+
+## Step 7 — E2E networked
+
+- [x] **Step 7 — E2E networked** (`96b6033055fb866124e23aa1161b3df7a7a7fc9a`, [#146](https://github.com/RoboNater/robo-agents/pull/146))
+
+  Completed run `20260924210331_88a8a797` against fresh [sandbox issue #15](https://github.com/RoboNater/robo-agents-sandbox/issues/15), [work PR #16](https://github.com/RoboNater/robo-agents-sandbox/pull/16), and CI-checked unrelated [base PR #17](https://github.com/RoboNater/robo-agents-sandbox/pull/17), at coordination commit `cced6cc87ef17607beebb511cbe6a8fa9d02fe8d`. The hub, interactive Claude Alice (2.1.282 / `claude-sonnet-5`) and Codex Charlie (0.155.1 / `gpt-6-sol`) ran in WSL2 in NAT mode; Claude Bob (2.1.281 / `claude-sonnet-5`) ran natively on the Windows host and dialed WSL's `eth0` (`http://172.26.115.68:8431`), so every Bob call crossed the Hyper-V vSwitch while Charlie stayed on loopback. All 73 correlated verifier checks pass, including the 12 `step7_*` checks: Bob's recorded peer is `172.26.112.1` and Charlie's `127.0.0.1`; Bob's telemetry dialed the advertised `HUB_PUBLIC_URL`; his largest heartbeat gap was 30.045 s against `HUB_LOST_AFTER_S` = 180 with no `agent_lost`; the two `workspace_id`s were distinct and stable; a duplicate check-in with a copy of Bob's identity was refused with HTTP 409 while he was live; and each clone's uncommitted canary stayed out of the other.
+
+  The Step 6 choreography repeated unchanged: blocking review `r1-1` and ADDRESS, the declared head push and actual head-mismatch refusal with RE-REVIEW, the base PR merge and actual stale-base refusal with conflict-free REBASE. Final head `d856d68b7820eb84d929bdebf0b82e6b33a13809` passed exact-head CI and Alice SHA-bound squash-merged it as `6ecc8329e1059832b7ff366eb703d4e6a9fbe7d5`. The issue closed, Bob completed CLOSE-OUT, both workers observed release, and the hub reached `done`. The first verify passed 70/73, failing only the reviewer-comment identity's capitalization; [#145](https://github.com/RoboNater/robo-agents/pull/145) (`5cbc989d9e4170b376c682b7230344d6a1b94d90`) fixed the verifier and re-verification of the unchanged run passed 73/73. It was the only measured attempt, so there are no failed-attempt notes.
+
+  [Credential-free evidence](evidence/step7-20260924210331_88a8a797.md) covers the SHAs, the Step 7 checks and the disclosed limits. The harness is [#140](https://github.com/RoboNater/robo-agents/issues/140), merged in [#144](https://github.com/RoboNater/robo-agents/pull/144) (`cced6cc87ef17607beebb511cbe6a8fa9d02fe8d`); the run and its evidence are [#141](https://github.com/RoboNater/robo-agents/issues/141), merged in [#146](https://github.com/RoboNater/robo-agents/pull/146). The prerequisite #126 peer-address recording (schema v12, [#138](https://github.com/RoboNater/robo-agents/pull/138)) passed its Windows live acceptance in [#139](https://github.com/RoboNater/robo-agents/pull/139) (`d450647718a1f5ebe9389a51b6d36624bdfb3f12`): the first native-Windows `--worker-only` render and check-in across the vSwitch. Limits: one physical machine, NAT mode, launch and collect through WSL interop, only Bob remote, and no link disruption; multi-machine hardening is deferred to [#127](https://github.com/RoboNater/robo-agents/issues/127).
+
+  *Done when:* met — the Step 6 criteria plus boundary crossing, live heartbeats and the #70 identity, duplicate-refusal and uncommitted-isolation checks, all passing on one networked run. ✔
 
 ---
 

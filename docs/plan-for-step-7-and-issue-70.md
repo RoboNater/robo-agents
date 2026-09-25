@@ -1,7 +1,14 @@
 # Plan for Step 7 and issue #70 — networked E2E
 
-Status: planned 2026-09-22. PR 1 is merged (#125 via [#132](https://github.com/RoboNater/robo-agents/pull/132);
-non-default ports #133 via [#134](https://github.com/RoboNater/robo-agents/pull/134)).
+Status: complete 2026-09-24. PR 1 is merged (#125 via [#132](https://github.com/RoboNater/robo-agents/pull/132);
+non-default ports #133 via [#134](https://github.com/RoboNater/robo-agents/pull/134)). PR 2 is merged
+(#126 via [#138](https://github.com/RoboNater/robo-agents/pull/138), Windows live acceptance
+[#139](https://github.com/RoboNater/robo-agents/pull/139)). PR 3's harness
+[#140](https://github.com/RoboNater/robo-agents/issues/140) is merged via
+[#144](https://github.com/RoboNater/robo-agents/pull/144), and the acceptance run
+[#141](https://github.com/RoboNater/robo-agents/issues/141) passed 73/73 with its evidence merged via
+[#146](https://github.com/RoboNater/robo-agents/pull/146). PR 4, the close-out, is
+[#147](https://github.com/RoboNater/robo-agents/pull/147).
 Tracking issue [#128](https://github.com/RoboNater/robo-agents/issues/128),
 with prerequisites [#125](https://github.com/RoboNater/robo-agents/issues/125) and
 [#126](https://github.com/RoboNater/robo-agents/issues/126), landing together with
