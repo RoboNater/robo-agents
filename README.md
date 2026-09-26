@@ -1,8 +1,19 @@
-# Agent Comms Hub
+# robo-agents proof-of-concept
 
-This repository implements the proof of concept described in
-[`docs/poc-spec.md`](docs/poc-spec.md). The current implementation covers plan
-Steps 1–6: the uv workspace, shared configuration and bearer-token
+The robo-agents proof-of-concept is complete and achieved its goal.
+Active work has moved to [robomate](https://github.com/RoboNater/robomate).
+
+This repository implements the proof of concept robo-agents.   robo-agents 
+enables a small team of AI coding agents to take a GitHub issue or written 
+statement of work all the way to a reviewed and merged pull request. 
+One agent orchestrates, one implements, and one reviews. Each can run in 
+whichever agent harness and model you choose, with built-in support for 
+Claude Code and Codex.  
+
+## How it works
+
+The specification for robo-agents can be found in [`docs/poc-spec.md`](docs/poc-spec.md). 
+The current implementation covers plan Steps 1–6: the uv workspace, shared configuration and bearer-token
 provisioning, the SQLite schema, A2A agent-card discovery, the hub core (A2A
 request handlers, role-guide route, event queue, lease/heartbeat sweeper,
 bearer enforcement), Alice's MCP tools over stdio (including the
